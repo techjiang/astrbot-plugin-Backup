@@ -22,21 +22,27 @@ from .database import REALTIME_BACKUP_ID, Database
 from .models import Message
 from .verifier import compute_checksum
 
-EXPIRY_UNITS = {"m": 60, "h": 3600, "d": 86400}
+EXPIRY_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
 def parse_expire(value) -> int:
-    """'24h' → 86400 秒。"""
+    """'24h' → 86400 秒。
+
+    写错或写成 0 一律退回 24 小时：0 秒等于「导出完链接就失效」，红线 4 要求的是
+    带 token 且有期限，不是「给了个用不了的链接」。'30s' 这类秒级写法也认。
+    """
     text = str(value or "24h").strip().lower()
+    seconds = 0
     if text.isdigit():
-        return int(text)
-    unit = text[-1]
-    if unit in EXPIRY_UNITS:
-        try:
-            return int(float(text[:-1]) * EXPIRY_UNITS[unit])
-        except ValueError:
-            pass
-    return 24 * 3600
+        seconds = int(text)
+    else:
+        unit = text[-1]
+        if unit in EXPIRY_UNITS:
+            try:
+                seconds = int(float(text[:-1]) * EXPIRY_UNITS[unit])
+            except ValueError:
+                seconds = 0
+    return seconds if seconds > 0 else 24 * 3600
 
 
 @dataclass
@@ -147,8 +153,10 @@ class ExportManager:
         if not ctx.messages:
             raise ValueError("该群没有可导出的消息")
 
+        # 文件名精确到秒还不够：连点两次导出、或批量导出多个群，同一秒内就会撞在
+        # 同一个路径上。后一份直接覆盖前一份，前一个 token 指向的是别人的文件。
         stamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        target = self.export_dir / f"{group_id}_{stamp}_{fmt}"
+        target = self.export_dir / f"{group_id}_{stamp}_{fmt}_{secrets.token_hex(3)}"
 
         if fmt == "zip":
             path = self._export_zip(ctx, target)
@@ -189,8 +197,12 @@ class ExportManager:
         (work / "chat.html").write_text(HtmlExporter().render(ctx), encoding="utf-8")
 
         zip_path = base.with_suffix(".zip")
+        record = self.db.get_record(ctx.backup_id) if ctx.backup_id else None
         manifest = {
             "backup_id": ctx.backup_id,
+            # 记录里那份校验和：本地库留着的可信指纹，恢复端靠它认出「包被整体
+            # 改写后重新算过校验和」这种情况。包里的 checksum 是包自己的，谁都能改
+            "record_checksum": (record.checksum if record else "") or "",
             "group_id": ctx.group_id,
             "group_name": ctx.group_name,
             "message_count": len(ctx.messages),
@@ -232,8 +244,13 @@ class ExportManager:
         self.db.save_token(token, str(path), expires)
         return token, datetime.fromtimestamp(expires)
 
-    def resolve_token(self, token: str) -> Optional[Path]:
-        """兑换 token。过期、越界、文件不存在一律返回 None。"""
+    def resolve_token(self, token: str, shared: bool = False) -> Optional[Path]:
+        """兑换 token。过期、越界、文件不存在一律返回 None。
+
+        `shared=True` 用于分享给群成员的链接：带宽跑满时浏览器会发 Range 请求续
+        传，那是第二次访问同一个 token。默认（下载路由）仍然一次性，链接转发出去
+        就不能再被别人重复领走。
+        """
         if not token:
             return None
         row = self.db.get_token(token)
@@ -245,6 +262,8 @@ class ExportManager:
         path = Path(row["path"])
         if not self._is_inside(path, self.export_dir) or not path.exists():
             return None
+        if not shared:
+            self.db.delete_token(token)
         return path
 
     def take_token(self, token: str) -> Optional[Path]:
@@ -255,6 +274,9 @@ class ExportManager:
         return path
 
     def clean_exports(self, max_age_days: int = 1) -> int:
+        """`max_age_days <= 0` 表示不淘汰：留空或写 0 的配置不该被理解成「立刻全删」。"""
+        if not max_age_days or max_age_days <= 0:
+            return 0
         """删过期 token 与过期导出文件。返回删除数量。"""
         now = time.time()
         removed = self.db.purge_expired_tokens(now)

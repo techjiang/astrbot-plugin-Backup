@@ -32,19 +32,30 @@ class DownloadResponse:
     body: bytes = b""
     headers: dict = field(default_factory=dict)
     file: Optional[Path] = None
+    start: int = 0
+    length: Optional[int] = None
 
     @property
     def ok(self) -> bool:
         return self.status == 200
 
     def iter_chunks(self, size: int = CHUNK):
-        """流式读，避免大 ZIP 一次性进内存。"""
+        """流式读，避免大 ZIP 一次性进内存。按 [start, start+length) 取，支持续传。"""
         if self.file is None:
             yield self.body
             return
         with open(self.file, "rb") as fh:
-            for chunk in iter(lambda: fh.read(size), b""):
+            fh.seek(self.start)
+            remaining = self.length
+            while True:
+                chunk = fh.read(size if remaining is None else min(size, remaining))
+                if not chunk:
+                    return
                 yield chunk
+                if remaining is not None:
+                    remaining -= len(chunk)
+                    if remaining <= 0:
+                        return
 
 
 def content_type_for(path: Path) -> str:
@@ -59,10 +70,32 @@ def _error(status: int, message: str) -> DownloadResponse:
     )
 
 
-def handle_download(path: str, exports) -> DownloadResponse:
-    """处理一次下载请求。expires 由 exports.resolve_token 判定。
+def _parse_range(header: Optional[str], total: int) -> Optional[tuple[int, int]]:
+    """解析 `Range: bytes=start-end`。只认单段、绝对偏移；不合法返回 None（按整份发）。"""
+    if not header or not header.lower().startswith("bytes="):
+        return None
+    spec = header[6:].strip().split(",")[0].strip()
+    if not spec or spec.startswith("-"):
+        return None  # 后缀区间（bytes=-500）对 ZIP 没意义，忽略
+    start_s, _, end_s = spec.partition("-")
+    if not start_s.isdigit():
+        return None
+    start = int(start_s)
+    if start >= total:
+        return None
+    end = int(end_s) if end_s.isdigit() else total - 1
+    end = min(end, total - 1)
+    if end < start:
+        return None
+    return start, end - start + 1
 
-    状态码：404 无 token/文件不存在，410 已过期，400 路径非法。
+
+def handle_download(path: str, exports, range_header: Optional[str] = None) -> DownloadResponse:
+    """处理一次下载请求。expires 由 exports.resolve_token 判定，token 一次性。
+
+    状态码：404 无 token/文件不存在，410 已过期，416 区间不可满足。
+    链接是分享给群成员点的，浏览器下载大文件时常常先发一个 Range 探测、再续传，
+    所以这里必须回 206：回不了续传，用户拿到的是断掉的半个 ZIP。
     """
     if not path or not path.startswith(PREFIX):
         return _error(404, "not found")
@@ -75,17 +108,25 @@ def handle_download(path: str, exports) -> DownloadResponse:
         return _error(410, "链接已失效或不存在")
 
     stat = target.stat()
-    return DownloadResponse(
-        status=200,
-        file=target,
-        headers={
-            "Content-Type": content_type_for(target),
-            "Content-Length": str(stat.st_size),
-            "Content-Disposition": f'attachment; filename="{target.name}"',
-            "Cache-Control": "no-store",
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
+    total = stat.st_size
+    headers = {
+        "Content-Type": content_type_for(target),
+        "Content-Disposition": f'attachment; filename="{target.name}"',
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+        "Accept-Ranges": "bytes",
+    }
+    span = _parse_range(range_header, total)
+    if span is None:
+        if range_header:
+            return _error(416, "range not satisfiable")
+        headers["Content-Length"] = str(total)
+        return DownloadResponse(status=200, file=target, headers=headers)
+
+    start, length = span
+    headers["Content-Length"] = str(length)
+    headers["Content-Range"] = f"bytes {start}-{start + length - 1}/{total}"
+    return DownloadResponse(status=206, file=target, headers=headers, start=start, length=length)
 
 
 def expires_header(expires_at: datetime) -> dict:

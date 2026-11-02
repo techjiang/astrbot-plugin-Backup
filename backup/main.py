@@ -25,6 +25,7 @@ from .core.commands import (
 from .core.database import Database
 from .core.download_route import handle_download
 from .core.export_manager import ExportManager
+from .exporters import SUPPORTED_FORMATS
 from .core.auto_trigger import AutoTrigger
 from .core.event_hooks import EventHooks, extract_group_id
 from .core.paths import assert_writable_target, resolve_storage_root
@@ -186,27 +187,40 @@ class BackupPlugin(Star):
         yield event.plain_result(render_status(self.db, group_id))
 
     async def _cmd_export(self, event, args):
+        """导出某个群。
+
+        默认走 `export_latest`：最近一次备份覆盖的消息 + 只在实时归档里的那些。
+        只按某次 backup_id 取数会正好漏掉群被炸前最后几条——那几条往往只走了实时
+        归档，不属于任何一次备份。两个参数位置都认（群号在格式前或后）。
+        """
         if not args:
             yield event.plain_result("用法：/backup export [群号] <格式>")
             return
-        group_id = parse_group_arg(args[0])
-        fmt_index = 1 if group_id else 0
-        if len(args) <= fmt_index:
+        formats = set(SUPPORTED_FORMATS) | {"md", "htm"}
+        group_id = None
+        fmt = ""
+        for token in args:
+            low = token.lower()
+            if low in formats:
+                fmt = low
+            elif group_id is None:
+                group_id = parse_group_arg(token)
+        if not fmt:
             yield event.plain_result("请指定导出格式：sqlite/json/csv/txt/markdown/html/zip")
             return
-        fmt = args[fmt_index].lower()
         group_id = group_id or getattr(event, "group_id", None)
         if not group_id:
             yield event.plain_result("请指定群号：/backup export 123456 sqlite")
             return
+        own = getattr(event, "self_id", None) or getattr(event, "bot_id", None)
         try:
-            result = self.exports.export(group_id, fmt)
+            result = self.exports.export_latest(group_id, fmt, own_user_id=own)
         except Exception as e:
             yield event.plain_result(f"导出失败：{e}")
             return
         yield event.plain_result(
             f"✅ 导出完成（{result.format}）\n消息 {result.message_count} 条 · "
-            f"{human_size(result.size)}\n临时链接（{result.expires_at:%H:%M} 过期）：{result.link}"
+            f"{human_size(result.size)}\n临时链接（{result.expires_at:%H:%M} 过期，仅可使用一次）：{result.link}"
         )
 
     async def _cmd_restore(self, event, args):
@@ -255,17 +269,22 @@ class BackupPlugin(Star):
         yield event.plain_result(f"{'✅' if ok else '❌'} {reason}")
 
     async def _cmd_clean(self, event, args):
-        days = int(args[0]) if args and args[0].isdigit() else 90
-        from datetime import datetime, timedelta
+        """清理旧备份。
 
-        cutoff = datetime.now() - timedelta(days=days)
-        removed = 0
-        for record in self.db.list_records(limit=1000):
-            if record.started_at < cutoff:
-                self.db.delete_record(record.backup_id)
-                removed += 1
-        removed += self.exports.clean_exports()
-        yield event.plain_result(f"🧹 已清理 {removed} 项（早于 {days} 天）")
+        以前这里是「删记录 → 连本备份名下的消息一起删」。消息只归属最后一次归档它
+        的备份，所以删一条老记录会顺带抹掉还可能被别的备份用到的聊天记录。现在
+        只淘汰记录、过期导出文件、超出保留期的媒体，消息本身不动。
+        """
+        retention = self.config.get("retention") or {}
+        days = int(args[0]) if args and args[0].isdigit() else int(retention.get("keep_days", 90) or 0)
+        keep_count = int(retention.get("keep_count", 0) or 0)
+        records = self.db.prune_records(keep_count=keep_count, keep_days=days)
+        media = self.db.prune_media(days)
+        exports = self.exports.clean_exports(days)
+        yield event.plain_result(
+            f"🧹 已清理：备份记录 {records} 条 · 过期导出 {exports} 个 · "
+            f"早于 {days} 天的媒体 {media} 个\n消息本身不删，仍可按备份 ID 导出"
+        )
 
     async def _cmd_diff(self, event, args):
         if len(args) < 2:

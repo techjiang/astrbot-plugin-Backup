@@ -66,7 +66,7 @@ pip install -r astrbot-plugin-Backup/backup/requirements.txt
 | `/backup status [群号]` | 当前群备份状态 |
 | `/backup verify <备份ID> [备份包]` | 校验备份完整性 |
 | `/backup diff <备份ID1> <备份ID2>` | 对比两个备份 |
-| `/backup clean [天数]` | 清理旧备份 |
+| `/backup clean [天数]` | 清理旧备份记录与过期导出/媒体（消息本身不删） |
 
 恢复的冲突策略：`--strategy skip`（默认，跳过已存在）/ `overwrite`（覆盖）/ `merge`（补齐缺失）。
 
@@ -125,17 +125,18 @@ backup:
 ### 下载链接怎么用
 
 导出后返回 `/backup/download/<token>`。token 存在数据库里，重启后仍然有效，过期即作废，
-并且只认 `exports/` 目录内的文件。接路由时把请求路径丢给 `handle_download`：
+只认 `exports/` 目录内的文件，兑换一次即失效（链接转发出去也不会被反复领取）。接路由时
+把请求路径丢给 `handle_download`，需要支持大文件续传就把 `Range` 头一起传进去：
 
 ```python
 from backup.core.download_route import handle_download
 
-resp = handle_download(request.path, plugin.exports)
-if resp.ok:
+resp = handle_download(request.path, plugin.exports, request.headers.get("Range"))
+if resp.ok:   # 200 整份 / 206 区间续传
     for chunk in resp.iter_chunks():
         await write(chunk)
 else:
-    # 404 路径不对 / 410 链接过期
+    # 404 路径不对 / 410 链接过期或已领取 / 416 区间越界
     ...
 ```
 

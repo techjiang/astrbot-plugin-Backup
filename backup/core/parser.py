@@ -37,8 +37,14 @@ def _get(obj: Any, key: str, default=None):
 
 
 def _to_datetime(value) -> datetime:
+    """统一成 naive 本地时间。
+
+    时间戳在库里是 `%Y-%m-%d %H:%M:%S.%f` 字符串，tz-aware 值落库时会连带丢掉
+    时区，再读回来就凭空多了几小时——增量水位是 (timestamp, message_id) 比较的，
+    脏点一旦写下，那段时间的正常消息全被判成「更旧」而跳过。
+    """
     if isinstance(value, datetime):
-        return value
+        return _naive(value)
     if value is None:
         return datetime.now()
     try:
@@ -49,9 +55,16 @@ def _to_datetime(value) -> datetime:
     except (TypeError, ValueError):
         pass
     try:
-        return datetime.fromisoformat(str(value))
+        return _naive(datetime.fromisoformat(str(value)))
     except ValueError:
         return datetime.now()
+
+
+def _naive(dt: datetime) -> datetime:
+    """带时区的换算成本地时间再去掉时区，保证库里只有一种时间刻度。"""
+    if dt.tzinfo is not None:
+        return dt.astimezone().replace(tzinfo=None)
+    return dt
 
 
 def _raw_json(obj: Any) -> str:

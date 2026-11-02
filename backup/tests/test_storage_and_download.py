@@ -144,9 +144,18 @@ def test_clean_exports_purges_expired_tokens(exports, db, tmp_path):
     file = tmp_path / "exports" / "old.zip"
     file.write_bytes(b"data")
     db.save_token("stale", str(file), time.time() - 10)
-    removed = exports.clean_exports(max_age_days=0)
+    removed = exports.clean_exports(max_age_days=1)
+    # 过期 token 一律清，跟导出文件的保留天数无关
     assert removed >= 1
     assert db.get_token("stale") is None
+
+
+def test_clean_exports_keeps_everything_when_days_is_zero(exports, db, tmp_path):
+    """keep_days 写 0 是「别淘汰」，不是「立刻全删」——以前那个 0 会把整个导出目录清空。"""
+    file = tmp_path / "exports" / "keep.zip"
+    file.write_bytes(b"data")
+    assert exports.clean_exports(max_age_days=0) == 0
+    assert file.exists()
 
 
 @pytest.mark.parametrize(

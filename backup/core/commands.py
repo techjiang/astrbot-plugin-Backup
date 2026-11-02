@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
 
-from .database import Database
+from .database import REALTIME_BACKUP_ID, Database
 
 SIZE_UNITS = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3}
 
@@ -50,8 +50,37 @@ def _coerce(raw: str):
         return text
 
 
+def _validate_value(key: str, new):
+    """类型之外还得管语义：type 对不上只是格式问题，值不合法会让插件当场坏掉。"""
+    if isinstance(new, str):
+        if key.endswith("max_file_size"):
+            from .media_downloader import parse_size
+
+            text = new.strip().upper()
+            if not re.fullmatch(r"[\d.]+\s*[KMGT]?B", text):
+                return f"`{key}` 需要形如 100MB 的大小，收到 `{new}`"
+            if parse_size(new) <= 0:
+                return f"`{key}` 必须大于 0"
+        elif key.endswith("download_link_expire"):
+            from .export_manager import parse_expire
+
+            text = new.strip().lower()
+            if not re.fullmatch(r"\d+(\.\d+)?[smhd]?", text) or parse_expire(new) <= 0:
+                return f"`{key}` 需要形如 24h / 30m，收到 `{new}`"
+    if isinstance(new, int) and key.split(".")[-1] in (
+        "max_concurrent",
+        "retry_count",
+        "keep_days",
+        "keep_count",
+        "mass_leave_threshold",
+    ):
+        if new <= 0:
+            return f"`{key}` 必须大于 0"
+    return ""
+
+
 def _config_set(config: dict, key: str, raw: str) -> tuple[bool, str]:
-    """改已知键。拼错的键直接拒绝，避免配置里长出一堆废条目。"""
+    """改已知键。拼错的键、类型不对、值不合法的都拒绝，避免配置里长出一堆废条目。"""
     parts = key.split(".")
     node = config
     for part in parts[:-1]:
@@ -65,6 +94,9 @@ def _config_set(config: dict, key: str, raw: str) -> tuple[bool, str]:
     new = _coerce(raw)
     if type(old) is not type(new) and not (isinstance(old, float) and isinstance(new, int)):
         return False, f"`{key}` 需要 {type(old).__name__} 类型的值"
+    problem = _validate_value(key, new)
+    if problem:
+        return False, problem
     node[leaf] = new
     return True, ""
 
@@ -149,6 +181,11 @@ def render_status(db: Database, group_id: int) -> str:
         )
     else:
         lines.append("还没有完成过备份")
+    # 定时备份开着的时候，群消息其实一直在进库（实时归档），只报「没备份过」会让人
+    # 以为一条都没存下来
+    realtime = db.count_messages(group_id, backup_id=REALTIME_BACKUP_ID)
+    if realtime:
+        lines.append(f"其中实时归档 {realtime} 条（还没被任何一次备份接手）")
     return "\n".join(lines)
 
 

@@ -2,7 +2,7 @@
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -322,14 +322,23 @@ class Database:
         )
         return str(row["backup_id"] or "") if row else ""
 
-    def message_exists(self, message_id: str, group_id: int) -> bool:
-        return (
-            self.query_one(
+    def message_exists(self, message_id: str, group_id: Optional[int]) -> bool:
+        """这条消息是否已在库里。
+
+        group_id 给 None 是「不知道群号」的问法（消息链解析不出群号时）：此时只按
+        message_id 判，宁可当成已存在而跳过，也不要在恢复时把同一批消息再插一遍。
+        唯一键是 (message_id, group_id)，给个 0 或 None 落库就是另一个群的消息。
+        """
+        if group_id is None:
+            row = self.query_one(
+                "SELECT 1 FROM messages WHERE message_id = ? LIMIT 1", (message_id,)
+            )
+        else:
+            row = self.query_one(
                 "SELECT 1 FROM messages WHERE message_id = ? AND group_id = ? LIMIT 1",
                 (message_id, group_id),
             )
-            is not None
-        )
+        return row is not None
 
     def get_messages(
         self,
@@ -404,11 +413,18 @@ class Database:
             return None
         return ts, str(row["message_id"] or "")
 
-    def count_messages(self, group_id: Optional[int] = None) -> int:
-        if group_id is None:
-            row = self.query_one("SELECT COUNT(*) AS c FROM messages")
-        else:
-            row = self.query_one("SELECT COUNT(*) AS c FROM messages WHERE group_id = ?", (group_id,))
+    def count_messages(
+        self, group_id: Optional[int] = None, backup_id: Optional[str] = None
+    ) -> int:
+        sql = "SELECT COUNT(*) AS c FROM messages WHERE 1=1"
+        params: list = []
+        if group_id is not None:
+            sql += " AND group_id = ?"
+            params.append(group_id)
+        if backup_id is not None:
+            sql += " AND backup_id = ?"
+            params.append(backup_id)
+        row = self.query_one(sql, params)
         return int(row["c"]) if row else 0
 
     def delete_messages(self, group_id: int, message_ids: list[str]) -> int:
@@ -651,6 +667,61 @@ class Database:
             )
             for r in rows
         ]
+
+    # ---------- 保留策略 ----------
+    def prune_records(
+        self, keep_count: Optional[int] = None, keep_days: Optional[int] = None
+    ) -> int:
+        """按保留策略删备份记录，返回删掉的条数。
+
+        只删记录，不删消息：消息按 (message_id, group_id) 唯一、一条消息只归属最后
+        归档它的那次备份，删记录顺手删消息等于把一个群的聊天记录连根拔掉——连
+        别的备份名下还在用的都不管了。真占地方的是导出文件和媒体，另走
+        `clean_exports` 与 `prune_media`。
+
+        `keep_days <= 0` 表示不做时间淘汰：留空或写 0 的配置不该被理解成「立刻
+        全删」。
+        """
+        removed = 0
+        if keep_days and keep_days > 0:
+            cutoff = datetime.now() - timedelta(days=keep_days)
+            cur = self.execute(
+                "DELETE FROM backup_records WHERE started_at < ?", (to_db(cutoff),)
+            )
+            removed += cur.rowcount if cur else 0
+        if keep_count and keep_count > 0:
+            rows = self.query(
+                """SELECT backup_id FROM backup_records
+                   ORDER BY started_at DESC LIMIT -1 OFFSET ?""",
+                (int(keep_count),),
+            )
+            for row in rows:
+                self.execute("DELETE FROM backup_records WHERE backup_id = ?", (row["backup_id"],))
+                removed += 1
+        return removed
+
+    def prune_media(self, keep_days: int) -> int:
+        """删掉早于保留期的媒体文件（按消息时间），连落盘文件一起清。"""
+        if not keep_days or keep_days <= 0:
+            return 0
+        cutoff = datetime.now() - timedelta(days=keep_days)
+        rows = self.query(
+            """SELECT m.id, m.local_path FROM media_files m
+               JOIN messages msg ON msg.message_id = m.message_id AND msg.group_id = m.group_id
+               WHERE msg.timestamp < ?""",
+            (to_db(cutoff),),
+        )
+        removed = 0
+        for row in rows:
+            path = Path(row["local_path"] or "")
+            try:
+                if path.is_file():
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                continue
+            self.execute("DELETE FROM media_files WHERE id = ?", (row["id"],))
+        return removed
 
     # ---------- 定时任务 ----------
     def save_schedule(self, group_id: int, cron: str, enabled: bool = True) -> None:
