@@ -11,10 +11,7 @@
 > AstrBot 群聊数据备份插件。把群里的消息、文件、图片、成员、群信息全备份下来，支持定时自动备份、增量备份、多格式导出、一键恢复。群被炸了、机器人迁移、数据审计，都靠它。
 
 <p align="center">
-  <img src="backup/assets/icon.svg" width="18" alt="icon"> 消息 / 媒体 / 成员全量备份 ·
-  <img src="backup/assets/icon.svg" width="18" alt="icon"> 增量备份 ·
-  <img src="backup/assets/icon.svg" width="18" alt="icon"> 7 种导出格式 ·
-  <img src="backup/assets/icon.svg" width="18" alt="icon"> HTML 聊天记录
+  消息 / 媒体 / 成员全量备份 · 增量备份 · 7 种导出格式 · HTML 聊天记录
 </p>
 
 ## 功能
