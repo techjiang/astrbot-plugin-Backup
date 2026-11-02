@@ -38,3 +38,4 @@ backup:
   auto_trigger:
     mass_leave_threshold: 10
     on_group_disband: true
+    on_bot_kicked: true

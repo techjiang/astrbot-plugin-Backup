@@ -23,6 +23,7 @@ from .core.commands import (
 from .core.database import Database
 from .core.export_manager import ExportManager
 from .core.auto_trigger import AutoTrigger
+from .core.event_hooks import EventHooks, classify_group_event, extract_group_id
 from .core.restore_engine import RestoreEngine, RestoreError
 from .core.scheduler import BackupScheduler
 from .core.verifier import verify_zip
@@ -70,6 +71,13 @@ class BackupPlugin(Star):
             self.db,
             self._scheduled_backup,
             (self.config.get("schedule") or {}).get("default_cron", "0 3 * * *"),
+        )
+        self.hooks = EventHooks(
+            self.db,
+            self.auto_trigger,
+            archive=bool((self.config.get("scope") or {}).get("group_messages", True)),
+            on_leave=bool((self.config.get("auto_trigger") or {}).get("on_bot_kicked", True)),
+            on_disband=bool((self.config.get("auto_trigger") or {}).get("on_group_disband", True)),
         )
         self.scheduler.restore_jobs()
 
@@ -275,6 +283,39 @@ class BackupPlugin(Star):
             yield event.plain_result(f"已移除群 {group_id} 的定时备份")
         else:
             yield event.plain_result("未知操作，支持 set / list / remove")
+
+    # ---------- 事件钩子 ----------
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_message(self, event: AstrMessageEvent):
+        """实时归档：消息进群时就落库，之后增量备份不必再回捞。
+
+        只写库不下载媒体，也不回复任何内容——群聊里静默干活。
+        """
+        try:
+            self.hooks.archive_message(event)
+        except Exception as e:  # 归档失败不能影响机器人正常聊天
+            logger.error("实时归档失败 group=%s: %s", extract_group_id(event), type(e).__name__)
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_notice(self, event: AstrMessageEvent):
+        """群人数变动：退群聚合到阈值、机器人被踢 / 群解散时抢最后一次备份。"""
+        payload = getattr(event, "message_obj", None) or getattr(event, "raw_message", None)
+        group_id, subtype = classify_group_event(payload)
+        if group_id is None:
+            group_id = extract_group_id(event)
+        if group_id is None:
+            return
+        try:
+            if "decrease" in subtype or "leave" in subtype:
+                if self.hooks.note_group_decrease(group_id):
+                    logger.warning("群 %s 短时大量退群，触发备份", group_id)
+                    await self._scheduled_backup(group_id)
+                return
+            if self.hooks.note_group_event(group_id, subtype):
+                logger.warning("群 %s 事件 %s，触发最后备份", group_id, subtype)
+                await self._scheduled_backup(group_id)
+        except Exception as e:
+            logger.error("触发式备份失败 group=%s: %s", group_id, type(e).__name__)
 
     async def terminate(self):
         self.scheduler.shutdown()

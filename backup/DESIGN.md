@@ -14,6 +14,7 @@ core/incremental.py 增量点（timestamp + message_id 复合排序）
 core/media_downloader.py 限速 / 重试 / 去重 / 大小上限
 core/scheduler.py  APScheduler 定时任务（缺失依赖时降级为仅落库）
 core/auto_trigger.py 退群聚合、解散预警触发
+core/event_hooks.py   AstrBot 事件 → 实时归档 / 触发式备份（鸭子类型，可单测）
 core/verifier.py   确定性校验和 + ZIP 校验
 exporters/         6 种格式，统一 export(ctx, path)
 ```
@@ -34,6 +35,11 @@ exporters/         6 种格式，统一 export(ctx, path)
 
 **恢复为什么强制 `--confirm`**
 `RestoreEngine.restore` 自身检查 `confirm` 参数，不止依赖命令层。任何调用路径都必须显式确认。
+
+**实时归档为什么放在事件钩子而不是等定时备份**
+群被炸、机器人被踢时，平台历史消息接口往往已经拿不到了。`EventHooks.archive_message`
+在消息进群那一刻就写库（只写库、不下载媒体），定时/增量备份再补齐媒体与成员快照。
+钩子只做判断，AstrBot 事件字段全部鸭子类型读取，适配器改名不影响核心逻辑。
 
 **Event 适配**
 真实平台方法名在不同 AstrBot 版本/适配器下不一致（`get_group_msg_history` / `get_group_history` / `get_history`），`PlatformAdapter` 逐一探测，全都没有就返回空数据而不是抛异常，避免一个 API 变更拖垮整个备份。

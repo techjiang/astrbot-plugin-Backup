@@ -29,7 +29,8 @@
 - 手动：`/backup now [群号]`
 - 定时：`/backup schedule set <群号> "0 3 * * *"`
 - 增量：以 `(timestamp, message_id)` 复合排序记录增量点，首次全量、之后增量
-- 触发式：大量退群、群解散预警、机器人被踢前的最后备份
+- 实时归档：消息进群即写库（只写库不下媒体），群被炸/被踢时仍有底
+- 触发式：10 分钟内退群数超阈值、群解散、机器人被踢，自动补一次备份
 
 **导出格式**
 
@@ -143,7 +144,7 @@ python -m pytest -q
 python -m coverage run --source=backup/core,backup/exporters -m pytest -q && python -m coverage report
 ```
 
-覆盖率要求 ≥ 80%。
+覆盖率要求 ≥ 80%。`backup/main.py` 是 AstrBot 接线层，不进覆盖率统计口径。
 
 项目结构：
 
