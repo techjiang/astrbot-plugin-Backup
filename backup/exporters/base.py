@@ -16,6 +16,8 @@ class ExportContext:
     members: list[GroupMember] = field(default_factory=list)
     media_index: dict[str, Path] = field(default_factory=dict)
     backup_id: str = ""
+    # 导出前的消息集校验和。导出器拼出来的清单要跟它一致，ZIP 包才恢复得回去
+    checksum: str = ""
 
     @property
     def group_name(self) -> str:

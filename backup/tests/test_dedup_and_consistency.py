@@ -61,11 +61,13 @@ class TestRepeatBackup:
         await engine.backup_group(100, platform, incremental=False, download_media=False)
         await engine.backup_group(100, platform, incremental=False, download_media=False)
 
+        # 库里不膨胀就够。第二次全量一条也没新增，它不该再记 5 条，
+        # 「这次备份覆盖了哪些消息」由 backup_id 归属来回答
         assert db.count_messages(100) == 5
-        # 第二次全量是「接管」：5 条消息全归后一次备份
         records = db.list_records(100)
-        assert records[0].message_count == 5
-        assert db.count_backup_source(records[0].backup_id) == 5
+        assert records[0].message_count == 0
+        assert db.count_backup_source(records[0].backup_id) == 0
+        assert db.count_backup_source(records[1].backup_id) == 5
 
     async def test_empty_backup_does_not_mask_previous(self, db, tmp_path):
         engine = BackupEngine(db, tmp_path / "media", {"media": {}})
@@ -114,6 +116,17 @@ class TestExportOwnership:
         assert result.message_count == 1
         assert "消息内容 1" in result.path.read_text(encoding="utf-8")
         assert "消息内容 0" not in result.path.read_text(encoding="utf-8")
+
+    def test_export_latest_keeps_realtime_only_messages(self, db, tmp_path):
+        """群被炸时最后几条只在实时归档里，导最近一次备份不能把它们漏掉。"""
+        db.save_message(make_message(0), "bk1")
+        record(db, "bk1", count=1, when=datetime(2024, 5, 1))
+        db.save_message(make_message(1), "realtime")  # 备份之后才进群的消息
+
+        manager = ExportManager(db, tmp_path / "exports", tmp_path / "media")
+        result = manager.export_latest(100, "txt")
+        assert result.message_count == 2
+        assert "消息内容 1" in result.path.read_text(encoding="utf-8")
 
     def test_html_lists_backup_id(self, db, tmp_path):
         db.save_message(make_message(0), "bk_visible")
@@ -333,3 +346,105 @@ class TestParserRoundTrip:
             assert {m.content for m in fresh.get_messages(777)} == {m.content for m in msgs}
         finally:
             fresh.close()
+
+
+class TestRealtimeArchiveOwnership:
+    """实时归档是「群被炸时的兜底」，后续备份不能把它挪走或漏掉。"""
+
+    def _archive(self, db, message_id="m50", minute=50):
+        from backup.core.auto_trigger import AutoTrigger
+        from backup.core.event_hooks import EventHooks
+
+        payload = {
+            "message_id": message_id,
+            "group_id": 100,
+            "sender": {"user_id": 1, "nickname": "u"},
+            "timestamp": (datetime(2024, 5, 1, 10, minute)).timestamp(),
+            "message": [{"type": "text", "data": {"text": "最后一句"}}],
+        }
+
+        # 用实例属性而不是类属性：类属性的 dict 是共享的，改一次污染所有用例
+        class Event:
+            group_id = 100
+            sender_id = 1
+            sender_name = "u"
+            message_str = "最后一句"
+
+        event = Event()
+        event.message_obj = payload
+        EventHooks(db, AutoTrigger({})).archive_message(event)
+
+    async def test_full_backup_keeps_realtime_ownership(self, db, tmp_path):
+        self._archive(db)
+        engine = BackupEngine(db, tmp_path / "media", {"media": {}})
+        # 平台接口只回得到 0..9 分钟，实时归档那条（50 分钟）平台已经取不到了
+        await engine.backup_group(
+            100, FakePlatform(history=raw_history(10)), incremental=False, download_media=False
+        )
+
+        assert db.count_messages(100) == 11
+        assert db.message_backup_id("m50", 100) == "realtime"
+
+    async def test_realtime_message_survives_export_latest(self, db, tmp_path):
+        self._archive(db)
+        engine = BackupEngine(db, tmp_path / "media", {"media": {}})
+        await engine.backup_group(
+            100, FakePlatform(history=raw_history(10)), incremental=False, download_media=False
+        )
+        result = ExportManager(db, tmp_path / "exports", tmp_path / "media").export_latest(100, "txt")
+        assert result.message_count == 11
+        assert "最后一句" in result.path.read_text(encoding="utf-8")
+
+    async def test_realtime_archive_does_not_advance_incremental_point(self, db, tmp_path):
+        """实时归档按到达顺序写库，时间戳乱序，不能拿它当增量点。"""
+        engine = BackupEngine(db, tmp_path / "media", {"media": {}})
+        await engine.backup_group(
+            100, FakePlatform(history=raw_history(5)), incremental=False, download_media=False
+        )
+        self._archive(db, message_id="m50", minute=50)  # 值夜班的人抢先归档了一条
+
+        platform = FakePlatform(history=raw_history(8))
+        record = await engine.backup_group(100, platform, incremental=True, download_media=False)
+        # 增量点仍停在 m4，m5..m7 必须补进来
+        assert record.message_count == 3
+        assert db.count_messages(100) == 9
+
+
+class TestResumeAfterInterruption:
+    """备份中途断掉后重跑，不该把下半截重下、重计。"""
+
+    async def test_rerun_does_not_redownload_media(self, db, tmp_path):
+        history = raw_history(3)
+        history[0]["message"] = [
+            {"type": "image", "data": {"url": "https://example.invalid/a.png"}}
+        ]
+        engine = BackupEngine(db, tmp_path / "media", {"media": {}})
+        downloads = []
+
+        async def fake_download(url, message_id, timestamp, session=None):
+            downloads.append(message_id)
+            path = tmp_path / "media" / f"{message_id}.png"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"x")
+            return str(path)
+
+        engine.media.download = fake_download
+        platform = FakePlatform(history=history)
+        await engine.backup_group(100, platform, incremental=False, download_media=True)
+        second = await engine.backup_group(100, platform, incremental=False, download_media=True)
+
+        assert downloads == ["m0"]
+        assert second.message_count == 0
+        assert second.media_count == 0
+        assert db.count_messages(100) == 3
+
+    async def test_resume_collects_only_missing_half(self, db, tmp_path):
+        """模拟上半截已入库、增量点没推进：续传只该补剩下的。"""
+        engine = BackupEngine(db, tmp_path / "media", {"media": {}})
+        full = FakePlatform(history=raw_history(120))
+        await engine.backup_group(100, FakePlatform(history=raw_history(60)), incremental=False, download_media=False)
+
+        record = await engine.backup_group(100, full, incremental=True, download_media=False)
+
+        assert record.message_count == 60
+        assert db.count_messages(100) == 120

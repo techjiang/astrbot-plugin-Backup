@@ -107,6 +107,9 @@ CREATE TABLE IF NOT EXISTS schedules (
 );
 """
 
+# 实时归档写入的 messages.backup_id。它不是一次备份，只是「已经在库里了」的标记。
+REALTIME_BACKUP_ID = "realtime"
+
 # 老库升级：messages 的唯一键从 (message_id, group_id, backup_id) 收紧到
 # (message_id, group_id)。不做这一步，升级前建的库会继续堆重复消息。
 _MESSAGES_UNIQUE = ("message_id", "group_id")
@@ -266,6 +269,13 @@ class Database:
         )
         return cur.rowcount if cur else 0
 
+    def message_backup_id(self, message_id: str, group_id: int) -> str:
+        row = self.query_one(
+            "SELECT backup_id FROM messages WHERE message_id = ? AND group_id = ? LIMIT 1",
+            (message_id, group_id),
+        )
+        return str(row["backup_id"] or "") if row else ""
+
     def message_exists(self, message_id: str, group_id: int) -> bool:
         return (
             self.query_one(
@@ -314,6 +324,39 @@ class Database:
             is_forward=bool(row["is_forward"]),
             forward_chain=json.loads(row["forward_chain"] or "[]"),
         )
+
+    def latest_backup_message_key(self, group_id: int) -> Optional[tuple[datetime, str]]:
+        """该群非实时归档消息里最新的一条，用作增量点基线。
+
+        实时归档的行不参与：它按到达顺序写库，时间戳乱序，而且它不代表「备份已经
+        覆盖到哪」——拿它当基线会让后续备份跳过一整个时间段的正常消息。
+        """
+        row = self.query_one(
+            """SELECT timestamp, message_id FROM messages
+               WHERE group_id = ? AND backup_id != ?
+               ORDER BY timestamp DESC, id DESC LIMIT 1""",
+            (group_id, REALTIME_BACKUP_ID),
+        )
+        if row is None:
+            return None
+        ts = from_db(row["timestamp"])
+        if ts is None:
+            return None
+        return ts, str(row["message_id"] or "")
+
+    def latest_message_key(self, group_id: int) -> Optional[tuple[datetime, str]]:
+        """库里该群最新一条消息的 (timestamp, message_id)，用作续传水位。"""
+        row = self.query_one(
+            """SELECT timestamp, message_id FROM messages WHERE group_id = ?
+               ORDER BY timestamp DESC, id DESC LIMIT 1""",
+            (group_id,),
+        )
+        if row is None:
+            return None
+        ts = from_db(row["timestamp"])
+        if ts is None:
+            return None
+        return ts, str(row["message_id"] or "")
 
     def count_messages(self, group_id: Optional[int] = None) -> int:
         if group_id is None:

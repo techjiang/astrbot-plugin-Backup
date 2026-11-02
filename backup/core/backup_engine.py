@@ -91,14 +91,22 @@ class BackupEngine:
             (self.config.get("incremental") or {}).get("enabled", True)
         )
         base = self.db.latest_completed_record(group_id) if incremental_enabled else None
-        point = self.tracker.get_incremental(group_id) if incremental_enabled else None
+        # 这一轮往下跑的水位，取两者更靠后的：
+        # - 增量点：平台接口还翻得到的老消息不必每轮从头分页；
+        # - 库里非实时归档的最新一条：上一轮中途断掉时增量点不会推进（只有整轮
+        #   跑完才 advance），但库里已经有半截数据，续传不该把半截再下一遍。
+        # 实时归档的行两边都不参与：它按到达顺序写库、时间戳乱序，拿它当水位会
+        # 跳过一整个时间段的正常消息
+        stored_point = self.tracker.get_stored_point(group_id)
+        candidates = [k for k in (stored_point, self.db.latest_backup_message_key(group_id)) if k]
+        skip_key = max(candidates) if candidates else (datetime.min, "")
 
         record = BackupRecord(
             backup_id=self._gen_backup_id(group_id),
             group_id=group_id,
             status=BackupStatus.RUNNING,
             started_at=datetime.now(),
-            is_incremental=point is not None,
+            is_incremental=incremental_enabled and stored_point is not None,
             base_backup_id=base.backup_id if base else None,
         )
         self.db.save_record(record)
@@ -114,8 +122,9 @@ class BackupEngine:
 
             # 3-5. 分页拉消息，解析、下载媒体、入库
             page = 0
-            saved: list[Message] = []
+            collected: list[Message] = []
             failed_media = 0
+            skipped = 0
             while True:
                 batch = await adapter.get_group_history(
                     group_id, count=PAGE_SIZE, offset=page * PAGE_SIZE
@@ -124,21 +133,27 @@ class BackupEngine:
                     break
                 for raw in batch:
                     msg = parse_message(raw, group_id)
-                    if point is not None and not (
-                        (msg.timestamp, str(msg.message_id)) > (point[0], point[1])
-                    ):
+                    # 两道判断不能合并成「早于水位」：全量重跑时库里可能已经堆了
+                    # 实时归档的消息（时间靠后），拿它当水位会把正常消息一起跳掉。
+                    # 所以水位只在增量盘跑过之后才生效，库里有没有则逐条问。
+                    too_old = stored_point is not None and (
+                        (msg.timestamp, str(msg.message_id)) <= skip_key
+                    )
+                    if too_old or self.db.message_exists(msg.message_id, group_id):
+                        skipped += 1
                         continue
+                    # 已在库里的消息归属不动——包括实时归档的 backup_id='realtime'。
+                    # 改成归给本次备份，等于把「群被炸时的兜底数据」从实时归档那个
+                    # 入口上摘掉，`export latest` 从此看不到它
                     if download_media and msg.media_paths:
                         ok, bad = await self._download_media(msg)
                         record.media_count += ok
                         failed_media += bad
-                    if any(s.message_id == msg.message_id for s in saved):
-                        continue
-                    # 重跑全量、重试、恢复都会重写同一条消息：库里去重，但本次备份
-                    # 仍然覆盖了它，所以要接着写归属，否则这次的导出会是空的
+                    existed = self.db.message_exists(msg.message_id, group_id)
                     self.db.save_message(msg, record.backup_id)
-                    saved.append(msg)
-                    record.message_count += 1
+                    if not existed:
+                        record.message_count += 1
+                    collected.append(msg)
                 page += 1
                 if progress_callback:
                     await progress_callback(record.message_count)
@@ -146,11 +161,14 @@ class BackupEngine:
                     break
 
             # 6. 增量点
-            if saved:
-                self.tracker.advance(group_id, saved)
+            if collected:
+                self.tracker.advance(group_id, collected)
 
             # 7. 校验和
-            record.checksum = compute_checksum(saved)
+            record.checksum = compute_checksum(collected)
+            logger.debug(
+                "备份 group=%s 新增=%s 已在库=%s", group_id, record.message_count, skipped
+            )
             record.total_size = self._compute_size(group_id)
             record.status = BackupStatus.PARTIAL if failed_media else BackupStatus.COMPLETED
             record.error = f"{failed_media} 个媒体文件下载失败" if failed_media else None
@@ -191,6 +209,21 @@ class BackupEngine:
                 )
                 msg.media_paths[i] = f"[下载失败] {url}"
         return ok, failed
+
+    def watermark(self, group_id: int) -> tuple[datetime, str]:
+        """上次备份停在哪 —— 增量点与库里最新一条消息取更靠后的那个。
+
+        备份中途断掉时增量点不会推进（只有整轮跑完才 advance），但库里已经有半截
+        数据。续传若只认增量点，会把这半截整段重拉、媒体整段重下，媒体记录还会
+        重复插入。以库里的水位做下界，续传就真的只是往下跑。
+        """
+        point = self.tracker.get_incremental(group_id)
+        latest = self.db.latest_message_key(group_id)
+        if latest is None:
+            return point or (datetime.min, "")
+        if point is None:
+            return latest
+        return max(point, latest)
 
     def _compute_size(self, group_id: int) -> int:
         total = 0

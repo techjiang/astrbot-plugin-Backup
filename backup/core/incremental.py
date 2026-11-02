@@ -15,7 +15,21 @@ class IncrementalTracker:
         self.db = db
 
     def get_incremental(self, group_id: int) -> Optional[tuple[datetime, str]]:
-        """返回上次备份的 (timestamp, message_id)；从未备份过返回 None。"""
+        """返回上次备份的 (timestamp, message_id)；从未备份过返回 None。
+
+        backup_meta 那一行可能是老版本写的（那时还会把实时归档算进水位），所以
+        还要跟库里「非实时归档」的最新一条取更靠后的那个。
+        """
+        point = self.get_stored_point(group_id)
+        latest = self.db.latest_backup_message_key(group_id)
+        if latest is None:
+            return point
+        if point is None:
+            return latest
+        return max(point, latest)
+
+    def get_stored_point(self, group_id: int) -> Optional[tuple[datetime, str]]:
+        """只读 backup_meta，不看库里的消息。"""
         row = self.db.query_one(
             "SELECT last_timestamp, last_message_id FROM backup_meta WHERE group_id = ?",
             (group_id,),

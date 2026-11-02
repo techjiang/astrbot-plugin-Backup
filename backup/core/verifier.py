@@ -37,8 +37,17 @@ def sha256_file(path: str | Path) -> str:
     return h.hexdigest()
 
 
+def read_manifest(archive: str | Path) -> dict:
+    """读备份包里的 manifest。读不到返回空 dict。"""
+    try:
+        with zipfile.ZipFile(archive) as zf:
+            return json.loads(zf.read("manifest.json").decode("utf-8"))
+    except (KeyError, zipfile.BadZipFile, ValueError):
+        return {}
+
+
 def verify_zip(path: str | Path, expected_checksum: Optional[str] = None) -> tuple[bool, str]:
-    """校验 ZIP 备份包：CRC 全量扫描 + 可选 manifest 校验和比对。"""
+    """校验 ZIP 备份包：CRC 全量扫描 + manifest 校验和比对 + 包内文件齐不齐。"""
     p = Path(path)
     if not p.is_file():
         return False, "备份文件不存在"
@@ -49,13 +58,30 @@ def verify_zip(path: str | Path, expected_checksum: Optional[str] = None) -> tup
             bad = zf.testzip()
             if bad:
                 return False, f"文件损坏：{bad}"
+            names = set(zf.namelist())
+            try:
+                manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+            except KeyError:
+                manifest = {}
+            except ValueError:
+                return False, "manifest.json 无法解析"
             if expected_checksum:
-                try:
-                    manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
-                except KeyError:
+                if not manifest:
                     return False, "缺少 manifest.json，无法校验"
                 if manifest.get("checksum") != expected_checksum:
                     return False, "校验和不一致，备份可能被修改"
+            # manifest 自洽不等于包完整：消息文件和媒体都可能被挑走，
+            # 恢复前就该说清，而不是恢复完发现缺了一段
+            if not any(n.endswith(".json") and n.startswith("json/") for n in names):
+                return False, "包内没有消息文件"
+            expected_media = {
+                n
+                for n in (manifest.get("media_files") or [])
+                if isinstance(n, str) and n
+            }
+            absent = sorted(expected_media - names)
+            if absent:
+                return False, f"包内缺媒体文件 {len(absent)} 个，最早缺失：{absent[0]}"
     except zipfile.BadZipFile:
         return False, "ZIP 解析失败"
     return True, "校验通过"

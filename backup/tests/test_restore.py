@@ -139,7 +139,26 @@ class TestRestoreEngine:
         archive = tmp_path / "x.zip"
         with zipfile.ZipFile(archive, "w") as zf:
             zf.writestr("manifest.json", '{"checksum": "abc"}')
+            zf.writestr("json/daily/2024-05-01.json", "[]")
         ok, reason = verify_zip(archive, "def")
         assert ok is False and "校验和" in reason
         ok, _ = verify_zip(archive, "abc")
         assert ok is True
+
+    def test_verify_zip_rejects_package_without_messages(self, tmp_path):
+        archive = tmp_path / "empty.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("manifest.json", '{"checksum": "abc"}')
+        ok, reason = verify_zip(archive, "abc")
+        assert ok is False and "消息文件" in reason
+
+    def test_verify_zip_reports_missing_media(self, tmp_path):
+        archive = tmp_path / "media.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("json/daily/2024-05-01.json", "[]")
+            zf.writestr(
+                "manifest.json",
+                '{"checksum": "abc", "media_files": ["media/20240501/a.png"]}',
+            )
+        ok, reason = verify_zip(archive, "abc")
+        assert ok is False and "缺媒体文件" in reason

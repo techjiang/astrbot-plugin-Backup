@@ -18,7 +18,7 @@ from typing import Optional
 from ..exporters import get_exporter
 from ..exporters.base import ExportContext
 from ..exporters.html_exporter import HtmlExporter
-from .database import Database
+from .database import REALTIME_BACKUP_ID, Database
 from .models import Message
 from .verifier import compute_checksum
 
@@ -97,11 +97,34 @@ class ExportManager:
         )
 
     def export_latest(self, group_id: int, fmt: str, own_user_id: Optional[int] = None) -> ExportResult:
-        """导出该群「最近一次备份」。"""
+        """导出该群「最近一次备份」，外加只在实时归档里的那部分消息。
+
+        群被炸的场景下，最后那几条消息只走了实时归档（backup_id='realtime'），
+        它们不属于任何一次备份。只按 backup_id 取整份导出会刚好漏掉最要紧的一段。
+        """
         record = self.db.latest_completed_record(group_id)
-        return self.export(
-            group_id, fmt, backup_id=record.backup_id if record else None, own_user_id=own_user_id
-        )
+        ctx = self.build_context(group_id, record.backup_id if record else None)
+        owned = {m.message_id for m in ctx.messages}
+        extra = []
+        if record is not None:
+            # 一次备份按群全量跑完时接手了所有消息，更早的备份就只剩空壳；此时若
+            # latest 只导自己名下那几条，等于把历史丢了。所以「上次备份名下已经
+            # 没有消息」时，退回整群导出，再补上不属于任何备份的那些（实时归档）
+            history_hollow = not any(
+                r.backup_id != record.backup_id and self.db.count_backup_source(r.backup_id, group_id)
+                for r in self.db.list_records(group_id)
+            )
+            for m in self.db.get_messages(group_id=group_id):
+                if m.message_id in owned:
+                    continue
+                if history_hollow or self.db.message_backup_id(
+                    m.message_id, group_id
+                ) in ("", REALTIME_BACKUP_ID):
+                    extra.append(m)
+        ctx.messages = sorted(ctx.messages + extra, key=lambda m: (m.timestamp, m.message_id))
+        # manifest 里的校验和跟着最终消息集走，否则恢复时会跟包内容对不上
+        ctx.checksum = compute_checksum(ctx.messages)
+        return self._finish(group_id, fmt, ctx, own_user_id)
 
     def export(
         self,
@@ -110,8 +133,17 @@ class ExportManager:
         backup_id: Optional[str] = None,
         own_user_id: Optional[int] = None,
     ) -> ExportResult:
-        fmt = (fmt or "sqlite").lower()
         ctx = self.build_context(group_id, backup_id)
+        return self._finish(group_id, fmt, ctx, own_user_id)
+
+    def _finish(
+        self,
+        group_id: int,
+        fmt: str,
+        ctx: ExportContext,
+        own_user_id: Optional[int] = None,
+    ) -> ExportResult:
+        fmt = (fmt or "sqlite").lower()
         if not ctx.messages:
             raise ValueError("该群没有可导出的消息")
 
@@ -164,19 +196,24 @@ class ExportManager:
             "message_count": len(ctx.messages),
             "member_count": len(ctx.members),
             "exported_at": datetime.now().isoformat(),
-            "checksum": compute_checksum(ctx.messages),
+            "checksum": ctx.checksum or compute_checksum(ctx.messages),
             "author": {"name": "科技酱", "homepage": "https://www.asoe.cn"},
         }
+        media_members: list[str] = []
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for file in work.rglob("*"):
                 if file.is_file():
                     zf.write(file, file.relative_to(work))
-            zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
             for m in ctx.messages:
                 for media in m.media_paths:
                     p = Path(media)
                     if p.is_file() and self._is_inside(p, self.media_dir):
-                        zf.write(p, Path("media") / p.parent.name / p.name)
+                        member = str(Path("media") / p.parent.name / p.name)
+                        zf.write(p, member)
+                        media_members.append(member)
+            # 媒体清单写进 manifest，校验时才知道包里该有哪些文件
+            manifest["media_files"] = sorted(set(media_members))
+            zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         shutil.rmtree(work, ignore_errors=True)
         return zip_path
 
