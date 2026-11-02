@@ -58,6 +58,7 @@ class HtmlExporter(BaseExporter):
         replacements = {
             "GROUP_NAME": html.escape(ctx.group_name),
             "GROUP_ID": str(ctx.group_id),
+            "BACKUP_LABEL": f"备份 {html.escape(ctx.backup_id)}" if ctx.backup_id else "",
             "MEMBER_COUNT": str(len(ctx.members)),
             "MESSAGE_COUNT": str(len(messages)),
             "TIME_RANGE": html.escape(time_range),

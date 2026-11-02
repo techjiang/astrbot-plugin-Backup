@@ -133,26 +133,36 @@ def render_backup_list(db: Database, group_id: Optional[int] = None, limit: int 
 
 def render_status(db: Database, group_id: int) -> str:
     info = db.get_group_info(group_id)
+    # 取「最近一次真正落了消息的备份」，而不是列表第一行：
+    # 空跑一次会留下 0 条的记录，按第一行取会把实绩藏起来
     record = db.latest_completed_record(group_id)
     members = db.get_members(group_id)
     lines = [f"**群 {info.group_name if info else group_id}**（{group_id}）"]
     lines.append(f"消息总数：{db.count_messages(group_id)}")
     lines.append(f"成员数：{len(members)}")
     if record:
+        # 记录里的 message_count 是「那次新增了多少」，和库里的总数不是一回事
         lines.append(f"最近备份：{record.started_at:%Y-%m-%d %H:%M:%S}")
-        lines.append(f"消息数：{record.message_count} · 媒体数：{record.media_count}")
-        lines.append(f"大小：{human_size(record.total_size)}")
+        lines.append(
+            f"这次新增：{record.message_count} 条 · 媒体 {record.media_count} 个"
+            f" · 累计 {human_size(record.total_size)}"
+        )
     else:
         lines.append("还没有完成过备份")
     return "\n".join(lines)
 
 
 def render_diff(db: Database, id1: str, id2: str) -> str:
+    """比两次备份各自留下了哪些消息。
+
+    消息按 (message_id, group_id) 唯一，一条消息只归属最后一次归档它的备份，
+    所以这里按归属反查，而不是把整个群的库都算给每次备份——那样比出来永远相等。
+    """
     r1, r2 = db.get_record(id1), db.get_record(id2)
     if not r1 or not r2:
         return "备份 ID 不存在，无法对比。"
-    m1 = {m.message_id for m in db.get_messages(backup_id=id1)}
-    m2 = {m.message_id for m in db.get_messages(backup_id=id2)}
+    m1 = {m.message_id for m in db.get_messages(group_id=r1.group_id, backup_id=id1)}
+    m2 = {m.message_id for m in db.get_messages(group_id=r2.group_id, backup_id=id2)}
     only1, only2 = m1 - m2, m2 - m1
     return (
         f"**备份对比**\n- `{id1}`：{len(m1)} 条\n- `{id2}`：{len(m2)} 条\n"

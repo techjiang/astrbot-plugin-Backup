@@ -66,7 +66,10 @@ class RestoreEngine:
         target = target_group_id or record.group_id
 
         messages = self._load_messages(backup_id, archive)
-        if messages and record.checksum and not archive:
+        if messages and record.checksum:
+            # 无论消息来自库还是 ZIP 包，都要跟记录里的校验和对上。
+            # 只在 archive 为空时校验等于放行整个 ZIP 路径：包的 manifest 只要自洽，
+            # 内容被换过也能一路写进目标群。
             actual = compute_checksum(messages)
             if actual != record.checksum:
                 raise RestoreError("消息校验和不一致，备份可能已损坏")
@@ -85,6 +88,9 @@ class RestoreEngine:
                 # merge：保留原有，仅补齐缺失字段（这里等同跳过，但不计数为 skip）
             if self.db.save_message(msg, backup_id):
                 inserted += 1
+            elif not exists:
+                # 已存在（含 merge 策略）：补上这次恢复的归属，否则导出按备份取数会看不到它
+                self.db.assign_message_backup(msg.message_id, target, backup_id)
 
         return RestoreResult(
             backup_id=backup_id,
@@ -105,12 +111,14 @@ class RestoreEngine:
             raise RestoreError("不是合法的 ZIP 备份包")
         messages: list[Message] = []
         with zipfile.ZipFile(path) as zf:
-            if "messages.json" in zf.namelist():
+            names = zf.namelist()
+            if "messages.json" in names:
                 raw = json.loads(zf.read("messages.json").decode("utf-8"))
                 if isinstance(raw, dict):
                     raw = raw.get("messages", [])
                 return [parse_message(m) for m in raw]
-            for name in zf.namelist():
+            # ZIP 导出把 JSON 放在 json/daily/ 下，这里按同样路径取
+            for name in sorted(names):
                 if name.startswith("json/daily/") and name.endswith(".json"):
                     for m in json.loads(zf.read(name).decode("utf-8")):
                         messages.append(parse_message(m))

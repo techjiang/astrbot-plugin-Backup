@@ -85,6 +85,10 @@ def parse_message(raw: Any, group_id: Optional[int] = None) -> Message:
         or _get(sender, "nickname")
         or str(sender_id)
     )
+    # 导出器把消息摊平成一条 dict（content/message_type 在顶层），从 ZIP 包
+    # 恢复时走的就是这条路径。不显式接住的话内容会变成空串，校验和必然对不上。
+    flat_content = _get(raw, "content")
+    flat_type = _get(raw, "message_type")
     timestamp = _to_datetime(
         _get(raw, "timestamp", _get(raw, "time", _get(raw, "created_at")))
     )
@@ -124,10 +128,21 @@ def parse_message(raw: Any, group_id: Optional[int] = None) -> Message:
             if mtype is MessageType.FILE and label:
                 texts.append(f"[文件] {label}")
         else:
-            text = _get(data, "text") or _get(seg, "text") or ""
+            text = _get(data, "text") or _get(seg, "text")
+            if text is None and not stype:
+                # 没有 type 的 dict 常见于导出后回灌（message_type/content 平铺），
+                # 也见于单段纯文本对象；取不到就算空，不要拼出整段 JSON
+                text = _get(seg, "content")
             if text:
                 types.append(MessageType.TEXT)
                 texts.append(str(text))
+
+    if not types and flat_content and flat_type:
+        texts.append(str(flat_content))
+        try:
+            types.append(MessageType(str(flat_type)))
+        except ValueError:
+            types.append(MessageType.UNKNOWN)
 
     if not types:
         # 兜底：raw 本身就是纯文本

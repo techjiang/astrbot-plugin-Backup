@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import mimetypes
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -128,11 +129,13 @@ class BackupEngine:
                     ):
                         continue
                     if download_media and msg.media_paths:
-                        failed_media += await self._download_media(msg)
-                    if self.db.message_exists(msg.message_id, group_id) or any(
-                        s.message_id == msg.message_id for s in saved
-                    ):
+                        ok, bad = await self._download_media(msg)
+                        record.media_count += ok
+                        failed_media += bad
+                    if any(s.message_id == msg.message_id for s in saved):
                         continue
+                    # 重跑全量、重试、恢复都会重写同一条消息：库里去重，但本次备份
+                    # 仍然覆盖了它，所以要接着写归属，否则这次的导出会是空的
                     self.db.save_message(msg, record.backup_id)
                     saved.append(msg)
                     record.message_count += 1
@@ -160,9 +163,9 @@ class BackupEngine:
         self.db.save_record(record)
         return record
 
-    async def _download_media(self, msg: Message) -> int:
-        """下载消息媒体，返回失败数量。单个失败不影响整体。"""
-        failed = 0
+    async def _download_media(self, msg: Message) -> tuple[int, int]:
+        """下载消息媒体，返回 (成功数, 失败数)。单个失败不影响整体。"""
+        ok = failed = 0
         for i, url in enumerate(list(msg.media_paths)):
             if not isinstance(url, str) or not url.startswith("http"):
                 continue
@@ -177,16 +180,17 @@ class BackupEngine:
                     local_path=local,
                     filename=p.name,
                     file_size=p.stat().st_size,
-                    mime_type="",
+                    mime_type=mimetypes.guess_type(p.name)[0] or "",
                     sha256=self.media.sha256_of(p),
                 )
+                ok += 1
             except Exception as e:  # 红线 2：失败跳过并记录
                 failed += 1
                 logger.warning(
                     "媒体下载失败 message=%s reason=%s", msg.message_id, type(e).__name__
                 )
                 msg.media_paths[i] = f"[下载失败] {url}"
-        return failed
+        return ok, failed
 
     def _compute_size(self, group_id: int) -> int:
         total = 0

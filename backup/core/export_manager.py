@@ -79,12 +79,28 @@ class ExportManager:
         self.base_url = str(export_cfg.get("base_url") or "").rstrip("/")
 
     def build_context(self, group_id: int, backup_id: Optional[str] = None) -> ExportContext:
-        messages = self.db.get_messages(group_id=group_id, backup_id=backup_id)
+        """取导出用的数据。
+
+        不给 backup_id 就导整个群；给了就导这次备份覆盖到的消息——消息按
+        (message_id, group_id) 唯一、归属最后一次归档它的备份，所以一次全量
+        备份之后再来一次增量，增量只拿到自己新增的那几条，不会把全量再算一遍。
+        """
+        if backup_id is None:
+            messages = self.db.get_messages(group_id=group_id)
+        else:
+            messages = self.db.get_messages(group_id=group_id, backup_id=backup_id)
         return ExportContext(
             messages=messages,
             group_info=self.db.get_group_info(group_id),
             members=self.db.get_members(group_id),
             backup_id=backup_id or "",
+        )
+
+    def export_latest(self, group_id: int, fmt: str, own_user_id: Optional[int] = None) -> ExportResult:
+        """导出该群「最近一次备份」。"""
+        record = self.db.latest_completed_record(group_id)
+        return self.export(
+            group_id, fmt, backup_id=record.backup_id if record else None, own_user_id=own_user_id
         )
 
     def export(

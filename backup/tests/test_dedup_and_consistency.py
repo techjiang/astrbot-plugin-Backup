@@ -1,0 +1,335 @@
+"""消息唯一性带来的连锁行为：重复备份不留重复行、导出只算本次备份、恢复必须对得上校验和。"""
+
+import json
+import zipfile
+from datetime import datetime
+
+import pytest
+
+from backup.core.backup_engine import BackupEngine
+from backup.core.commands import render_diff, render_status
+from backup.core.database import Database
+from backup.core.download_route import PREFIX, handle_download
+from backup.core.export_manager import ExportManager
+from backup.core.models import BackupRecord, BackupStatus
+from backup.core.restore_engine import RestoreEngine, RestoreError
+from backup.core.verifier import compute_checksum
+
+from .conftest import FakePlatform, make_message, raw_history
+
+
+def record(db, bid, group_id=100, count=0, checksum="", when=None):
+    db.save_record(
+        BackupRecord(
+            backup_id=bid,
+            group_id=group_id,
+            status=BackupStatus.COMPLETED,
+            started_at=when or datetime.now(),
+            finished_at=when or datetime.now(),
+            message_count=count,
+            checksum=checksum,
+        )
+    )
+
+
+class TestMessageUniqueness:
+    def test_same_message_saved_twice_leaves_one_row(self, db):
+        msg = make_message(0)
+        assert db.save_message(msg, "bk1") is True
+        assert db.save_message(msg, "bk2") is False  # 第二次不算新增
+        assert db.count_messages(100) == 1
+
+    def test_later_backup_takes_ownership(self, db):
+        db.save_message(make_message(0), "bk1")
+        db.save_message(make_message(0), "bk2")
+        assert db.count_backup_source("bk1") == 0
+        assert db.count_backup_source("bk2") == 1
+        assert db.list_backup_ids_with_messages(100) == ["bk2"]
+
+    def test_different_group_same_message_id_kept_separate(self, db):
+        db.save_message(make_message(0, group_id=100), "bk1")
+        db.save_message(make_message(0, group_id=200), "bk1")
+        assert db.count_messages() == 2
+
+
+class TestRepeatBackup:
+    """全量重跑、增量重跑都不该让库里的消息数膨胀。"""
+
+    async def test_repeated_full_backup_does_not_duplicate(self, db, tmp_path):
+        engine = BackupEngine(db, tmp_path / "media", {"media": {}})
+        platform = FakePlatform(history=raw_history(5))
+        await engine.backup_group(100, platform, incremental=False, download_media=False)
+        await engine.backup_group(100, platform, incremental=False, download_media=False)
+
+        assert db.count_messages(100) == 5
+        # 第二次全量是「接管」：5 条消息全归后一次备份
+        records = db.list_records(100)
+        assert records[0].message_count == 5
+        assert db.count_backup_source(records[0].backup_id) == 5
+
+    async def test_empty_backup_does_not_mask_previous(self, db, tmp_path):
+        engine = BackupEngine(db, tmp_path / "media", {"media": {}})
+        await engine.backup_group(
+            100, FakePlatform(history=raw_history(4)), incremental=False, download_media=False
+        )
+        first = db.list_records(100)[0]
+
+        await engine.backup_group(100, FakePlatform(history=[]), incremental=False, download_media=False)
+
+        # 空跑一次不该顶掉上一次的实绩，否则「最近备份」永远显示 0 条
+        assert db.latest_completed_record(100).backup_id == first.backup_id
+        assert "这次新增：4 条" in render_status(db, 100)
+
+
+class TestExportOwnership:
+    def test_backup_export_only_covers_its_own_messages(self, db, tmp_path):
+        for i in range(4):
+            db.save_message(make_message(i), "bk1")
+        for i in range(4, 6):
+            db.save_message(make_message(i), "bk2")
+        record(db, "bk1", count=4)
+        record(db, "bk2", count=2)
+
+        manager = ExportManager(db, tmp_path / "exports", tmp_path / "media")
+        # 增量备份 bk2 只导自己新增的 2 条，不能把 bk1 的 4 条再算一遍
+        assert len(manager.build_context(100, "bk2").messages) == 2
+        assert len(manager.build_context(100, "bk1").messages) == 4
+        assert len(manager.build_context(100).messages) == 6  # 不指定就是整群
+
+    def test_backup_id_argument_is_not_swallowed(self, db, tmp_path):
+        """未指定 backup_id 时不能退化成「整群」——早期写法会这样。"""
+        db.save_message(make_message(0), "bk1")
+        db.save_message(make_message(1), "bk2")
+        manager = ExportManager(db, tmp_path / "exports", tmp_path / "media")
+        assert [m.message_id for m in manager.build_context(100, "bk1").messages] == ["m0"]
+
+    def test_export_latest_uses_latest_record(self, db, tmp_path):
+        db.save_message(make_message(0), "bk1")
+        record(db, "bk1", count=1, when=datetime(2024, 5, 1))
+        db.save_message(make_message(1), "bk2")
+        record(db, "bk2", count=1, when=datetime(2024, 5, 2))
+
+        manager = ExportManager(db, tmp_path / "exports", tmp_path / "media")
+        result = manager.export_latest(100, "txt")
+        assert result.message_count == 1
+        assert "消息内容 1" in result.path.read_text(encoding="utf-8")
+        assert "消息内容 0" not in result.path.read_text(encoding="utf-8")
+
+    def test_html_lists_backup_id(self, db, tmp_path):
+        db.save_message(make_message(0), "bk_visible")
+        record(db, "bk_visible", count=1)
+        manager = ExportManager(db, tmp_path / "exports", tmp_path / "media")
+        html = manager.export(100, "html", backup_id="bk_visible").path.read_text(encoding="utf-8")
+        assert "bk_visible" in html
+        # 没指定备份时不该冒出空的「备份 ID：」
+        whole = manager.export(100, "txt").path.read_text(encoding="utf-8")
+        assert "bk_visible" not in whole
+
+
+class TestRestoreChecksum:
+    """恢复必须校验到内容本身，不能只看包自己的 manifest。"""
+
+    async def _seeded(self, db):
+        msgs = [make_message(i) for i in range(3)]
+        for m in msgs:
+            db.save_message(m, "bk1")
+        record(db, "bk1", count=3, checksum=compute_checksum(msgs))
+        return msgs
+
+    async def test_tampered_database_rejected(self, db):
+        await self._seeded(db)
+        db.execute("UPDATE messages SET content = '被改过' WHERE message_id = 'm1'")
+        with pytest.raises(RestoreError):
+            await RestoreEngine(db).restore("bk1", 999, confirm=True)
+
+    async def test_tampered_zip_with_self_consistent_manifest_rejected(self, db, tmp_path):
+        await self._seeded(db)
+        forged = make_message(0, content="替换后的内容")
+        archive = tmp_path / "forged.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr(
+                "messages.json",
+                json.dumps([{"message_id": forged.message_id, "group_id": 100,
+                             "sender_id": 1, "sender_name": "u",
+                             "timestamp": forged.timestamp.isoformat(),
+                             "message_type": "text", "content": forged.content}], ensure_ascii=False),
+            )
+            # 攻击者按算法重算 manifest，包自身自洽，但和记录里的校验和对不上
+            zf.writestr("manifest.json", json.dumps({"checksum": compute_checksum([forged])}))
+
+        with pytest.raises(RestoreError):
+            await RestoreEngine(db).restore("bk1", 888, archive=archive, confirm=True)
+        assert db.count_messages(888) == 0
+
+    async def test_zip_restore_reads_daily_json(self, db, tmp_path):
+        msgs = await self._seeded(db)
+        archive = tmp_path / "good.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr(
+                "json/daily/2024-05-01.json",
+                json.dumps(
+                    [
+                        {"message_id": m.message_id, "group_id": 100, "sender_id": m.sender_id,
+                         "sender_name": m.sender_name, "timestamp": m.timestamp.isoformat(),
+                         "message_type": "text", "content": m.content}
+                        for m in msgs
+                    ],
+                    ensure_ascii=False,
+                ),
+            )
+            zf.writestr("manifest.json", json.dumps({"checksum": compute_checksum(msgs)}))
+
+        result = await RestoreEngine(db).restore("bk1", 777, archive=archive, confirm=True)
+        assert result.inserted == 3
+        assert db.count_messages(777) == 3
+
+
+class TestMediaCount:
+    async def test_media_count_counts_successes_only(self, db, tmp_path, monkeypatch):
+        history = raw_history(3)
+        for raw in history:
+            raw["message"] = [{"type": "image", "data": {"url": f"https://cdn/{raw['message_id']}.png"}}]
+        engine = BackupEngine(db, tmp_path / "media", {"media": {}})
+
+        async def ok(url, message_id, timestamp, session=None):
+            p = tmp_path / "media" / f"{message_id}.png"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"x")
+            return str(p)
+
+        monkeypatch.setattr(engine.media, "download", ok)
+        first = await engine.backup_group(100, FakePlatform(history=history), incremental=False)
+        assert first.media_count == 3
+        assert first.status is BackupStatus.COMPLETED
+
+    async def test_partial_records_failed_count(self, db, tmp_path, monkeypatch):
+        history = raw_history(2)
+        for raw in history:
+            raw["message"] = [{"type": "image", "data": {"url": "https://cdn/x.png"}}]
+        engine = BackupEngine(db, tmp_path / "media", {"media": {}})
+
+        async def boom(*a, **kw):
+            raise RuntimeError("down")
+
+        monkeypatch.setattr(engine.media, "download", boom)
+        rec = await engine.backup_group(100, FakePlatform(history=history), incremental=False)
+        assert rec.media_count == 0
+        assert rec.status is BackupStatus.PARTIAL
+        assert "2 个媒体文件下载失败" in rec.error
+
+
+class TestLegacyDatabaseMigration:
+    """升级前建的库：唯一键带 backup_id，直接沿用会继续堆重复消息。"""
+
+    def _legacy_db(self, path):
+        import sqlite3
+
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            """
+            CREATE TABLE messages (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              message_id TEXT NOT NULL,
+              group_id INTEGER NOT NULL,
+              sender_id INTEGER NOT NULL,
+              sender_name TEXT,
+              timestamp DATETIME NOT NULL,
+              message_type TEXT NOT NULL,
+              content TEXT,
+              raw_content TEXT,
+              reply_to TEXT,
+              is_forward BOOLEAN DEFAULT 0,
+              media_paths TEXT,
+              forward_chain TEXT,
+              backup_id TEXT NOT NULL,
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              UNIQUE(message_id, group_id, backup_id)
+            );
+            """
+        )
+        rows = [
+            ("m0", 100, "bk1", "旧内容"),
+            ("m0", 100, "bk2", "旧内容"),
+            ("m1", 100, "bk1", "第二条"),
+        ]
+        conn.executemany(
+            """INSERT INTO messages
+               (message_id, group_id, sender_id, sender_name, timestamp, message_type,
+                content, raw_content, backup_id)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            [(mid, gid, 1, "u", "2024-05-01 10:00:00.000000", "text", c, "{}", bid) for mid, gid, bid, c in rows],
+        )
+        conn.commit()
+        conn.close()
+
+    def test_duplicates_collapsed_and_new_constraint_applied(self, tmp_path):
+        path = tmp_path / "legacy.sqlite"
+        self._legacy_db(path)
+
+        db = Database(path)
+        try:
+            assert db.count_messages(100) == 2  # m0 的两行合并
+            db.save_message(make_message(0), "bk3")
+            assert db.count_messages(100) == 2  # 新键生效，不再新增一行
+            assert db.count_backup_source("bk3") == 1
+        finally:
+            db.close()
+
+    def test_migration_is_idempotent(self, tmp_path):
+        path = tmp_path / "legacy.sqlite"
+        self._legacy_db(path)
+        Database(path).close()
+        db = Database(path)  # 第二次打开不该再重建表
+        try:
+            assert db.count_messages(100) == 2
+        finally:
+            db.close()
+
+
+class TestParserRoundTrip:
+    """ZIP 恢复读的是导出器摊平后的 dict，解析必须还原出同样的内容。"""
+
+    def test_flat_dict_keeps_content_and_type(self):
+        from backup.core.parser import parse_message
+
+        msg = parse_message(
+            {
+                "message_id": "m0",
+                "group_id": 100,
+                "sender_id": 1,
+                "sender_name": "用户1",
+                "timestamp": "2024-05-01T10:00:00",
+                "message_type": "text",
+                "content": "消息内容 0",
+            }
+        )
+        assert msg.content == "消息内容 0"
+        assert msg.message_type.value == "text"
+
+    def test_segment_without_type_does_not_dump_json(self):
+        from backup.core.parser import parse_message
+
+        msg = parse_message({"message_id": "m1", "group_id": 1, "content": "裸内容"})
+        assert msg.content == "裸内容"
+        assert "{" not in msg.content
+
+    async def test_export_then_restore_checksum_matches(self, db, tmp_path):
+        """导出 → 打包 → 恢复，内容与校验和都得对得上。"""
+        msgs = [make_message(i) for i in range(3)]
+        for m in msgs:
+            db.save_message(m, "bk1")
+        record(db, "bk1", count=3, checksum=compute_checksum(msgs))
+
+        manager = ExportManager(db, tmp_path / "exports", tmp_path / "media")
+        exported = manager.export(100, "zip", backup_id="bk1")
+
+        fresh = Database(tmp_path / "fresh.sqlite")
+        try:
+            record(fresh, "bk1", count=3, checksum=compute_checksum(msgs))
+            restored = await RestoreEngine(fresh).restore(
+                "bk1", 777, archive=exported.path, confirm=True
+            )
+            assert restored.inserted == 3
+            assert {m.content for m in fresh.get_messages(777)} == {m.content for m in msgs}
+        finally:
+            fresh.close()

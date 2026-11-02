@@ -131,10 +131,14 @@ class TestCommands:
         assert human_size(2048) == "2.0KB"
 
     def test_render_diff(self, db):
+        # 消息按 (message_id, group_id) 唯一，后写入的备份接管归属，
+        # 所以两次备份要比的是「各自现在挂着哪些消息」，不能靠重复插入造数据
         for m in [make_message(i) for i in range(3)]:
             db.save_message(m, "bk1")
-        for m in [make_message(i) for i in range(1, 5)]:
+        for m in [make_message(i) for i in range(3)]:
             db.save_message(m, "bk2")
+        db.save_message(make_message(3), "bk2")
+        db.save_message(make_message(4), "bk2")
         from backup.core.models import BackupRecord
 
         for bid in ("bk1", "bk2"):
@@ -147,8 +151,10 @@ class TestCommands:
                 )
             )
         text = render_diff(db, "bk1", "bk2")
-        assert "仅在 bk1：1 条" in text
-        assert "仅在 bk2：2 条" in text
+        # bk1 的 3 条被 bk2 接管，bk1 现在挂着 0 条；bk2 是 5 条
+        assert "- `bk1`：0 条" in text
+        assert "仅在 bk1：0 条" in text
+        assert "仅在 bk2：5 条" in text
 
     def test_permission_checker(self):
         class Admin:

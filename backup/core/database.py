@@ -25,11 +25,12 @@ CREATE TABLE IF NOT EXISTS messages (
   forward_chain TEXT,
   backup_id TEXT NOT NULL,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE(message_id, group_id, backup_id)
+  UNIQUE(message_id, group_id)
 );
 CREATE INDEX IF NOT EXISTS idx_msg_group ON messages(group_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_msg_sender ON messages(sender_id);
 CREATE INDEX IF NOT EXISTS idx_msg_type ON messages(message_type);
+CREATE INDEX IF NOT EXISTS idx_msg_backup ON messages(backup_id);
 
 CREATE TABLE IF NOT EXISTS media_files (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,6 +107,68 @@ CREATE TABLE IF NOT EXISTS schedules (
 );
 """
 
+# 老库升级：messages 的唯一键从 (message_id, group_id, backup_id) 收紧到
+# (message_id, group_id)。不做这一步，升级前建的库会继续堆重复消息。
+_MESSAGES_UNIQUE = ("message_id", "group_id")
+
+
+def _migrate_messages_unique(conn) -> None:
+    """把旧库的 messages 表按新唯一键重建，顺带做一次去重。"""
+    indexes = conn.execute("PRAGMA index_list('messages')").fetchall()
+    for idx in indexes:
+        if not idx["unique"]:
+            continue
+        cols = tuple(
+            r["name"]
+            for r in conn.execute(f"PRAGMA index_info('{idx['name']}')").fetchall()
+        )
+        if cols == _MESSAGES_UNIQUE:
+            return  # 已经是新结构
+        if set(cols) == {*_MESSAGES_UNIQUE, "backup_id"}:
+            break
+    else:
+        return  # 结构不认识，不擅自动手
+
+    conn.executescript(
+        """
+        BEGIN;
+        CREATE TABLE messages_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          message_id TEXT NOT NULL,
+          group_id INTEGER NOT NULL,
+          sender_id INTEGER NOT NULL,
+          sender_name TEXT,
+          timestamp DATETIME NOT NULL,
+          message_type TEXT NOT NULL,
+          content TEXT,
+          raw_content TEXT,
+          reply_to TEXT,
+          is_forward BOOLEAN DEFAULT 0,
+          media_paths TEXT,
+          forward_chain TEXT,
+          backup_id TEXT NOT NULL,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(message_id, group_id)
+        );
+        INSERT OR REPLACE INTO messages_new
+          (message_id, group_id, sender_id, sender_name, timestamp, message_type,
+           content, raw_content, reply_to, is_forward, media_paths, forward_chain,
+           backup_id, created_at)
+        SELECT message_id, group_id, sender_id, sender_name, timestamp, message_type,
+               content, raw_content, reply_to, is_forward, media_paths, forward_chain,
+               backup_id, created_at
+        FROM messages ORDER BY id;
+        DROP TABLE messages;
+        ALTER TABLE messages_new RENAME TO messages;
+        CREATE INDEX IF NOT EXISTS idx_msg_group ON messages(group_id, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_msg_sender ON messages(sender_id);
+        CREATE INDEX IF NOT EXISTS idx_msg_type ON messages(message_type);
+        CREATE INDEX IF NOT EXISTS idx_msg_backup ON messages(backup_id);
+        COMMIT;
+        """
+    )
+
+
 _DT_FMT = "%Y-%m-%d %H:%M:%S.%f"
 
 
@@ -134,6 +197,7 @@ class Database:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
         self._conn.commit()
+        _migrate_messages_unique(self._conn)
 
     def close(self) -> None:
         self._conn.close()
@@ -153,12 +217,27 @@ class Database:
 
     # ---------- 消息 ----------
     def save_message(self, msg: Message, backup_id: str) -> bool:
-        """写入消息。同 backup_id 下重复消息直接忽略，返回是否真的写入。"""
-        cur = self.execute(
-            """INSERT OR IGNORE INTO messages
+        """写入一条消息。返回是否「这条消息此前不在库里」。
+
+        唯一键是 (message_id, group_id)：同一条消息被多次备份只留一行，
+        backup_id 记最后一次归档它的那次备份。否则全量重跑、重试、恢复都会留下
+        重复行，导出和聊天记录里就会出现同一条消息好几遍。
+        """
+        existed = self.query_one(
+            "SELECT 1 FROM messages WHERE message_id = ? AND group_id = ? LIMIT 1",
+            (msg.message_id, msg.group_id),
+        )
+        self.execute(
+            """INSERT INTO messages
                (message_id, group_id, sender_id, sender_name, timestamp, message_type,
                 content, raw_content, reply_to, is_forward, media_paths, forward_chain, backup_id)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(message_id, group_id) DO UPDATE SET
+                 backup_id = excluded.backup_id,
+                 media_paths = CASE
+                   WHEN excluded.media_paths IN ('[]', '') THEN messages.media_paths
+                   ELSE excluded.media_paths
+                 END""",
             (
                 msg.message_id,
                 msg.group_id,
@@ -175,12 +254,14 @@ class Database:
                 backup_id,
             ),
         )
-        return cur.rowcount > 0
+        # upsert 的 rowcount 恒为 1，区分「新增」与「接管」只能靠写入前的探测
+        return existed is None
 
     def update_message_media(self, message_id: str, group_id: int, media_paths: list) -> int:
         """媒体补下后回填路径。"""
         cur = self.execute(
-            "UPDATE messages SET media_paths = ? WHERE message_id = ? AND group_id = ?",
+            """UPDATE messages SET media_paths = ?
+               WHERE message_id = ? AND group_id = ?""",
             (json.dumps(list(media_paths), ensure_ascii=False), message_id, group_id),
         )
         return cur.rowcount if cur else 0
@@ -324,13 +405,60 @@ class Database:
         return [self._row_to_record(r) for r in rows]
 
     def latest_completed_record(self, group_id: int) -> Optional[BackupRecord]:
+        """最近一次「真的落了消息」的备份。
+
+        只按状态过滤会让一次什么都没备份的新记录顶掉上一次的实绩——那之后
+        「最近备份」就永远显示 0 条。这里改为按消息数筛，全空时退回任意完成记录。
+        """
         row = self.query_one(
+            """SELECT * FROM backup_records
+               WHERE group_id = ? AND status = ? AND message_count > 0
+               ORDER BY started_at DESC LIMIT 1""",
+            (group_id, BackupStatus.COMPLETED.value),
+        ) or self.query_one(
             """SELECT * FROM backup_records
                WHERE group_id = ? AND status = ?
                ORDER BY started_at DESC LIMIT 1""",
             (group_id, BackupStatus.COMPLETED.value),
         )
         return self._row_to_record(row) if row else None
+
+    def assign_message_backup(self, message_id: str, group_id: int, backup_id: str) -> None:
+        """把已有消息挂到指定备份上（恢复时补齐归属）。"""
+        self.execute(
+            "UPDATE messages SET backup_id = ? WHERE message_id = ? AND group_id = ?",
+            (backup_id, message_id, group_id),
+        )
+
+    def count_backup_source(self, backup_id: str, group_id: Optional[int] = None) -> int:
+        """某次备份目前还挂在多少条消息上。
+
+        唯一键去掉 backup_id 之后，「这次备份到底留下了什么」只能按归属反查，
+        `/backup diff` 就是靠它比两次备份的真实差异。
+        """
+        if group_id is None:
+            row = self.query_one(
+                "SELECT COUNT(*) AS c FROM messages WHERE backup_id = ?", (backup_id,)
+            )
+        else:
+            row = self.query_one(
+                "SELECT COUNT(*) AS c FROM messages WHERE backup_id = ? AND group_id = ?",
+                (backup_id, group_id),
+            )
+        return int(row["c"]) if row else 0
+
+    def list_backup_ids_with_messages(self, group_id: int) -> list[str]:
+        """该群里真正挂着消息的备份 ID。
+
+        导出要的是「这次备份覆盖了哪些消息」，没有消息归属的备份记录不该进去，
+        否则导出进度、条数统计全都会被空记录带偏。
+        """
+        rows = self.query(
+            """SELECT DISTINCT backup_id FROM messages
+               WHERE group_id = ? AND backup_id != ''""",
+            (group_id,),
+        )
+        return [r["backup_id"] for r in rows]
 
     @staticmethod
     def _row_to_record(row: sqlite3.Row) -> BackupRecord:
