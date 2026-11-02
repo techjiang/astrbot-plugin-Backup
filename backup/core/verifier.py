@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from datetime import datetime
 import zipfile
 from pathlib import Path
 from typing import Iterable, Optional
@@ -12,10 +13,22 @@ from .models import Message
 _CHECKSUM_FIELDS = ("message_id", "group_id", "sender_id", "timestamp", "message_type", "content")
 
 
+def _sort_key(m: Message):
+    # 时间戳可能是 datetime.min（老库/解析失败），也可能同一毫秒多条，最后用
+    # (group_id, message_id) 兜底，保证同一批数据无论从库里还是从包里来都一样
+    return (
+        m.timestamp or datetime.min,
+        m.group_id or 0,
+        str(m.message_id),
+        m.sender_id or 0,
+        m.content or "",
+    )
+
+
 def compute_checksum(messages: Iterable[Message]) -> str:
     """对一组消息算 SHA-256。顺序无关：先排序再哈希。"""
     h = hashlib.sha256()
-    for m in sorted(messages, key=lambda x: (x.timestamp, str(x.message_id))):
+    for m in sorted(messages, key=_sort_key):
         payload = {
             "message_id": m.message_id,
             "group_id": m.group_id,
@@ -47,7 +60,13 @@ def read_manifest(archive: str | Path) -> dict:
 
 
 def verify_zip(path: str | Path, expected_checksum: Optional[str] = None) -> tuple[bool, str]:
-    """校验 ZIP 备份包：CRC 全量扫描 + manifest 校验和比对 + 包内文件齐不齐。"""
+    """校验 ZIP 备份包：CRC 全量扫描 + manifest 校验和比对 + 包内文件齐不齐。
+
+    `expected_checksum` 只该传包自己的 manifest 校验和。传「备份记录里的校验和」
+    会误伤：记录只覆盖那次备份新增的消息，而 `export latest` 的包还含实时归档
+    与更早的数据，两者本来就不该相等。内容与备份记录是否一致，由恢复时按消息
+    集比对，见 `RestoreEngine.restore`。
+    """
     p = Path(path)
     if not p.is_file():
         return False, "备份文件不存在"

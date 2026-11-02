@@ -13,18 +13,30 @@ _CRON_FIELD = re.compile(r"^[\d*/,\-]+$")
 _CRON_BOUNDS = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
 
 
+def _valid_field(part: str, low: int, high: int) -> bool:
+    """单段校验：数字在界内，步长非零，区间不反着写。"""
+    if not part or not _CRON_FIELD.match(part):
+        return False
+    for num in re.findall(r"\d+", part):
+        if not low <= int(num) <= high:
+            return False
+    for step in re.findall(r"/(\d+)", part):
+        if int(step) == 0:  # */0 会让 APScheduler 建任务时直接抛错
+            return False
+    for start, end in re.findall(r"(\d+)-(\d+)", part):
+        if int(start) > int(end):  # 5-3 是写反了，不是「每 3 天」
+            return False
+    return True
+
+
 def validate_cron(cron: str) -> bool:
     """不依赖 APScheduler 的 cron 校验，缺依赖时也能判断参数是否合法。"""
     parts = str(cron or "").split()
     if len(parts) != 5:
         return False
-    for part, (low, high) in zip(parts, _CRON_BOUNDS):
-        if not part or not _CRON_FIELD.match(part):
-            return False
-        for num in re.findall(r"\d+", part):
-            if not low <= int(num) <= high:
-                return False
-    return True
+    return all(
+        _valid_field(part, low, high) for part, (low, high) in zip(parts, _CRON_BOUNDS)
+    )
 
 
 class BackupScheduler:

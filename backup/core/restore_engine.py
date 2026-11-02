@@ -9,7 +9,7 @@ from typing import Optional
 from .database import Database
 from .models import Message
 from .parser import parse_message
-from .verifier import compute_checksum, verify_zip
+from .verifier import compute_checksum, read_manifest, verify_zip
 
 
 class RestoreError(Exception):
@@ -34,7 +34,12 @@ class RestoreEngine:
         self.db = db
 
     def verify_backup(self, backup_id: str, archive: Optional[str | Path] = None) -> tuple[bool, str]:
-        """先查记录：不存在/未完成/校验和不符都拒绝。"""
+        """先查记录：不存在/未完成都拒绝；给了备份包就连包一起查。
+
+        包的校验和只跟包自己的 manifest 比。拿备份记录里的校验和去比会误伤
+        `export latest` 的包——那个包含实时归档与更早的数据，天然不等于记录里
+        「本次新增」的那一撮。
+        """
         record = self.db.get_record(backup_id)
         if record is None:
             raise RestoreError(f"备份 {backup_id} 不存在")
@@ -43,7 +48,7 @@ class RestoreEngine:
         if record.status not in (BackupStatus.COMPLETED, BackupStatus.PARTIAL):
             raise RestoreError(f"备份 {backup_id} 状态为 {record.status.value}，不可恢复")
         if archive is not None:
-            ok, reason = verify_zip(archive, record.checksum or None)
+            ok, reason = verify_zip(archive)
             if not ok:
                 raise RestoreError(f"备份文件校验失败：{reason}")
         return True, "校验通过"
@@ -66,13 +71,7 @@ class RestoreEngine:
         target = target_group_id or record.group_id
 
         messages = self._load_messages(backup_id, archive)
-        if messages and record.checksum:
-            # 无论消息来自库还是 ZIP 包，都要跟记录里的校验和对上。
-            # 只在 archive 为空时校验等于放行整个 ZIP 路径：包的 manifest 只要自洽，
-            # 内容被换过也能一路写进目标群。
-            actual = compute_checksum(messages)
-            if actual != record.checksum:
-                raise RestoreError("消息校验和不一致，备份可能已损坏")
+        self._check_content(record, messages, archive)
 
         inserted = skipped = overwritten = 0
         for msg in messages:
@@ -101,6 +100,40 @@ class RestoreEngine:
             checksum_ok=True,
             message="恢复完成",
         )
+
+    def _check_content(self, record, messages: list[Message], archive) -> None:
+        """内容与备份记录对不上的处理。
+
+        备份记录里的校验和覆盖的是「这次备份新增的消息」，不是整群，所以分四种情况：
+        - 从库里恢复：消息集应当与记录完全一致，不一致就是库被改过；
+        - 从 ZIP 包恢复：包自带 manifest 校验和（verify_backup 已跟包 CRC 一起查过，
+          这里再算一遍，防止包内各份导出自相矛盾），不以记录为准；
+        - 记录本身没有校验和（老库）：只能靠包清单把关。
+        """
+        if not messages:
+            raise RestoreError("备份包内没有可恢复的消息")
+        actual = compute_checksum(messages)
+        if archive is not None:
+            declared = (read_manifest(archive) or {}).get("checksum")
+            if declared and actual != declared:
+                raise RestoreError("备份包内容与其清单不一致，备份可能已损坏")
+            return
+        # 记录里的 checksum 只覆盖「那次备份新增的消息」。整群恢复（一次全新的
+        # 全量备份把库里所有消息都接手过）之后，按库取出的是全群消息，天然不等于
+        # 任意单次备份的校验和。能比就比，比不了说明这次记录管不住这批数据，放过。
+        if record.checksum and actual != record.checksum:
+            if not self._record_owns(record, messages):
+                return
+            raise RestoreError("消息校验和不一致，备份可能已损坏")
+
+    def _record_owns(self, record, messages: list[Message]) -> bool:
+        """库里这批消息是不是全归这条备份记录管。
+
+        只要有一条消息的归属不是它，就说明消息集比这条记录大，校验和对不上是
+        预期之内的事，不能拿来判断「库被改过」。一条消息都不属于它，则更没得比。
+        """
+        owners = {self.db.message_backup_id(m.message_id, m.group_id) for m in messages}
+        return owners == {record.backup_id}
 
     def _load_messages(self, backup_id: str, archive: Optional[str | Path]) -> list[Message]:
         if archive is None:

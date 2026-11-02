@@ -75,6 +75,7 @@ class TestRestoreEngine:
                 started_at=datetime.now(),
                 finished_at=datetime.now(),
                 message_count=4,
+                checksum=compute_checksum(db.get_messages(group_id=100, backup_id="bk1")),
             )
         )
         result = await RestoreEngine(db).restore("bk1", target_group_id=200, confirm=True)
@@ -99,6 +100,7 @@ class TestRestoreEngine:
                 status=BackupStatus.COMPLETED,
                 started_at=datetime.now(),
                 finished_at=datetime.now(),
+                checksum=compute_checksum(db.get_messages(group_id=100, backup_id="bk1")),
             )
         )
         result = await RestoreEngine(db).restore("bk1", strategy="skip", confirm=True)

@@ -102,6 +102,29 @@ manifest 自洽只能证明「没人改过清单」，证明不了「清单里�
 **Event 适配**
 真实平台方法名在不同 AstrBot 版本/适配器下不一致（`get_group_msg_history` / `get_group_history` / `get_history`），`PlatformAdapter` 逐一探测，全都没有就返回空数据而不是抛异常，避免一个 API 变更拖垮整个备份。
 
+**恢复校验为什么分两层**
+备份记录里的 `checksum` 覆盖的是「那次备份新增的消息」，不是整群。`export latest`
+的包还会带上实时归档与更早的数据，两者天然不相等——早先拿记录的校验和去比包的
+manifest，结果是「自己导出的包自己恢复不了」。现在：`verify_backup` 只把包和包自己的
+manifest 比（外加 CRC 与文件齐全性），内容是否可信交给 `_check_content`：包路径比包
+清单，库路径比记录。记录只覆盖得住整群时（一次全量备份接手了所有消息）记录与库
+不再等值，`_record_owns` 会识别出来，不误判成「库被改过」。
+
+**翻页为什么需要去重兜底**
+部分适配器不认 `offset`，每页都回同一批消息。库里已经有它们，`message_exists` 让每条
+都被跳过，`len(batch) == PAGE_SIZE` 又永远成立——循环不会结束，备份卡在「进行中」，
+群越大越像死掉。现在每页先按 message_id 去重，整页都翻过就判定分页到头，正常收工。
+
+**媒体表为什么按 (message_id, original_url) 唯一**
+媒体补下、续传重跑、同一条消息的多个附件都会调 `save_media`。没有唯一键时重跑一次就
+多插一份，`media_files` 随重跑次数膨胀，`total_size` 跟着虚高。老库启动时自动重建并去重
+（`_migrate_media_unique`）。
+
+**cron 为什么不交给 APScheduler 校验**
+APScheduler 是延迟导入，缺依赖时降级为「只落库不调度」。降级后若还用它的
+`CronTrigger` 校验，`schedule set` 会永远失败。自己校验 5 段：数字在界内、步长非零、
+区间不反着写（`5-3` 是写错不是「每三天」）。
+
 ## 红线对照
 
 | 红线 | 落地位置 |

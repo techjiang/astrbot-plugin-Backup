@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS media_files (
   file_size INTEGER,
   mime_type TEXT,
   sha256 TEXT,
-  downloaded_at DATETIME
+  downloaded_at DATETIME,
+  UNIQUE(message_id, original_url)
 );
 CREATE INDEX IF NOT EXISTS idx_media_msg ON media_files(message_id);
 
@@ -172,6 +173,50 @@ def _migrate_messages_unique(conn) -> None:
     )
 
 
+# 老库升级：media_files 加 (message_id, original_url) 唯一键，顺带去掉重复行。
+_MEDIA_UNIQUE = ("message_id", "original_url")
+
+
+def _migrate_media_unique(conn) -> None:
+    for idx in conn.execute("PRAGMA index_list('media_files')").fetchall():
+        if not idx["unique"]:
+            continue
+        cols = tuple(
+            r["name"]
+            for r in conn.execute(f"PRAGMA index_info('{idx['name']}')").fetchall()
+        )
+        if cols == _MEDIA_UNIQUE:
+            return
+    conn.executescript(
+        """
+        BEGIN;
+        CREATE TABLE media_files_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          message_id TEXT NOT NULL,
+          group_id INTEGER,
+          original_url TEXT,
+          local_path TEXT,
+          filename TEXT,
+          file_size INTEGER,
+          mime_type TEXT,
+          sha256 TEXT,
+          downloaded_at DATETIME,
+          UNIQUE(message_id, original_url)
+        );
+        INSERT OR REPLACE INTO media_files_new
+          (message_id, group_id, original_url, local_path, filename, file_size,
+           mime_type, sha256, downloaded_at)
+        SELECT message_id, group_id, original_url, local_path, filename, file_size,
+               mime_type, sha256, downloaded_at
+        FROM media_files ORDER BY id;
+        DROP TABLE media_files;
+        ALTER TABLE media_files_new RENAME TO media_files;
+        CREATE INDEX IF NOT EXISTS idx_media_msg ON media_files(message_id);
+        COMMIT;
+        """
+    )
+
+
 _DT_FMT = "%Y-%m-%d %H:%M:%S.%f"
 
 
@@ -201,6 +246,7 @@ class Database:
         self._conn.executescript(SCHEMA)
         self._conn.commit()
         _migrate_messages_unique(self._conn)
+        _migrate_media_unique(self._conn)
 
     def close(self) -> None:
         self._conn.close()
@@ -387,11 +433,22 @@ class Database:
         mime_type: str,
         sha256: str,
     ) -> None:
+        # 媒体补下、续传重跑、同一消息的多个 URL 都会走到这里。按
+        # (message_id, original_url) 唯一，重复下载只更新落盘信息，不再多插一行，
+        # 否则媒体数会随重跑次数线性膨胀
         self.execute(
             """INSERT INTO media_files
                (message_id, group_id, original_url, local_path, filename, file_size,
                 mime_type, sha256, downloaded_at)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(message_id, original_url) DO UPDATE SET
+                 group_id = excluded.group_id,
+                 local_path = excluded.local_path,
+                 filename = excluded.filename,
+                 file_size = excluded.file_size,
+                 mime_type = excluded.mime_type,
+                 sha256 = excluded.sha256,
+                 downloaded_at = excluded.downloaded_at""",
             (
                 message_id,
                 group_id,

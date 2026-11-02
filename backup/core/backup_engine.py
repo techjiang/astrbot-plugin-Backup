@@ -1,6 +1,7 @@
 """备份引擎。一次备份 = 一次完整的数据快照（全量或增量）。"""
 
 import asyncio
+import json
 import logging
 import mimetypes
 import uuid
@@ -18,6 +19,17 @@ from .verifier import compute_checksum
 logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 50
+
+
+def _raw_id(raw) -> str:
+    """平台原始消息的 ID，用于判断翻页是否原地打转。取不到就退化成整条内容的指纹。"""
+    if isinstance(raw, dict):
+        value = raw.get("message_id") or raw.get("id") or raw.get("message_seq")
+        if value:
+            return str(value)
+        return json.dumps(raw, ensure_ascii=False, sort_keys=True, default=str)[:512]
+    value = getattr(raw, "message_id", None) or getattr(raw, "id", None)
+    return str(value) if value else repr(raw)[:512]
 
 
 class PlatformAdapter:
@@ -125,13 +137,26 @@ class BackupEngine:
             collected: list[Message] = []
             failed_media = 0
             skipped = 0
+            seen_on_pages: set[str] = set()
             while True:
                 batch = await adapter.get_group_history(
                     group_id, count=PAGE_SIZE, offset=page * PAGE_SIZE
                 )
                 if not batch:
                     break
-                for raw in batch:
+                # 有些适配器根本不认 offset，每页都回同一批消息。此时库里已经有它们，
+                # 循环永远不会因为「本页无新消息」而结束——群越大越像卡死。整页都是
+                # 翻过的消息就说明分页到头了，直接收工。
+                fresh = [raw for raw in batch if str(_raw_id(raw)) not in seen_on_pages]
+                if not fresh:
+                    logger.info(
+                        "群 %s 第 %s 页与之前重复，平台可能不支持偏移，停止翻页",
+                        group_id,
+                        page,
+                    )
+                    break
+                seen_on_pages.update(str(_raw_id(raw)) for raw in fresh)
+                for raw in fresh:
                     msg = parse_message(raw, group_id)
                     # 两道判断不能合并成「早于水位」：全量重跑时库里可能已经堆了
                     # 实时归档的消息（时间靠后），拿它当水位会把正常消息一起跳掉。

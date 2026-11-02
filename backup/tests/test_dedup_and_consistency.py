@@ -18,7 +18,11 @@ from backup.core.verifier import compute_checksum
 from .conftest import FakePlatform, make_message, raw_history
 
 
-def record(db, bid, group_id=100, count=0, checksum="", when=None):
+def record(db, bid, group_id=100, count=0, checksum=None, when=None):
+    # 不传 checksum 时按库里这批消息算一遍，跟真实备份记录的语义一致：
+    # 记录里的校验和永远是「那次备份留下的消息集」的指纹
+    if checksum is None:
+        checksum = compute_checksum(db.get_messages(group_id=group_id, backup_id=bid))
     db.save_record(
         BackupRecord(
             backup_id=bid,
