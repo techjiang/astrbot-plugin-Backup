@@ -47,10 +47,18 @@ class ExportResult:
     message_count: int
     token: str
     expires_at: datetime
+    base_url: str = ""
+
+    @property
+    def download_path(self) -> str:
+        return f"/backup/download/{self.token}"
 
     @property
     def link(self) -> str:
-        return f"/backup/download/{self.token}"
+        """直接可用的下载地址。没配 base_url 时只给路径。"""
+        if self.base_url:
+            return f"{self.base_url.rstrip('/')}{self.download_path}"
+        return self.download_path
 
 
 class ExportManager:
@@ -66,8 +74,9 @@ class ExportManager:
         self.export_dir.mkdir(parents=True, exist_ok=True)
         self.media_dir = Path(media_dir)
         cfg = config or {}
-        self.expire_seconds = parse_expire((cfg.get("export") or {}).get("download_link_expire", "24h"))
-        self._tokens: dict[str, dict] = {}
+        export_cfg = cfg.get("export") or {}
+        self.expire_seconds = parse_expire(export_cfg.get("download_link_expire", "24h"))
+        self.base_url = str(export_cfg.get("base_url") or "").rstrip("/")
 
     def build_context(self, group_id: int, backup_id: Optional[str] = None) -> ExportContext:
         messages = self.db.get_messages(group_id=group_id, backup_id=backup_id)
@@ -115,6 +124,7 @@ class ExportManager:
             message_count=len(ctx.messages),
             token=token,
             expires_at=expires,
+            base_url=self.base_url,
         )
 
     def _export_zip(self, ctx: ExportContext, base: Path) -> Path:
@@ -166,26 +176,35 @@ class ExportManager:
     def _issue_token(self, path: Path) -> tuple[str, datetime]:
         token = secrets.token_urlsafe(24)
         expires = datetime.now().timestamp() + self.expire_seconds
-        self._tokens[token] = {"path": str(path), "expires": expires}
+        self.db.save_token(token, str(path), expires)
         return token, datetime.fromtimestamp(expires)
 
     def resolve_token(self, token: str) -> Optional[Path]:
-        item = self._tokens.get(token)
-        if not item:
+        """兑换 token。过期、越界、文件不存在一律返回 None。"""
+        if not token:
             return None
-        if item["expires"] < time.time():
-            self._tokens.pop(token, None)
+        row = self.db.get_token(token)
+        if row is None:
             return None
-        path = Path(item["path"])
-        return path if path.exists() else None
+        if float(row["expires"]) < time.time():
+            self.db.delete_token(token)
+            return None
+        path = Path(row["path"])
+        if not self._is_inside(path, self.export_dir) or not path.exists():
+            return None
+        return path
+
+    def take_token(self, token: str) -> Optional[Path]:
+        """兑换并作废。一次性下载用。"""
+        path = self.resolve_token(token)
+        if path is not None:
+            self.db.delete_token(token)
+        return path
 
     def clean_exports(self, max_age_days: int = 1) -> int:
-        """删过期导出文件与其 token。返回删除数量。"""
+        """删过期 token 与过期导出文件。返回删除数量。"""
         now = time.time()
-        removed = 0
-        for token, item in list(self._tokens.items()):
-            if item["expires"] < now:
-                self._tokens.pop(token, None)
+        removed = self.db.purge_expired_tokens(now)
         cutoff = now - max_age_days * 86400
         for f in self.export_dir.iterdir():
             try:

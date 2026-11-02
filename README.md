@@ -79,7 +79,9 @@ pip install -r astrbot-plugin-Backup/backup/requirements.txt
 
 ```yaml
 backup:
-  storage_dir: "storage"
+  storage_dir: ""             # 留空 = ~/.astrbot-backup，刻意避开插件目录
+  storage:
+    web_roots: []             # 数据目录不允许落在这里面，否则启动直接报错
   scope:
     group_messages: true      # 群消息
     private_messages: false   # 私聊（默认关）
@@ -98,6 +100,7 @@ backup:
     auto_clean: true
   export:
     download_link_expire: "24h"
+    base_url: ""              # 填 https://你的域名，导出链接才是完整 URL
   permission:
     require_admin: true       # 仅群主/管理员可用
   incremental:
@@ -109,11 +112,34 @@ backup:
 
 ## 数据存放
 
+默认在 `~/.astrbot-backup`，不在插件目录里——AstrBot 的 data 目录常被面板静态托管，
+备份放那儿等于挂在公网（红线 3）。目录结构：
+
 ```
-backup/storage/
-├── db/backup.sqlite   # 消息、成员、群信息、备份记录、增量点、定时任务
+~/.astrbot-backup/
+├── db/backup.sqlite   # 消息、成员、群信息、备份记录、增量点、定时任务、下载 token
 ├── media/             # 媒体文件（按日期分目录）
-└── exports/           # 导出产物（不对外暴露，靠带 token 的临时链接访问）
+└── exports/           # 导出产物，只能通过带 token 的临时链接取
+```
+
+`storage_dir` 配成绝对路径时按配置走；配成相对路径会相对插件目录解析并打告警；
+无论哪种，只要落在 `storage.web_roots` 里就拒绝启动。
+
+### 下载链接怎么用
+
+导出后返回 `/backup/download/<token>`。token 存在数据库里，重启后仍然有效，过期即作废，
+并且只认 `exports/` 目录内的文件。接路由时把请求路径丢给 `handle_download`：
+
+```python
+from backup.core.download_route import handle_download
+
+resp = handle_download(request.path, plugin.exports)
+if resp.ok:
+    for chunk in resp.iter_chunks():
+        await write(chunk)
+else:
+    # 404 路径不对 / 410 链接过期
+    ...
 ```
 
 ## 常见问题

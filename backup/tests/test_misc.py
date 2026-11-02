@@ -202,3 +202,59 @@ class TestScheduler:
         sched.remove_job(100)
         assert sched.list_jobs() == []
         assert sched.add_job(100, "bad cron") is False
+
+
+class TestConfigAccess:
+    CONFIG = {
+        "scope": {"download_media": True},
+        "media": {"timeout": 30, "max_file_size": "100MB"},
+    }
+
+    def test_get_nested(self):
+        from backup.core.commands import _config_get
+
+        assert _config_get(self.CONFIG, "scope.download_media") is True
+        assert _config_get(self.CONFIG, "media.timeout") == 30
+
+    def test_get_missing_returns_none(self):
+        from backup.core.commands import _config_get
+
+        assert _config_get(self.CONFIG, "nope.nope") is None
+        assert _config_get(self.CONFIG, "scope.deep.deeper") is None
+
+    def test_set_bool(self):
+        from backup.core.commands import _config_get, _config_set
+
+        cfg = {"scope": {"download_media": True}}
+        assert _config_set(cfg, "scope.download_media", "false")[0]
+        assert _config_get(cfg, "scope.download_media") is False
+
+    def test_set_int(self):
+        from backup.core.commands import _config_set
+
+        cfg = {"media": {"timeout": 30}}
+        assert _config_set(cfg, "media.timeout", "60")[0]
+        assert cfg["media"]["timeout"] == 60
+
+    def test_set_rejects_type_change(self):
+        from backup.core.commands import _config_set
+
+        cfg = {"media": {"timeout": 30}}
+        ok, reason = _config_set(cfg, "media.timeout", "很久")
+        assert ok is False
+        assert "int" in reason
+
+    def test_set_rejects_unknown_key(self):
+        from backup.core.commands import _config_set
+
+        cfg = {"media": {"timeout": 30}}
+        ok, reason = _config_set(cfg, "media.time_out", "60")
+        assert ok is False
+        assert "不存在" in reason
+
+    def test_coerce_keeps_string_when_not_numeric(self):
+        from backup.core.commands import _config_set
+
+        cfg = {"export": {"default_format": "sqlite"}}
+        assert _config_set(cfg, "export.default_format", "html")[0]
+        assert cfg["export"]["default_format"] == "html"

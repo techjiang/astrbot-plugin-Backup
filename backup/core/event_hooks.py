@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 # 各平台「机器人被踢 / 群解散」通知的子类型名，命中即做最后一次备份
 KICK_SUBTYPES = {"kick", "kick_off", "bot_kicked", "bot_leave", "leave"}
 DISBAND_SUBTYPES = {"disband", "dismiss", "group_disband", "group_dismiss"}
+# 成员变动类通知：群里正常有人退群也走这里，先聚合再判断
+DECREASE_SUBTYPES = {"decrease", "leave", "quit", "member_leave", "kick"}
 
 
 def _get(obj: Any, name: str, default=None):
@@ -126,6 +128,28 @@ class EventHooks:
         self.db.save_message(msg, backup_id)
         return msg
 
+    async def archive_with_media(self, event, downloader=None, backup_id: str = "realtime"):
+        """实时归档 + 顺带补下载媒体。
+
+        默认路径不下载：消息量大的群里同步下载会拖慢每条消息的处理。
+        这里给一个显式入口，定时备份之外的「重要的那几条」可以走它。
+        """
+        msg = self.archive_message(event, backup_id)
+        if msg is None or downloader is None or not msg.media_paths:
+            return msg
+        for i, url in enumerate(list(msg.media_paths)):
+            if not isinstance(url, str) or not url.startswith("http"):
+                continue
+            try:
+                msg.media_paths[i] = await downloader.download(
+                    url, msg.message_id, msg.timestamp
+                )
+            except Exception as e:  # 单文件失败不阻塞（红线 2）
+                msg.media_paths[i] = f"[下载失败] {url}"
+                logger.warning("实时归档媒体失败 msg=%s err=%s", msg.message_id, type(e).__name__)
+        self.db.update_message_media(msg.message_id, msg.group_id, msg.media_paths)
+        return msg
+
     # ---------- 触发式备份：退群聚合 ----------
     def note_group_decrease(self, group_id: int) -> bool:
         """群人数下降一次，返回是否应当立即备份。"""
@@ -133,6 +157,21 @@ class EventHooks:
         return self.trigger.should_trigger_mass_leave(group_id)
 
     # ---------- 触发式备份：解散 / 被踢 ----------
+    def handle_notice(self, payload, event=None) -> tuple[Optional[int], str, bool]:
+        """统一处理一条通知事件。返回 (群号, 事件类型, 是否应当立即备份)。
+
+        拆成三段是为了让 main.py 只做接线：
+        认群号 → 退群聚合 → 解散/被踢判定。
+        """
+        group_id, subtype = classify_group_event(payload)
+        if group_id is None and event is not None:
+            group_id = extract_group_id(event)
+        if group_id is None:
+            return None, "", False
+        if subtype in DECREASE_SUBTYPES and subtype not in DISBAND_SUBTYPES:
+            return group_id, subtype, self.note_group_decrease(group_id)
+        return group_id, subtype, self.note_group_event(group_id, subtype)
+
     def note_group_event(self, group_id: int, subtype: str = "") -> bool:
         subtype = (subtype or "").lower()
         if subtype in DISBAND_SUBTYPES and self.on_disband:

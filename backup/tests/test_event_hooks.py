@@ -114,3 +114,97 @@ class TestTriggers:
         assert classify_group_event({"group_id": 5, "sub_type": "Decrease"}) == (5, "decrease")
         assert classify_group_event({"group": "5", "notice_type": "disband"})[1] == "disband"
         assert classify_group_event({}) == (None, "")
+
+
+class FakeDownloader:
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.calls = 0
+
+    async def download(self, url, message_id, timestamp):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("boom")
+        return f"/media/{message_id}.jpg"
+
+
+def with_media_event(group_id=100, message_id="m-media"):
+    event = FakeEvent(group_id=group_id, message_id=message_id)
+    event.message_obj["message"] = [
+        {"type": "image", "data": {"url": "https://cdn.example.com/a.jpg"}}
+    ]
+    return event
+
+
+class TestHandleNotice:
+    def test_leave_aggregates_until_threshold(self, db):
+        hooks = make_hooks(db)
+        for _ in range(3):
+            group_id, subtype, should = hooks.handle_notice({"group_id": 100, "sub_type": "leave"})
+        assert group_id == 100
+        assert subtype == "leave"
+        assert should is True  # 阈值 3，最后一次刚好触发
+
+    def test_leave_below_threshold_does_not_backup(self, db):
+        hooks = make_hooks(db)
+        _, _, should = hooks.handle_notice({"group_id": 100, "sub_type": "leave"})
+        assert should is False
+
+    def test_disband_triggers(self, db):
+        hooks = make_hooks(db)
+        _, subtype, should = hooks.handle_notice({"group_id": 100, "sub_type": "disband"})
+        assert subtype == "disband"
+        assert should is True
+
+    def test_kick_triggers_once_within_cooldown(self, db):
+        hooks = make_hooks(db)
+        assert hooks.handle_notice({"group_id": 100, "sub_type": "kick_off"})[2] is True
+        assert hooks.handle_notice({"group_id": 100, "sub_type": "kick_off"})[2] is False
+
+    def test_notice_without_group_falls_back_to_event(self, db):
+        hooks = make_hooks(db)
+        event = FakeEvent(group_id=555)
+        group_id, _, _ = hooks.handle_notice({"sub_type": "disband"}, event)
+        assert group_id == 555
+
+    def test_unknown_payload_returns_none(self, db):
+        hooks = make_hooks(db)
+        assert hooks.handle_notice({})[0] is None
+
+    def test_disband_disabled_by_config(self, db):
+        hooks = make_hooks(db, on_disband=False)
+        assert hooks.handle_notice({"group_id": 100, "sub_type": "disband"})[2] is False
+
+    def test_kick_disabled_by_config(self, db):
+        hooks = make_hooks(db, on_leave=False)
+        assert hooks.handle_notice({"group_id": 100, "sub_type": "kick"})[2] is False
+
+
+class TestArchiveWithMedia:
+    async def test_backfills_media_paths(self, db):
+        hooks = make_hooks(db)
+        downloader = FakeDownloader()
+        msg = await hooks.archive_with_media(with_media_event(), downloader)
+        assert downloader.calls == 1
+        assert msg.media_paths == ["/media/m-media.jpg"]
+        stored = db.get_messages(group_id=100)
+        assert stored[0].media_paths == ["/media/m-media.jpg"]
+
+    async def test_media_failure_marks_and_keeps_message(self, db):
+        hooks = make_hooks(db)
+        msg = await hooks.archive_with_media(with_media_event(), FakeDownloader(fail=True))
+        assert msg.media_paths[0].startswith("[下载失败]")
+        assert db.count_messages(100) == 1  # 消息照常入库（红线 2）
+
+    async def test_without_downloader_only_archives(self, db):
+        hooks = make_hooks(db)
+        msg = await hooks.archive_with_media(with_media_event(), None)
+        assert msg.media_paths == ["https://cdn.example.com/a.jpg"]
+
+    async def test_duplicate_message_not_downloaded_twice(self, db):
+        hooks = make_hooks(db)
+        event = with_media_event()
+        await hooks.archive_with_media(event, FakeDownloader())
+        downloader = FakeDownloader()
+        assert await hooks.archive_with_media(event, downloader) is None
+        assert downloader.calls == 0

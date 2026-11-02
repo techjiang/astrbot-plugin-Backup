@@ -1,5 +1,10 @@
 backup:
-  storage_dir: "storage"
+  # 留空 = ~/.astrbot-backup，刻意避开插件目录（插件常落在面板静态托管的 data 下）
+  storage_dir: ""
+
+  storage:
+    # 备份目录不允许落在这些路径内，防止被 Web 直接下载
+    web_roots: []
 
   scope:
     group_messages: true
@@ -27,6 +32,8 @@ backup:
   export:
     default_format: "sqlite"
     download_link_expire: "24h"
+    # 下载链接的前缀，填 https://你的域名 才能拼出可直接点的 URL
+    base_url: ""
 
   permission:
     require_admin: true

@@ -91,6 +91,13 @@ CREATE TABLE IF NOT EXISTS backup_meta (
   last_message_id TEXT
 );
 
+CREATE TABLE IF NOT EXISTS download_tokens (
+  token TEXT PRIMARY KEY,
+  path TEXT NOT NULL,
+  expires REAL NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS schedules (
   group_id INTEGER PRIMARY KEY,
   cron TEXT NOT NULL,
@@ -169,6 +176,14 @@ class Database:
             ),
         )
         return cur.rowcount > 0
+
+    def update_message_media(self, message_id: str, group_id: int, media_paths: list) -> int:
+        """媒体补下后回填路径。"""
+        cur = self.execute(
+            "UPDATE messages SET media_paths = ? WHERE message_id = ? AND group_id = ?",
+            (json.dumps(list(media_paths), ensure_ascii=False), message_id, group_id),
+        )
+        return cur.rowcount if cur else 0
 
     def message_exists(self, message_id: str, group_id: int) -> bool:
         return (
@@ -426,3 +441,22 @@ class Database:
 
     def delete_schedule(self, group_id: int) -> None:
         self.execute("DELETE FROM schedules WHERE group_id = ?", (group_id,))
+
+    # ---------- 下载 token ----------
+    def save_token(self, token: str, path: str, expires: float) -> None:
+        self.execute(
+            "INSERT OR REPLACE INTO download_tokens (token, path, expires) VALUES (?, ?, ?)",
+            (token, str(path), float(expires)),
+        )
+
+    def get_token(self, token: str) -> Optional[sqlite3.Row]:
+        return self.query_one(
+            "SELECT token, path, expires FROM download_tokens WHERE token = ?", (token,)
+        )
+
+    def delete_token(self, token: str) -> None:
+        self.execute("DELETE FROM download_tokens WHERE token = ?", (token,))
+
+    def purge_expired_tokens(self, now: float) -> int:
+        cur = self.execute("DELETE FROM download_tokens WHERE expires < ?", (now,))
+        return cur.rowcount if cur else 0

@@ -14,6 +14,8 @@ from .core.backup_engine import BackupEngine
 from .core.commands import (
     HELP_TEXT,
     PermissionChecker,
+    _config_get,
+    _config_set,
     human_size,
     parse_group_arg,
     render_backup_list,
@@ -21,9 +23,11 @@ from .core.commands import (
     render_status,
 )
 from .core.database import Database
+from .core.download_route import handle_download
 from .core.export_manager import ExportManager
 from .core.auto_trigger import AutoTrigger
-from .core.event_hooks import EventHooks, classify_group_event, extract_group_id
+from .core.event_hooks import EventHooks, extract_group_id
+from .core.paths import assert_writable_target, resolve_storage_root
 from .core.restore_engine import RestoreEngine, RestoreError
 from .core.scheduler import BackupScheduler
 from .core.verifier import verify_zip
@@ -43,6 +47,24 @@ def _load_config() -> dict:
         return {}
 
 
+def _save_config(config: dict) -> bool:
+    """把改过的配置写回 config.yaml。失败就只留在内存里，不影响本次运行。"""
+    try:
+        import yaml
+
+        target = PLUGIN_DIR / "config.yaml"
+        payload = {"backup": config}
+        tmp = target.with_suffix(".yaml.tmp")
+        tmp.write_text(
+            yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8"
+        )
+        tmp.replace(target)
+        return True
+    except Exception as e:
+        logger.warning("配置写回失败：%s", type(e).__name__)
+        return False
+
+
 @register(
     "backup",
     "科技酱",
@@ -53,7 +75,11 @@ class BackupPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.config = _load_config()
-        storage = PLUGIN_DIR / self.config.get("storage_dir", "storage")
+        storage = assert_writable_target(
+            resolve_storage_root(self.config, PLUGIN_DIR),
+            (self.config.get("storage") or {}).get("web_roots") or [],
+        )
+        self.storage = storage
         self.db = Database(storage / "db" / "backup.sqlite")
         self.engine = BackupEngine(self.db, storage / "media", self.config)
         self.exports = ExportManager(
@@ -80,18 +106,15 @@ class BackupPlugin(Star):
             on_disband=bool((self.config.get("auto_trigger") or {}).get("on_group_disband", True)),
         )
         self.scheduler.restore_jobs()
+        if self.config.get("retention", {}).get("auto_clean"):
+            self.exports.clean_exports(
+                int(self.config.get("retention", {}).get("keep_days", 90))
+            )
 
     # ---------- 运行时 ----------
     async def _scheduled_backup(self, group_id: int) -> None:
-        platform = getattr(self.context, "get_platform", lambda: None)()
-        if platform is None:
-            return
-        await self.engine.backup_group(
-            group_id,
-            platform,
-            incremental=(self.config.get("incremental") or {}).get("enabled", True),
-            download_media=(self.config.get("scope") or {}).get("download_media", True),
-        )
+        """定时任务入口：没有事件，用全局平台对象。"""
+        await self._backup(group_id)
 
     def _deny(self, event) -> Optional[str]:
         perm = self.permission.check_event(event)
@@ -125,6 +148,7 @@ class BackupPlugin(Star):
             "clean": self._cmd_clean,
             "diff": self._cmd_diff,
             "schedule": self._cmd_schedule,
+            "config": self._cmd_config,
         }.get(sub)
         if handler is None:
             yield event.plain_result(f"未知子命令：{sub}\n\n{HELP_TEXT}")
@@ -138,12 +162,10 @@ class BackupPlugin(Star):
             yield event.plain_result("请在群内使用，或指定群号：/backup now 123456")
             return
         yield event.plain_result(f"开始备份群 {group_id}…")
-        record = await self.engine.backup_group(
-            group_id,
-            event.bot if hasattr(event, "bot") else self.context.get_platform(),
-            incremental=(self.config.get("incremental") or {}).get("enabled", True),
-            download_media=(self.config.get("scope") or {}).get("download_media", True),
-        )
+        record = await self._backup(group_id, event)
+        if record is None:
+            yield event.plain_result("❌ 当前没有可用的平台适配器，无法拉取历史消息")
+            return
         state = {"完成": "✅", "partial": "⚠️", "failed": "❌"}.get(record.status.value, "•")
         yield event.plain_result(
             f"{state} 备份 {'增量' if record.is_incremental else '全量'}结束\n"
@@ -284,10 +306,41 @@ class BackupPlugin(Star):
         else:
             yield event.plain_result("未知操作，支持 set / list / remove")
 
+    async def _cmd_config(self, event, args):
+        """配置查看/修改。写回 config.yaml，只改已知键，避免拼错就多出一条废配置。"""
+        if not args or args[0].lower() not in ("get", "set"):
+            yield event.plain_result("用法：/backup config get <键> / config set <键> <值>")
+            return
+        action = args[0].lower()
+        if action == "get":
+            if len(args) < 2:
+                yield event.plain_result("用法：/backup config get <键>，如 scope.download_media")
+                return
+            key = args[1]
+            value = _config_get(self.config, key)
+            if value is None:
+                yield event.plain_result(f"配置项 `{key}` 不存在")
+                return
+            yield event.plain_result(f"`{key}` = `{value}`")
+            return
+
+        if len(args) < 3:
+            yield event.plain_result("用法：/backup config set <键> <值>")
+            return
+        key, raw = args[1], " ".join(args[2:])
+        ok, message = _config_set(self.config, key, raw)
+        if not ok:
+            yield event.plain_result(f"⚠️ {message}")
+            return
+        saved = _save_config(self.config)
+        yield event.plain_result(
+            f"✅ `{key}` = `{_config_get(self.config, key)}`" + ("" if saved else "（仅本次运行生效）")
+        )
+
     # ---------- 事件钩子 ----------
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
-        """实时归档：消息进群时就落库，之后增量备份不必再回捞。
+        """实时归档：消息进群就落库，之后增量备份不必再回捞。
 
         只写库不下载媒体，也不回复任何内容——群聊里静默干活。
         """
@@ -296,26 +349,35 @@ class BackupPlugin(Star):
         except Exception as e:  # 归档失败不能影响机器人正常聊天
             logger.error("实时归档失败 group=%s: %s", extract_group_id(event), type(e).__name__)
 
-    @filter.event_message_type(filter.EventMessageType.ALL)
-    async def on_notice(self, event: AstrMessageEvent):
-        """群人数变动：退群聚合到阈值、机器人被踢 / 群解散时抢最后一次备份。"""
+    async def _on_notice_impl(self, event):
         payload = getattr(event, "message_obj", None) or getattr(event, "raw_message", None)
-        group_id, subtype = classify_group_event(payload)
-        if group_id is None:
-            group_id = extract_group_id(event)
-        if group_id is None:
+        group_id, subtype, should_backup = self.hooks.handle_notice(payload, event)
+        if group_id is None or not should_backup:
             return
+        logger.warning("群 %s 事件 %s，触发备份", group_id, subtype or "unknown")
         try:
-            if "decrease" in subtype or "leave" in subtype:
-                if self.hooks.note_group_decrease(group_id):
-                    logger.warning("群 %s 短时大量退群，触发备份", group_id)
-                    await self._scheduled_backup(group_id)
-                return
-            if self.hooks.note_group_event(group_id, subtype):
-                logger.warning("群 %s 事件 %s，触发最后备份", group_id, subtype)
-                await self._scheduled_backup(group_id)
+            await self._backup(group_id, event)
         except Exception as e:
             logger.error("触发式备份失败 group=%s: %s", group_id, type(e).__name__)
+
+    async def _backup(self, group_id: int, event=None):
+        """统一的备份入口：优先用事件自带的平台对象，退回全局平台。"""
+        platform = getattr(event, "bot", None) if event is not None else None
+        if platform is None:
+            platform = getattr(self.context, "get_platform", lambda: None)()
+        if platform is None:
+            return None
+        return await self.engine.backup_group(
+            group_id,
+            platform,
+            incremental=(self.config.get("incremental") or {}).get("enabled", True),
+            download_media=(self.config.get("scope") or {}).get("download_media", True),
+        )
+
+    # ---------- 下载路由 ----------
+    def handle_download_request(self, path: str):
+        """给宿主的路由/静态服务调用：token 兑换成文件流。"""
+        return handle_download(path, self.exports)
 
     async def terminate(self):
         self.scheduler.shutdown()

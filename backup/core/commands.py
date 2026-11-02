@@ -26,6 +26,49 @@ HELP_TEXT = """**Backup 高级备份** · 命令速查
 `/backup diff <备份ID1> <备份ID2>` 对比差异"""
 
 
+def _config_get(config: dict, key: str):
+    node = config
+    for part in key.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def _coerce(raw: str):
+    text = raw.strip()
+    low = text.lower()
+    if low in ("true", "yes", "on"):
+        return True
+    if low in ("false", "no", "off"):
+        return False
+    if re.fullmatch(r"-?\d+", text):
+        return int(text)
+    try:
+        return float(text)
+    except ValueError:
+        return text
+
+
+def _config_set(config: dict, key: str, raw: str) -> tuple[bool, str]:
+    """改已知键。拼错的键直接拒绝，避免配置里长出一堆废条目。"""
+    parts = key.split(".")
+    node = config
+    for part in parts[:-1]:
+        if not isinstance(node.get(part), dict):
+            return False, f"配置项 `{key}` 不存在"
+        node = node[part]
+    leaf = parts[-1]
+    if leaf not in node:
+        return False, f"配置项 `{key}` 不存在"
+    old = node[leaf]
+    new = _coerce(raw)
+    if type(old) is not type(new) and not (isinstance(old, float) and isinstance(new, int)):
+        return False, f"`{key}` 需要 {type(old).__name__} 类型的值"
+    node[leaf] = new
+    return True, ""
+
+
 def human_size(size: int) -> str:
     num = float(size or 0)
     for unit in ("B", "KB", "MB", "GB"):

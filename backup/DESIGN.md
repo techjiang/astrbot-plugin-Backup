@@ -15,6 +15,8 @@ core/media_downloader.py 限速 / 重试 / 去重 / 大小上限
 core/scheduler.py  APScheduler 定时任务（缺失依赖时降级为仅落库）
 core/auto_trigger.py 退群聚合、解散预警触发
 core/event_hooks.py   AstrBot 事件 → 实时归档 / 触发式备份（鸭子类型，可单测）
+core/paths.py      存储目录解析 + Web 根越界拦截
+core/download_route.py  token → 文件流（与框架无关的纯逻辑）
 core/verifier.py   确定性校验和 + ZIP 校验
 exporters/         6 种格式，统一 export(ctx, path)
 ```
@@ -31,7 +33,16 @@ exporters/         6 种格式，统一 export(ctx, path)
 红线要求单文件失败不能阻塞整体。失败 URL 替换成 `[下载失败] {url}` 留在消息里，用户能追溯；备份记录状态降为 `partial` 而不是 `failed`。
 
 **导出为什么不直接给文件路径**
-红线要求链接带 token 且过期。`ExportManager` 内存里维护 `token → (path, expires)`，`resolve_token` 校验是否过期，过期即作废。导出目录在 `storage/exports`，不在 Web 根目录。
+红线要求链接带 token 且过期。token → (path, expires) 存 `download_tokens` 表而不是内存 dict：
+插件重启后链接仍然有效，过期即删。`resolve_token` 除了查过期，还要求文件落在 `exports/` 之内
+（防止路径穿越），`take_token` 供一次性下载。`core/download_route.py` 的 `handle_download`
+把请求路径变成文件流，不依赖具体 Web 框架，方便接任何宿主。
+
+**存储目录为什么不在插件目录里**
+插件通常装在 AstrBot 的 `data/plugins` 下，面板一旦把 `data` 静态托管，`storage/` 就被挂在公网。
+默认落到 `~/.astrbot-backup`；配了 `storage_dir` 就按配置解析，但必须不在 `storage.web_roots` 内，
+否则启动即抛 `UnsafeStoragePath`（红线 3）。相对路径按插件目录解析而不是 CWD，
+避免启动位置变化导致数据「跑」到别处。
 
 **恢复为什么强制 `--confirm`**
 `RestoreEngine.restore` 自身检查 `confirm` 参数，不止依赖命令层。任何调用路径都必须显式确认。

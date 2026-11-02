@@ -1,11 +1,30 @@
 """定时备份调度。APScheduler 延迟导入：未安装时插件仍可手动备份。"""
 
 import logging
+import re
 from typing import Awaitable, Callable, Optional
 
 from .database import Database
 
 logger = logging.getLogger(__name__)
+
+# 标准 5 段 cron：分 时 日 月 周。允许 * / , - 和数字
+_CRON_FIELD = re.compile(r"^[\d*/,\-]+$")
+_CRON_BOUNDS = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
+
+
+def validate_cron(cron: str) -> bool:
+    """不依赖 APScheduler 的 cron 校验，缺依赖时也能判断参数是否合法。"""
+    parts = str(cron or "").split()
+    if len(parts) != 5:
+        return False
+    for part, (low, high) in zip(parts, _CRON_BOUNDS):
+        if not part or not _CRON_FIELD.match(part):
+            return False
+        for num in re.findall(r"\d+", part):
+            if not low <= int(num) <= high:
+                return False
+    return True
 
 
 class BackupScheduler:
@@ -45,13 +64,7 @@ class BackupScheduler:
         return f"backup_group_{group_id}"
 
     def validate_cron(self, cron: str) -> bool:
-        try:
-            from apscheduler.triggers.cron import CronTrigger
-
-            CronTrigger.from_crontab(cron)
-            return True
-        except Exception:
-            return False
+        return validate_cron(cron)
 
     def add_job(self, group_id: int, cron: str) -> bool:
         if not self.validate_cron(cron):
