@@ -1,0 +1,17 @@
+name: backup
+display_name: Backup 高级备份
+version: 1.0.0
+description: AstrBot 群聊数据高级备份插件：消息/媒体/成员/群信息全量或增量备份，支持 SQLite/JSON/CSV/TXT/Markdown/HTML/ZIP 导出与一键恢复。
+author: 科技酱
+author_url: "https://www.asoe.cn"
+homepage: "https://docs.asoe.cn"
+repository: "https://github.com/techjiang/"
+email: "official@tech.asoe.cn"
+tags:
+  - backup
+  - export
+  - data
+python: ">=3.10"
+astrbot: ">=4.0"
+license: MIT
+repo: "https://github.com/techjiang/astrbot-plugin-Backup"
