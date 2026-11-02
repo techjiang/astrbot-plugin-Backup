@@ -1,26 +1,32 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="Backup 高级备份">
+  <title>Backup 高级备份</title>
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#7C3AED"/>
+    <linearGradient id="plate" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="216" y2="216">
+      <stop offset="0%" stop-color="#8B5CF6"/>
+      <stop offset="55%" stop-color="#A855F7"/>
       <stop offset="100%" stop-color="#EC4899"/>
     </linearGradient>
-    <linearGradient id="fade" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#FFFFFF"/>
-      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.9"/>
+    <linearGradient id="sheen" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="216">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity=".20"/>
+      <stop offset="52%" stop-color="#FFFFFF" stop-opacity=".04"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
     </linearGradient>
+    <clipPath id="tile"><rect width="256" height="256" rx="60"/></clipPath>
+    <mask id="glyph">
+      <rect width="256" height="256" fill="#000"/>
+      <path fill="#fff" d="M80 205a33 33 0 0 1-6-65.4A46 46 0 0 1 163.6 131 37 37 0 0 1 176 205Z"/>
+      <path fill="#fff" d="M128 44v24" stroke="#fff" stroke-width="22" stroke-linecap="round"/>
+      <path fill="#fff" d="M128 86 103 58h50Z"/>
+      <circle cx="128" cy="150" r="16" fill="#000"/>
+      <path stroke="#000" stroke-width="15" stroke-linecap="round" d="M128 162v24"/>
+    </mask>
   </defs>
-  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#bg)"/>
-  <circle cx="200" cy="54" r="30" fill="#FFFFFF" opacity="0.12"/>
-  <circle cx="54" cy="208" r="22" fill="#FFFFFF" opacity="0.10"/>
-
-  <!-- 备份箭头 -->
-  <path d="M128 40v44" stroke="url(#fade)" stroke-width="13" stroke-linecap="round"/>
-  <path d="M128 94l-16-16h32z" fill="url(#fade)"/>
-
-  <!-- 云朵外壳 -->
-  <path d="M74 196c-17.7 0-32-14.3-32-32 0-16 11.8-29.2 27.2-31.4C73.4 113.9 94.6 100 119 100c27 0 49 20.6 51.4 46.9C183.4 149.2 193 160.7 193 174c0 12.2-9.8 22-22 22z" fill="url(#fade)"/>
-
-  <!-- 锁孔 -->
-  <circle cx="128" cy="146" r="11" fill="#7C3AED"/>
-  <path d="M128 152v16" stroke="#7C3AED" stroke-width="9" stroke-linecap="round"/>
+  <rect width="256" height="256" rx="60" fill="url(#plate)"/>
+  <g clip-path="url(#tile)">
+    <circle cx="214" cy="34" r="70" fill="#fff" opacity=".10"/>
+    <circle cx="40" cy="226" r="56" fill="#fff" opacity=".08"/>
+    <rect width="256" height="256" fill="url(#sheen)"/>
+  </g>
+  <rect x="1" y="1" width="254" height="254" rx="59" fill="none" stroke="#FFFFFF" stroke-opacity=".24" stroke-width="2"/>
+  <rect width="256" height="256" rx="60" fill="#fff" mask="url(#glyph)"/>
 </svg>

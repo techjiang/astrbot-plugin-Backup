@@ -1,25 +1,57 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="800" height="400" viewBox="0 0 800 400" role="img" aria-label="Backup 高级备份 横幅">
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="400" viewBox="0 0 800 400" role="img" aria-label="Backup 高级备份 · AstrBot 插件">
+  <title>Backup 高级备份 · AstrBot 插件</title>
   <defs>
-    <linearGradient id="bbg" x1="0" y1="0" x2="1" y2="1">
+    <linearGradient id="bg" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="680" y2="400">
       <stop offset="0%" stop-color="#7C3AED"/>
+      <stop offset="58%" stop-color="#A855F7"/>
       <stop offset="100%" stop-color="#EC4899"/>
     </linearGradient>
-    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.22"/>
-      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.06"/>
+    <linearGradient id="sheen" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="400">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity=".16"/>
+      <stop offset="60%" stop-color="#FFFFFF" stop-opacity="0"/>
     </linearGradient>
+    <clipPath id="frame"><rect width="800" height="400" rx="32"/></clipPath>
+    <mask id="glyph">
+      <rect x="0" y="0" width="256" height="256" fill="#000"/>
+      <path fill="#fff" d="M80 205a33 33 0 0 1-6-65.4A46 46 0 0 1 163.6 131 37 37 0 0 1 176 205Z"/>
+      <path fill="#fff" d="M128 44v24" stroke="#fff" stroke-width="22" stroke-linecap="round"/>
+      <path fill="#fff" d="M128 86 103 58h50Z"/>
+      <circle cx="128" cy="150" r="16" fill="#000"/>
+      <path stroke="#000" stroke-width="15" stroke-linecap="round" d="M128 162v24"/>
+    </mask>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#3B0764" flood-opacity=".35"/>
+    </filter>
   </defs>
-  <rect width="800" height="400" rx="32" fill="url(#bbg)"/>
-  <circle cx="700" cy="60" r="120" fill="#FFFFFF" opacity="0.08"/>
-  <circle cx="90" cy="360" r="110" fill="#FFFFFF" opacity="0.07"/>
-  <rect x="72" y="122" width="156" height="156" rx="40" fill="url(#tile)" stroke="#FFFFFF" stroke-opacity="0.35" stroke-width="2"/>
-  <path d="M150 122v34" stroke="#FFFFFF" stroke-width="11" stroke-linecap="round"/>
-  <path d="M150 164l-14-14h28z" fill="#FFFFFF"/>
-  <path d="M112 232c-13.8 0-25-11.2-25-25 0-12.5 9.2-22.8 21.2-24.5C111 165.5 127.6 154 147 154c21 0 38.2 16 40.1 36.6 9.2 2.2 16.2 10.5 16.2 20.4 0 11.6-9.4 21-21 21z" fill="#FFFFFF" opacity="0.96"/>
-  <circle cx="150" cy="198" r="8" fill="#7C3AED"/>
-  <path d="M150 202v12" stroke="#7C3AED" stroke-width="7" stroke-linecap="round"/>
-  <text x="272" y="192" font-family="'PingFang SC','Microsoft YaHei',system-ui,sans-serif" font-size="62" font-weight="700" fill="#FFFFFF">Backup</text>
-  <text x="274" y="252" font-family="'PingFang SC','Microsoft YaHei',system-ui,sans-serif" font-size="34" font-weight="500" fill="#FFFFFF" opacity="0.92">高级备份 · AstrBot 插件</text>
-  <text x="274" y="300" font-family="'PingFang SC','Microsoft YaHei',system-ui,sans-serif" font-size="22" fill="#FFFFFF" opacity="0.75">消息 / 媒体 / 成员 · 增量备份 · 多格式导出 · 一键恢复</text>
-  <text x="72" y="348" font-family="'PingFang SC','Microsoft YaHei',system-ui,sans-serif" font-size="18" fill="#FFFFFF" opacity="0.7">科技酱 · asoe.cn</text>
+
+  <g clip-path="url(#frame)">
+    <rect width="800" height="400" fill="url(#bg)"/>
+    <circle cx="742" cy="24" r="150" fill="#fff" opacity=".09"/>
+    <circle cx="60" cy="392" r="128" fill="#fff" opacity=".07"/>
+    <circle cx="330" cy="330" r="70" fill="#fff" opacity=".05"/>
+    <rect width="800" height="400" fill="url(#sheen)"/>
+  </g>
+  <rect x="1" y="1" width="798" height="398" rx="31" fill="none" stroke="#fff" stroke-opacity=".2" stroke-width="2"/>
+
+  <!-- 图标：与 logo.svg 同形，缩放至 148 -->
+  <g transform="translate(84,134) scale(0.52)">
+    <rect width="256" height="256" rx="60" fill="#4C1D95" opacity=".42" filter="url(#shadow)"/>
+    <rect width="256" height="256" rx="60" fill="none" stroke="#fff" stroke-opacity=".38" stroke-width="3.5"/>
+    <rect width="256" height="256" rx="60" fill="#fff" mask="url(#glyph)"/>
+  </g>
+
+  <g font-family="'PingFang SC','HarmonyOS Sans SC','Microsoft YaHei',system-ui,sans-serif" fill="#fff">
+    <text x="272" y="176" font-size="66" font-weight="800" letter-spacing="-1">Backup</text>
+    <text x="274" y="222" font-size="27" font-weight="600" opacity=".95">高级备份 · AstrBot 插件</text>
+    <g opacity=".88" font-size="18">
+      <text x="274" y="272" text-anchor="start">消息 / 媒体 / 成员</text>
+      <text x="430" y="272" text-anchor="middle" opacity=".5">·</text>
+      <text x="450" y="272" text-anchor="start">增量备份</text>
+      <text x="546" y="272" text-anchor="middle" opacity=".5">·</text>
+      <text x="566" y="272" text-anchor="start">多格式导出</text>
+      <text x="672" y="272" text-anchor="middle" opacity=".5">·</text>
+      <text x="692" y="272" text-anchor="start">一键恢复</text>
+    </g>
+  </g>
+  <text x="76" y="330" font-family="'PingFang SC','Microsoft YaHei',system-ui,sans-serif" font-size="17" fill="#fff" opacity=".62">科技酱 · asoe.cn</text>
 </svg>
