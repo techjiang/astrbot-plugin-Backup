@@ -190,6 +190,38 @@ try，失败就沿用上次快照并在 `error` 里说明；只有历史消息�
 所以 `is_admin` 不可用（或返回 False）时继续看 `sender_role` / `role` / `sender.role`，
 都认不出才拒绝。
 
+**通知钩子为什么必须有 `on_notice`**
+`_on_notice_impl` 写好了却没人调，等于「大量退群触发备份」「群解散预警」「机器人被踢前
+最后一次备份」三个功能从来没上线过——README 写着，代码不通。现在 `on_notice` 用
+`filter.event_message_type(ALL)` 注册（与 `on_message` 同一入口），内部先判
+`post_type == message` 直接返回：消息重投已经在 `on_message` 归档过了，再走一遍退群聚合
+等于凭空造出 N 个退群者，一次普通聊天就能把阈值顶满。钩子整体 try/except，通知出问题也
+不能把机器人的消息链路带崩。
+
+**为什么 `sub_type` 要先于 `notice_type` 读**
+OneBot v11 把类型放 `notice_type`（`group_decrease` / `group_disband`），原因放 `sub_type`
+（`leave` / `kick` / `kick_me`）。原来的顺序是先读 `notice_type`，于是所有退群通知都被归类
+成 `group_decrease`，既不在 `DECREASE_SUBTYPES` 里、也不在解散集合里，聚合永不触发。
+
+**为什么 `leave` / `kick` 不算「机器人被踢」**
+`leave` 是「有成员退群」，`kick` 是「有成员被踢」——被踢的可以是别人。把它们放进
+`KICK_SUBTYPES` 的后果是：群里任意一人退群都会立刻做一次「离群前最后备份」，而真正的
+`kick_me`（机器人自己被踢）不在集合里，永远不触发。三个集合现在互不相交，
+`handle_notice` 的 if/else 才不会把一次退群判成两种事。
+
+**解析产物为什么要保证稳定**
+`@张三` + `" 看这个"` 用 `" ".join()` 拼出来是 `@张三  看这个`，中英混排的段之间又会粘成
+`helloworld`。这不只是好看不好看：校验和是按 `content` 算的，同一段话两次解析结果不同，
+跨来源比对就会假阳性。现在按「相邻两段都是 ASCII 词才补空格」来拼，段内原有空白不动。
+
+**只能实机确认的三处，怎么对齐**
+`message_obj` 字段名、退群/被踢的 `sub_type` 取值、宿主自定义路由的挂载方式，代码里已经
+留好口袋：
+- `EventHooks.describe_event` / `describe_notice`：首次收到真实事件时打一行 **只含字段名**
+  的 debug 日志（值里可能有消息内容，不记），直接告出「认出群号 / 认出类型」的结果；
+- `event_hooks.py` 顶部三个 `*_SUBTYPES` 集合，适配器叫法不同就改这里；
+- `download_route.handle_download(path, exports)` 是纯函数，怎么挂都行。
+
 ## 红线对照
 
 | 红线 | 落地位置 |

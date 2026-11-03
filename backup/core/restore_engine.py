@@ -68,6 +68,11 @@ class RestoreEngine:
         if archive is not None:
             # 本地没有记录时只能信包自己的 manifest：这正是「换台机器、把包拿出来
             # 恢复」的场景，包里必须自带够用的元数据
+            from pathlib import Path as _Path
+
+            if not _Path(str(archive)).is_file():
+                # 不过滤会把「路径打错」和「包真被改过」混成同一句「校验失败」
+                raise RestoreError(f"备份文件不存在：{archive}")
             ok, reason = verify_zip(archive, expected_checksum)
             if not ok:
                 raise RestoreError(f"备份文件校验失败：{reason}")

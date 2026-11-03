@@ -186,13 +186,34 @@ def parse_message(raw: Any, group_id: Optional[int] = None) -> Message:
         sender_name=str(sender_name),
         timestamp=timestamp,
         message_type=message_type,
-        content=" ".join(t for t in texts if t).strip(),
+        content=_join_texts(texts),
         raw_content=_raw_json(raw),
         reply_to=str(reply_to) if reply_to else None,
         media_paths=media_paths,
         is_forward=is_forward,
         forward_chain=forward_chain,
     )
+
+
+def _join_texts(texts: list[str]) -> str:
+    """把消息链里的文本段拼回一句话。
+
+    直接 `" ".join()` 会在每个 @ 后面多出一个空格（`@张三  看这个`），中英混排
+    的群消息里几乎每条 @ 都会中招。可读性是一方面，更要紧的是同一段话每次
+    解析都要得到同一个结果——校验和是按 content 算的。
+
+    规则：段与段相邻都是 ASCII 单词时补一个空格（避免 `hello`+`world` 粘成
+    `helloworld`）；原本就以空白结尾/开头的段不重复补。
+    """
+    out = ""
+    for seg in texts:
+        if not seg:
+            continue
+        if out and not out[-1].isspace() and not seg[0].isspace():
+            if out[-1].isascii() and out[-1].isalnum() and seg[0].isascii() and seg[0].isalnum():
+                out += " "
+        out += seg
+    return out.strip()
 
 
 def _forward_node(node: Any) -> dict:

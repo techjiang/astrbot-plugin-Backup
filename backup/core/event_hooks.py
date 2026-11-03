@@ -13,11 +13,29 @@ from .models import Message
 
 logger = logging.getLogger(__name__)
 
-# 各平台「机器人被踢 / 群解散」通知的子类型名，命中即做最后一次备份
-KICK_SUBTYPES = {"kick", "kick_off", "bot_kicked", "bot_leave", "leave"}
+# 「机器人自己被踢」的通知子类型。OneBot 协议里这个值是 kick_me，不叫 kick_off。
+# 注意不能把 `leave` 放进来：那是「有成员退群」，被踢的可以是别人。
+KICK_SUBTYPES = {"kick_me", "kick_self", "bot_kicked", "bot_leave", "self_kick"}
 DISBAND_SUBTYPES = {"disband", "dismiss", "group_disband", "group_dismiss"}
-# 成员变动类通知：群里正常有人退群也走这里，先聚合再判断
-DECREASE_SUBTYPES = {"decrease", "leave", "quit", "member_leave", "kick"}
+# 「有人退群」的通知子类型：先聚合，达到阈值再备份
+DECREASE_SUBTYPES = {"decrease", "leave", "quit", "member_leave", "member_kick"}
+# 通知里出现这些 type（而非 sub_type）时，按消息重投处理：同一条通知换个投递
+# 路径再进来一次，不能当成「又退了一个人」
+NOTICE_ECHO_TYPES = {"message", "message_sent", "send", "echo"}
+
+# 适配器探测：只记「有没有这个字段」，不记值——值里可能是消息内容
+EVENT_FIELDS = (
+    "group_id",
+    "group",
+    "message_obj",
+    "raw_message",
+    "message_str",
+    "sender_id",
+    "user_id",
+    "sender_name",
+    "nickname",
+)
+NOTICE_FIELDS = ("post_type", "notice_type", "sub_type", "subtype", "group_id", "group")
 
 # 私聊消息在库里的 group_id。负数，和真实群号（正整数）区分开
 PRIVATE_ARCHIVE_GROUP = -1
@@ -79,7 +97,12 @@ def parse_event_message(event, group_id: int) -> Optional[Message]:
 
 
 def classify_group_event(payload) -> tuple[Optional[int], str]:
-    """从原始通知里认 (群号, 事件类型)。认不出返回 (None, '')。"""
+    """从原始通知里认 (群号, 事件类型)。认不出返回 (None, '')。
+
+    OneBot v11 把类型放在 `notice_type`（group_decrease / group_disband ……），
+    具体原因放在 `sub_type`（leave / kick / kick_me ……）。反过来取会把
+    `group_decrease` 当成类型，那样所有退群通知都认不出来，聚合永远不触发。
+    """
     group_id = None
     for name in ("group_id", "group", "target_id"):
         value = _get(payload, name)
@@ -89,10 +112,24 @@ def classify_group_event(payload) -> tuple[Optional[int], str]:
         if isinstance(value, str) and value.isdigit():
             group_id = int(value)
             break
-    subtype = (
-        _get(payload, "sub_type") or _get(payload, "subtype") or _get(payload, "notice_type")
-    )
+    subtype = _get(payload, "sub_type") or _get(payload, "subtype") or _get(payload, "notice_type")
     return group_id, str(subtype or "").lower()
+
+
+def notice_candidates(payload) -> list:
+    """一条通知可能被包了一层（`{'post_type': 'notice', 'notice': {...}}`）。"""
+    if payload is None:
+        return []
+    inner = payload.get("notice") if isinstance(payload, dict) else _get(payload, "notice")
+    return [payload, inner] if inner is not None and inner is not payload else [payload]
+
+
+def is_message_echo(payload) -> bool:
+    """这条通知其实是消息的重投（post_type=message），不是群事件。"""
+    for item in notice_candidates(payload):
+        if str(_get(item, "post_type", "") or "").lower() in NOTICE_ECHO_TYPES:
+            return True
+    return False
 
 
 class EventHooks:
@@ -175,7 +212,15 @@ class EventHooks:
         拆成三段是为了让 main.py 只做接线：
         认群号 → 退群聚合 → 解散/被踢判定。
         """
-        group_id, subtype = classify_group_event(payload)
+        if is_message_echo(payload):
+            # on_message 已经归档过了。同一条消息再走一遍退群聚合，等于凭空
+            # 造出 N 个退群者，一次普通聊天就能把「大量退群」的阈值顶满
+            return None, "", False
+        group_id, subtype = None, ""
+        for item in notice_candidates(payload):
+            group_id, subtype = classify_group_event(item)
+            if group_id is not None or subtype:
+                break
         if group_id is None and event is not None:
             group_id = extract_group_id(event)
         if group_id is None:
@@ -196,3 +241,28 @@ class EventHooks:
             self._last_kick_backup[group_id] = now
             return True
         return False
+
+    # ---------- 适配器探测 ----------
+    def describe_event(self, event) -> str:
+        """第一次收到真实事件时打一行字段清单（只列字段名，不含值与内容）。
+
+        只能实机确认的那几处——群号从哪个字段读、退群/被踢的 sub_type 到底叫什么
+        ——靠这行日志对齐，不用靠猜。
+        """
+        present = [n for n in EVENT_FIELDS if _get(event, n) not in (None, "", [], {})]
+        group_id = extract_group_id(event)
+        return (
+            f"事件字段：{'、'.join(present) or '（无）'}"
+            f" | 认出群号：{group_id if group_id is not None else '失败'}"
+        )
+
+    def describe_notice(self, payload) -> str:
+        present = []
+        for item in notice_candidates(payload):
+            present += [n for n in NOTICE_FIELDS if _get(item, n) not in (None, "", [], {})]
+        group_id, subtype = classify_group_event(payload)
+        return (
+            f"通知字段：{'、'.join(dict.fromkeys(present)) or '（无）'}"
+            f" | 认出：群 {group_id if group_id is not None else '失败'}"
+            f" / 类型 {subtype or '未知'}"
+        )

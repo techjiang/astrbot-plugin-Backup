@@ -104,11 +104,40 @@ class TestTriggers:
 
     def test_kick_triggers_once(self, db):
         hooks = make_hooks(db)
-        assert hooks.note_group_event(100, "kick") is True
-        assert hooks.note_group_event(100, "kick") is False
+        # OneBot 里「机器人自己被踢」是 kick_me；kick / leave 是「有成员被踢 / 退群」
+        assert hooks.note_group_event(100, "kick_me") is True
+        assert hooks.note_group_event(100, "kick_me") is False
+
+    def test_member_kick_is_not_bot_kick(self, db):
+        """群主踢了别人，不该被当成「机器人被踢」去做最后一次备份。"""
+        assert make_hooks(db).note_group_event(100, "kick") is False
+        assert make_hooks(db).note_group_event(100, "leave") is False
 
     def test_unknown_subtype_ignored(self, db):
         assert make_hooks(db).note_group_event(100, "poke") is False
+
+    def test_notice_type_not_read_as_subtype(self, db):
+        """OneBot 把类型放 notice_type、原因放 sub_type。反过来取会让所有退群通知认不出来。"""
+        hooks = make_hooks(db)
+        for _ in range(3):
+            _, subtype, should = hooks.handle_notice(
+                {"group_id": 100, "notice_type": "group_decrease", "sub_type": "leave"}
+            )
+        assert subtype == "leave"
+        assert should is True
+
+    def test_wrapped_payload_is_unwrapped(self, db):
+        hooks = make_hooks(db)
+        payload = {"post_type": "notice", "notice": {"group_id": 100, "sub_type": "disband"}}
+        assert hooks.handle_notice(payload)[0] == 100
+        assert hooks.handle_notice(payload)[1] == "disband"
+
+    def test_message_echo_does_not_count_as_leave(self, db):
+        """消息重投不能再走一遍退群聚合，否则普通聊天就能把阈值顶满。"""
+        hooks = make_hooks(db)
+        for _ in range(5):
+            assert hooks.handle_notice({"post_type": "message", "group_id": 100}) [2] is False
+        assert hooks.trigger.record_leave(100, None) == 1  # 只有这一条是我们手动记的
 
     def test_classify_group_event(self):
         assert classify_group_event({"group_id": 5, "sub_type": "Decrease"}) == (5, "decrease")
@@ -158,8 +187,9 @@ class TestHandleNotice:
 
     def test_kick_triggers_once_within_cooldown(self, db):
         hooks = make_hooks(db)
-        assert hooks.handle_notice({"group_id": 100, "sub_type": "kick_off"})[2] is True
-        assert hooks.handle_notice({"group_id": 100, "sub_type": "kick_off"})[2] is False
+        payload = {"group_id": 100, "notice_type": "group_decrease", "sub_type": "kick_me"}
+        assert hooks.handle_notice(payload)[2] is True
+        assert hooks.handle_notice(payload)[2] is False
 
     def test_notice_without_group_falls_back_to_event(self, db):
         hooks = make_hooks(db)

@@ -110,6 +110,8 @@ class BackupPlugin(Star):
             on_disband=bool((self.config.get("auto_trigger") or {}).get("on_group_disband", True)),
             archive_private=bool((self.config.get("scope") or {}).get("private_messages", False)),
         )
+        self._notice_probe_done = False
+        self._event_probe_done = False
         self.scheduler.restore_jobs()
         if self.config.get("retention", {}).get("auto_clean"):
             self.exports.clean_exports(
@@ -371,9 +373,33 @@ class BackupPlugin(Star):
             self.hooks.archive_message(event)
         except Exception as e:  # 归档失败不能影响机器人正常聊天
             logger.error("实时归档失败 group=%s: %s", extract_group_id(event), type(e).__name__)
+        if not self._event_probe_done:
+            self._event_probe_done = True
+            try:
+                logger.debug("首次真实事件 %s", self.hooks.describe_event(event))
+            except Exception:  # 探测自己出错绝不能影响归档
+                pass
 
-    async def _on_notice_impl(self, event):
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_notice(self, event: AstrMessageEvent):
+        """群事件通知（成员变动 / 解散 / 机器人被踢）→ 触发式备份。
+
+        以前 `_on_notice_impl` 写好了却没人调，等于退群聚合、解散预警、离群前
+        最后一次备份三个功能从来没上线过。钩子里抛错一律吞掉：备份插件不能因为
+        一条通知就把机器人的消息处理链路带崩。
+        """
+        try:
+            await self._handle_notice(event)
+        except Exception as e:
+            logger.error("通知处理失败: %s", type(e).__name__)
+
+    async def _handle_notice(self, event):
         payload = getattr(event, "message_obj", None) or getattr(event, "raw_message", None)
+        if payload is None:
+            payload = self._notice_payload(event)
+        if not self._notice_probe_done:
+            self._notice_probe_done = True
+            logger.debug(self.hooks.describe_notice(payload))
         group_id, subtype, should_backup = self.hooks.handle_notice(payload, event)
         if group_id is None or not should_backup:
             return
@@ -382,6 +408,29 @@ class BackupPlugin(Star):
             await self._backup(group_id, event)
         except Exception as e:
             logger.error("触发式备份失败 group=%s: %s", group_id, type(e).__name__)
+
+    @staticmethod
+    def _notice_payload(event):
+        """把 AstrBot 的事件对象摊成 dict，供 handle_notice 认类型。
+
+        只搬「结构字段」，不碰消息内容——日志和内存里都不该出现聊天记录。
+        """
+        for holder in ("message_obj", "raw_message"):
+            inner = getattr(event, holder, None)
+            if isinstance(inner, dict):
+                return inner
+        data = {}
+        for name in ("post_type", "notice_type", "sub_type", "group_id", "user_id"):
+            value = getattr(event, name, None)
+            if value not in (None, ""):
+                data[name] = value
+        obj = getattr(event, "message_obj", None)
+        if obj is not None:
+            for name in ("post_type", "notice_type", "sub_type", "group_id", "user_id"):
+                value = getattr(obj, name, None)
+                if value not in (None, "") and name not in data:
+                    data[name] = value
+        return data
 
     async def _backup(self, group_id: int, event=None):
         """统一的备份入口：优先用事件自带的平台对象，退回全局平台。"""
