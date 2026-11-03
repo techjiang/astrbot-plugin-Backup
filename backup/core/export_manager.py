@@ -20,7 +20,11 @@ from ..exporters.base import ExportContext
 from ..exporters.html_exporter import HtmlExporter
 from .database import REALTIME_BACKUP_ID, Database, group_info_from_dict, members_from_list
 from .models import Message
-from .verifier import compute_checksum, compute_manifest_checksum
+from .verifier import (
+    compute_checksum,
+    compute_manifest_checksum,
+    snapshot_evidence,
+)
 
 EXPIRY_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
@@ -285,12 +289,21 @@ class ExportManager:
             "author": {"name": "科技酱", "homepage": "https://www.asoe.cn"},
         }
         # 群名、群信息、成员表不在消息校验和的覆盖范围内，单独算一个指纹：
-        # 否则改掉包里的群名和成员表，清单依然「自洽」，恢复时照单全收
-        # 指纹只能证明「清单没被单独改过」：谁都能用同一套算法算完再填回去。
-        # 真正拦得住的是本地库里那份记录——导出时把记录记下的值写进清单，恢复
-        # 时拿它比对，包作者改不了一份他没写过的记录。
+        # 否则改掉包里的群名和成员表，清单依然「自洽」，恢复时照单全收。
+        #
+        # 但指纹证明不了什么——它和包里的内容在同一只手里，改完重算一遍就自洽了。
+        # 真正拦得住篡改的是**本机库里另存的那份证据**（`export_evidence` 表）：
+        # 包作者能改包，改不了导出当时写进本机库的记录。所以带 backup_id 导出时，
+        # 顺手把快照和它的指纹落到本地；恢复端只认本地这份，不认包里的 `trusted`。
         manifest["trusted"] = ctx.trusted or self._trusted_snapshot(record, ctx.group_id)
         manifest["manifest_checksum"] = compute_manifest_checksum(manifest)
+        if ctx.backup_id:
+            self.db.save_export_evidence(
+                ctx.backup_id,
+                int(manifest["group_id"] or ctx.group_id),
+                manifest["trusted"],
+                snapshot_evidence(manifest["trusted"]),
+            )
         media_members: list[str] = []
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for file in work.rglob("*"):

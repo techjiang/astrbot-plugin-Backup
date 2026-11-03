@@ -17,7 +17,13 @@ from .database import (
 from .export_manager import snapshot_of
 from .models import Message
 from .parser import parse_message
-from .verifier import compute_checksum, diff_snapshot, read_manifest, verify_zip
+from .verifier import (
+    compute_checksum,
+    diff_snapshot,
+    read_manifest,
+    snapshot_evidence,
+    verify_zip,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -206,18 +212,14 @@ class RestoreEngine:
                     f"备份包含 {len(stray)} 条不属于备份 {record.backup_id} 的消息，拒绝恢复"
                 )
             # 消息对得上，不代表群名和成员对得上：这两样是自由文本，改完消息校验和
-            # 纹丝不动，恢复时照样写进目标群。导出时按本机库写下的「可信快照」就
-            # 是为了这一刻——包里被换成别的群名、别的人名，一比就露。
+            # 纹丝不动，恢复时照样写进目标群。
+            #
+            # 比对基准只能是**本机库里的那份**（导出时落下的 export_evidence）。不能
+            # 读包里的 `manifest['trusted']`：那份和被比对的内容在同一个 ZIP 里，
+            # 改完顺手重算 `manifest_checksum`，包就自洽了，比对恒成立——而
+            # 「群名改掉、成员表塞一个攻击者」实测就是这么恢复成功的。
             packed = read_manifest(archive) or {}
-            problems = diff_snapshot(
-                snapshot_of(
-                    group_info_from_dict(packed.get("group_info") or {}, record.group_id),
-                    members_from_list(packed.get("members") or [], record.group_id),
-                ),
-                packed.get("trusted"),
-            )
-            if problems:
-                raise RestoreError("备份包的群信息与可信快照不一致：" + "；".join(problems))
+            self._check_snapshot(record, packed, archive)
             return
         # 记录里的 checksum 只覆盖「那次备份新增的消息」。整群恢复（一次全新的
         # 全量备份把库里所有消息都接手过）之后，按库取出的是全群消息，天然不等于
@@ -226,6 +228,53 @@ class RestoreEngine:
             if not self._record_owns(record, messages):
                 return
             raise RestoreError("消息校验和不一致，备份可能已损坏")
+
+    def _check_snapshot(self, record, packed: dict, archive) -> None:
+        """包里的群信息/成员表 必须与本地留存的那份一致。
+
+        证据从 `export_evidence` 取，缺失时退回「这条记录自己的快照」——两者都在
+        本机库里，都是包作者改不到的东西。
+
+        本机一样都没有（换台机器、记录已被清理）时不硬拦：这时包本身就是唯一凭据，
+        拦下去等于「换机器恢复」彻底不能用了。但也不能假装验过。
+        """
+        local, source = self._local_evidence(record)
+        if local is None:
+            logger.warning(
+                "备份 %s 在本机没有可信快照（换机器/记录已清理），群信息与成员表无法校验",
+                record.backup_id,
+            )
+            return
+        actual = snapshot_of(
+            group_info_from_dict(packed.get("group_info") or {}, record.group_id),
+            members_from_list(packed.get("members") or [], record.group_id),
+        )
+        problems = diff_snapshot(actual, local)
+        if problems:
+            raise RestoreError(
+                f"备份包的群信息与{source}不一致：" + "；".join(problems)
+            )
+
+    def _local_evidence(self, record) -> tuple[Optional[dict], str]:
+        """本机手里那份「这份备份的群名和成员原本是什么」。
+
+        优先导出证据（带指纹，能顺带发现证据行本身被改过），退回记录自带的快照。
+        """
+        evidence = self.db.get_export_evidence(record.backup_id, record.group_id)
+        if evidence and evidence.get("snapshot"):
+            snapshot = evidence["snapshot"]
+            if snapshot_evidence(snapshot) != evidence.get("evidence"):
+                raise RestoreError("本机留存的导出证据自相矛盾，拒绝恢复")
+            return snapshot, "导出时留存的快照"
+        bundle = self.db.get_bundle(record.backup_id, record.group_id)
+        if bundle:
+            snapshot = snapshot_of(
+                group_info_from_dict(bundle.get("group_info") or {}, record.group_id),
+                members_from_list(bundle.get("members") or [], record.group_id),
+            )
+            if (snapshot.get("group_info") or {}).get("group_name") or snapshot.get("members"):
+                return snapshot, "本机留存的快照"
+        return None, ""
 
     def _record_owns(self, record, messages: list[Message]) -> bool:
         """库里这批消息是不是全归这条备份记录管。
@@ -345,8 +394,12 @@ class RestoreEngine:
         # 群状态表只在「本机还没有这个群的任何记录」时补：换机器是这种情况，
         # 而本机已经有更新的实时状态时不该被一个旧包覆盖回去
         if self.db.get_group_info(target) is None:
+            # 群号必须落到**目标**群上：包里的 group_info 写着原群号，直接存进去
+            # 就成了「原群的群名 + 原群的群号」，目标群里照样查不到群名——
+            # 换机器恢复完 `/backup status` 依旧显示只有一串数字
             info = group_info_from_dict((manifest or {}).get("group_info") or {}, target)
             if info is not None:
+                info.group_id = target
                 self.db.save_group_info(info)
         if not self.db.get_members(target):
             members = members_from_list((manifest or {}).get("members") or [], target)

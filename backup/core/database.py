@@ -109,6 +109,18 @@ CREATE TABLE IF NOT EXISTS backup_bundle (
   PRIMARY KEY (backup_id, group_id)
 );
 
+-- 导出时的「可信快照」证据：群名/群信息/成员表的指纹。
+-- 备份包里的每一个字段都是包作者写的，谁都能改完再把这个包自己的指纹重算一遍。
+-- 唯一改不了的是导出当时写在本机库里的这一行——恢复时拿它比对，篡改才拦得住。
+CREATE TABLE IF NOT EXISTS export_evidence (
+  backup_id TEXT NOT NULL,
+  group_id INTEGER NOT NULL,
+  snapshot TEXT NOT NULL,
+  evidence TEXT NOT NULL,
+  exported_at DATETIME,
+  PRIMARY KEY (backup_id, group_id)
+);
+
 CREATE TABLE IF NOT EXISTS backup_meta (
   group_id INTEGER PRIMARY KEY,
   last_timestamp DATETIME,
@@ -1070,6 +1082,46 @@ class Database:
                 continue
             self.execute("DELETE FROM media_files WHERE id = ?", (row["id"],))
         return removed
+
+    # ---------- 导出证据 ----------
+    def save_export_evidence(
+        self, backup_id: str, group_id: int, snapshot: dict, evidence: str, exported_at=None
+    ) -> None:
+        """记下「这份备份导出时本机看到的群名/成员表」及其指纹。
+
+        只写这一行就能挡住篡改：包里的快照和它比，改了就露。指纹单独存是为了
+        比对时不用再把整份快照读出来算 hash。
+        """
+        self.execute(
+            """INSERT OR REPLACE INTO export_evidence
+               (backup_id, group_id, snapshot, evidence, exported_at)
+               VALUES (?,?,?,?,?)""",
+            (
+                backup_id,
+                group_id,
+                json.dumps(snapshot or {}, ensure_ascii=False, sort_keys=True),
+                evidence,
+                to_db(exported_at or datetime.now()) if isinstance(exported_at, datetime)
+                else to_db(datetime.now()),
+            ),
+        )
+
+    def get_export_evidence(self, backup_id: str, group_id: Optional[int] = None) -> Optional[dict]:
+        """取导出证据。`group_id` 为空时取这份备份最近一次导出留下的那行。"""
+        sql = "SELECT * FROM export_evidence WHERE backup_id = ?"
+        params: list = [backup_id]
+        if group_id is not None:
+            sql += " AND group_id = ?"
+            params.append(group_id)
+        sql += " ORDER BY exported_at DESC LIMIT 1"
+        row = self.query_one(sql, params)
+        if row is None:
+            return None
+        try:
+            snapshot = json.loads(row["snapshot"] or "{}")
+        except ValueError:
+            snapshot = {}
+        return {"snapshot": snapshot, "evidence": row["evidence"], "group_id": row["group_id"]}
 
     # ---------- 群公告 / 群文件 ----------
     def save_announcements(self, group_id: int, items: list[dict]) -> int:

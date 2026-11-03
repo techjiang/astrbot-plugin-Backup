@@ -193,7 +193,8 @@ class TestPackageSnapshot:
             for name, body in items.items():
                 zf.writestr(name, body)
 
-        target = Database(tmp_path / "target.sqlite")
+        # 同一台机器恢复：目标库就是导出时那个库，里面有导出留下的证据
+        target = db
         try:
             _record(target, "bk_x", [make_message(i) for i in range(3)])
             with pytest.raises(RestoreError) as err:
@@ -202,10 +203,10 @@ class TestPackageSnapshot:
                         "bk_x", GROUP, "skip", archive=str(forged), confirm=True
                     )
                 )
-            assert "可信快照" in str(err.value)
-            assert target.get_group_info(GROUP) is None
+            assert "快照" in str(err.value)
+            assert target.get_group_info(GROUP).group_name == "真实群名"
         finally:
-            target.close()
+            pass
 
     def test_honest_package_still_restores(self, db, tmp_path):
         """拦得住假的，也得放得过真的——包括换台机器（本地没有记录）。"""

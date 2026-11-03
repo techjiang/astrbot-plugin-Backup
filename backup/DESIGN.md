@@ -301,11 +301,19 @@ token 一次性，目的是「链接转发出去不能被重复领走」。但�
 只有整份取走才作废。
 
 **包里的群名和成员凭什么信得过**
-`manifest_checksum` 只能证明「清单没被单独改过」：谁都能用同一套算法算完填回去。真正拦得住
-的是本地库里那份记录——导出时按本机库写下 `trusted`（群名/群信息/成员表的规范化快照），
-恢复时拿包内容跟它比，包作者改不了一份他没写过的记录。`diff_snapshot` 做这个比对；
-老包没有 `trusted` 字段就跳过，不因为少个字段把旧包全判成损坏。同机恢复走这条，换机器
-（本地没有记录）只能信包，指纹至少能对上。
+`manifest_checksum` 只能证明「清单没被单独改过」：谁都能用同一套算法算完填回去。
+包里的 `manifest['trusted']` 也一样——它和被比对的内容在同一个 ZIP 里，改完顺手重算
+指纹，包就自洽了（实测：把 trusted 的成员表换成一个人，同机恢复照样通过）。
+
+真正拦得住的是**本机库里另存的那份**：导出时把快照和它的 SHA-256 落进
+`export_evidence` 表，恢复时只认这一份，包作者改不了他没写过的记录。
+证据行本身被动过（快照与指纹对不上）同样拒绝恢复。
+
+比对用「一致」而不是「包里有的都得对上」：包在群名或成员表上**单方面添加**内容
+（删掉真群名换成自造的、多塞一个 owner）也自洽，只有双向相等才算没被改过。
+
+换台机器时本机没有任何证据，此时只能信包——但会在日志里明确写「无法校验」，
+不假装验过，也不因此把迁移这条路堵死（拦下去等于「换机器恢复」彻底不能用）。
 
 ## 红线对照
 
@@ -315,7 +323,7 @@ token 一次性，目的是「链接转发出去不能被重复领走」。但�
 | 媒体失败不阻塞 | `BackupEngine._download_media` 内 try/except，计失败数 |
 | 备份不在 Web 目录 | `storage/exports`，靠 token 转发 |
 | 链接带 token 且过期 | `ExportManager._issue_token` / `resolve_token` |
-| 恢复二次确认 + 校验 | `RestoreEngine.restore(confirm=True)` + `verify_backup` |
+| 恢复二次确认 + 校验 | `RestoreEngine.restore(confirm=True)` + `verify_backup` + 本机 `export_evidence` 快照比对 |
 | 大群分页 | `PAGE_SIZE = 50` 循环拉取 |
 | 超时兜底 | aiohttp `ClientTimeout`、APscheduler `misfire_grace_time` |
 | pathlib 路径 | 全部用 `Path`；`safe_filename` 剥离目录部分 |

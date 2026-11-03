@@ -91,28 +91,58 @@ def _normalize(value):
     return value
 
 
-def diff_snapshot(actual: dict, trusted) -> list[str]:
-    """包里自带的群信息/成员表，和可信快照对不上就返回差异说明。
+def _group_fields(snapshot) -> dict:
+    info = (snapshot or {}).get("group_info") or {}
+    # member_count 不参与：它是成员表的派生数字，平台各适配器给的时机不一样，
+    # 明明成员表一致却因为它多算一次差异，等于把正常包判成被改过
+    return {k: info.get(k) for k in ("group_name", "owner_id")}
 
-    `trusted` 是导出时按本机库写进清单的那份（`manifest['trusted']`）。老包没有
-    这个字段，返回空表——不能因为少个新字段把旧包全判成损坏。
+
+def _member_map(snapshot) -> dict:
+    return {
+        str(m.get("user_id")): _normalize(m) for m in ((snapshot or {}).get("members") or [])
+    }
+
+
+def diff_snapshot(packed: dict, local) -> list[str]:
+    """包里的群信息/成员表 与 本地留存的那份 对不上就返回差异说明。
+
+    两个来源都**必须来自本地库**，不能读包里的 `manifest['trusted']`：清单里的
+    任何字段都是包作者写的，他改完顺手用同一个算法把指纹重算一遍，比对就恒成立。
+
+    `local` 为 None 表示本机根本没有这份证据（换台机器 / 记录已被清理）。此时
+    不做裁决，返回空表——包不可信这件事由调用方另外处理。
     """
-    if not isinstance(trusted, dict):
+    if not local:
         return []
+    packed = packed or {}
     problems: list[str] = []
-    real_info = (actual or {}).get("group_info") or {}
-    want_info = trusted.get("group_info") or {}
-    for key in ("group_name", "owner_id", "member_count"):
-        got, want = _normalize(real_info.get(key)), _normalize(want_info.get(key))
+    got_info, want_info = _group_fields(packed), _normalize(_group_fields(local))
+    for key, want in want_info.items():
+        got = _normalize(got_info.get(key))
         if want and got != want:
             problems.append(f"群信息 {key}（包里 {got!r}，应为 {want!r}）")
-    real_members = {
-        str(m.get("user_id")): _normalize(m) for m in ((actual or {}).get("members") or [])
-    }
-    want_members = {str(m.get("user_id")): _normalize(m) for m in (trusted.get("members") or [])}
-    if want_members and real_members != want_members:
-        problems.append(f"成员列表（包里 {len(real_members)} 人，应为 {len(want_members)} 人）")
+    got_members, want_members = _member_map(packed), _member_map(local)
+    if want_members and got_members != want_members:
+        problems.append(
+            f"成员列表（包里 {len(got_members)} 人，应为 {len(want_members)} 人）"
+        )
     return problems
+
+
+def _canonical(snapshot) -> str:
+    return json.dumps(
+        _normalize(snapshot or {}), ensure_ascii=False, sort_keys=True, default=str
+    )
+
+
+def snapshot_evidence(snapshot) -> str:
+    """可信快照的指纹。存在本机库 `export_evidence` 表里，恢复时拿来对包。
+
+    `trusted` 存在包里时，它的指纹和内容在同一只手上——改完重算一遍就自洽了。
+    落到本地库才形成「两边」，包作者改不了他看不见的那一份。
+    """
+    return hashlib.sha256(_canonical(snapshot).encode("utf-8")).hexdigest()
 
 
 def verify_zip(path: str | Path, expected_checksum: Optional[str] = None) -> tuple[bool, str]:
