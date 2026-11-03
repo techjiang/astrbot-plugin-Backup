@@ -207,14 +207,15 @@ class PermissionChecker:
 
 
 def format_record_line(record) -> str:
-    """一行说清这次备份干了什么。
+    """一行说清这次备份干了什么：保住了多少条、其中新存了几条。
 
-    「新增 0 条」有两种完全不同的意思：增量没跑到新消息（正常），或者全量跑完了
-    但库里一条不缺（也正常）。而 `+3 条（库里已有 5 条）` 一眼能看出是补了新消息。
+    「覆盖 5 条」是这份备份的体量，「新 0 条」是这轮没遇到没备份过的消息——
+    两个数一起看才知道重跑一次到底是空转还是真干活。
     """
     base = "<增量>" if record.is_incremental else "<全量>"
     return (
-        f"`{record.backup_id}` {base} 覆盖 {record.message_count} 条 / "
+        f"`{record.backup_id}` {base} 覆盖 {record.message_count} 条"
+        f"（新 {record.new_count} 条）/ "
         f"{human_size(record.total_size)} / {record.status.value}"
     )
 
@@ -253,7 +254,7 @@ def render_status(db: Database, group_id: int) -> str:
         lines.append(f"最近备份：{record.started_at:%Y-%m-%d %H:%M:%S}")
         covered = db.count_sources(record.backup_id)
         lines.append(
-            f"这次覆盖：{covered or record.message_count} 条 · "
+            f"这次覆盖：{covered or record.message_count} 条（新 {record.new_count} 条）· "
             f"媒体 {record.media_count} 个 · {human_size(record.total_size)}"
         )
     else:
@@ -266,17 +267,31 @@ def render_status(db: Database, group_id: int) -> str:
     return "\n".join(lines)
 
 
+def _record_message_ids(db: Database, record) -> set[str]:
+    """一份备份覆盖过的消息 ID：来源清单优先，老库退回按归属。"""
+    ids = {m.message_id for m in db.get_source_messages(record.backup_id, record.group_id)}
+    if not ids:
+        ids = {
+            m.message_id
+            for m in db.get_messages(group_id=record.group_id, backup_id=record.backup_id)
+        }
+    return ids
+
+
 def render_diff(db: Database, id1: str, id2: str) -> str:
     """比两次备份各自留下了哪些消息。
 
-    消息按 (message_id, group_id) 唯一，一条消息只归属最后一次归档它的备份，
-    所以这里按归属反查，而不是把整个群的库都算给每次备份——那样比出来永远相等。
+    按「来源清单」取，不能按 `messages.backup_id`：那个归属只有一个值，记的是
+    最后一次归档这条消息的备份。一次全量重跑就把整群消息都划到新备份名下，
+    老备份按归属取出来是空的——`/backup diff` 于是永远报「A 0 条 / 相同 0 条 /
+    仅在 B N 条」，比什么都长这样。来源清单是后加的，升级前的老库没有这份
+    登记，此时才退回按归属取。
     """
     r1, r2 = db.get_record(id1), db.get_record(id2)
     if not r1 or not r2:
         return "备份 ID 不存在，无法对比。"
-    m1 = {m.message_id for m in db.get_messages(group_id=r1.group_id, backup_id=id1)}
-    m2 = {m.message_id for m in db.get_messages(group_id=r2.group_id, backup_id=id2)}
+    m1 = _record_message_ids(db, r1)
+    m2 = _record_message_ids(db, r2)
     only1, only2 = m1 - m2, m2 - m1
     return (
         f"**备份对比**\n- `{id1}`：{len(m1)} 条\n- `{id2}`：{len(m2)} 条\n"

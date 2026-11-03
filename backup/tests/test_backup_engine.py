@@ -40,7 +40,10 @@ async def test_incremental_backup_skips_existing(db, tmp_path):
     record = await engine.backup_group(100, platform, incremental=True, download_media=False)
 
     assert record.is_incremental is True
-    assert record.message_count == 5
+    # message_count 是「这份备份覆盖了多少条」= 全群 15 条；
+    # 「这次新存进来几条」是 new_count = 5。两个数各回答一个问题
+    assert record.new_count == 5
+    assert record.message_count == 15
     assert db.count_messages(100) == 15
 
 

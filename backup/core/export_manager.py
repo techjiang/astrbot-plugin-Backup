@@ -114,13 +114,18 @@ class ExportManager:
             snapshot_members = members_from_list(bundle.get("members") or [], group_id)
             group_info = snapshot_info or group_info
             members = snapshot_members or members
-        return ExportContext(
+        ctx = ExportContext(
             messages=messages,
             group_info=group_info,
             members=members,
             media_index=self._media_index(messages),
             backup_id=backup_id or "",
         )
+        # 清单里那份「可信快照」按用户当前看到的群名/成员写：恢复时它会被当成
+        # 「原机器上这份备份到底属于谁」来比对，用一份更旧的 bundle 写会跟导出
+        # 页面上显示的内容不一致
+        ctx.trusted = snapshot_of(group_info, members)
+        return ctx
 
     def _media_index(self, messages: list[Message]) -> dict[str, Path]:
         """库里记录的媒体路径 → 本机真实文件。
@@ -157,8 +162,14 @@ class ExportManager:
             # 一次备份按群全量跑完时接手了所有消息，更早的备份就只剩空壳；此时若
             # latest 只导自己名下那几条，等于把历史丢了。所以「上次备份名下已经
             # 没有消息」时，退回整群导出，再补上不属于任何备份的那些（实时归档）
+            # 判「历史是不是空的」要看别的备份**名下**还剩什么，不是它们覆盖过
+            # 什么：来源清单是后加的、且不会被后续备份擦掉，于是每个老备份都
+            # 覆盖了满满一批消息，这个条件恒为 False——「上次备份接手了整群、
+            # 老备份名下一个字都不剩」这种情况永远认不出来，导出 latest 只剩
+            # 最近那两三条新增，看着像把历史导丢了
             history_hollow = not any(
-                r.backup_id != record.backup_id and self.db.count_backup_source(r.backup_id, group_id)
+                r.backup_id != record.backup_id
+                and self.db.get_messages(group_id=group_id, backup_id=r.backup_id)
                 for r in self.db.list_records(group_id)
             )
             for m in self.db.get_messages(group_id=group_id):
@@ -275,6 +286,10 @@ class ExportManager:
         }
         # 群名、群信息、成员表不在消息校验和的覆盖范围内，单独算一个指纹：
         # 否则改掉包里的群名和成员表，清单依然「自洽」，恢复时照单全收
+        # 指纹只能证明「清单没被单独改过」：谁都能用同一套算法算完再填回去。
+        # 真正拦得住的是本地库里那份记录——导出时把记录记下的值写进清单，恢复
+        # 时拿它比对，包作者改不了一份他没写过的记录。
+        manifest["trusted"] = ctx.trusted or self._trusted_snapshot(record, ctx.group_id)
         manifest["manifest_checksum"] = compute_manifest_checksum(manifest)
         media_members: list[str] = []
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -295,6 +310,24 @@ class ExportManager:
             zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         shutil.rmtree(work, ignore_errors=True)
         return zip_path
+
+    def _trusted_snapshot(self, record, group_id: int) -> dict:
+        """导出时记下的「这份备份属于谁」：群名、群信息、成员表。
+
+        只放本机库里的值，它随包一起走。恢复端有这条记录时以记录为准（包改了也
+        没用），没有记录时（换机器）只能信包，至少指纹能对上。
+        """
+        snapshot: dict = {"group_id": int(group_id)}
+        bundle = self.db.get_bundle(record.backup_id, group_id) if record else None
+        info = group_info_from_dict((bundle or {}).get("group_info") or {}, group_id)
+        if info is None:
+            info = self.db.get_group_info(group_id)
+        members = members_from_list((bundle or {}).get("members") or [], group_id)
+        if not members:
+            members = self.db.get_members(group_id)
+        snapshot["group_info"] = group_info_to_dict(info)
+        snapshot["members"] = [member_to_dict(m) for m in members]
+        return snapshot
 
     @staticmethod
     def _is_inside(path: Path, root: Path) -> bool:
@@ -389,6 +422,20 @@ def _record_to_dict(record) -> Optional[dict]:
         "is_incremental": record.is_incremental,
         "base_backup_id": record.base_backup_id,
         "checksum": record.checksum,
+    }
+
+
+def snapshot_of(info, members) -> dict:
+    """群信息 + 成员列表 → 可比较的规范化结构。
+
+    导出端写「可信快照」和恢复端比对都用它，保证两边算的是同一件事。
+    成员按 user_id 排序：平台返回顺序不稳定，顺序不同不代表内容不同。
+    """
+    return {
+        "group_info": group_info_to_dict(info),
+        "members": sorted(
+            (member_to_dict(m) for m in members or []), key=lambda m: int(m["user_id"] or 0)
+        ),
     }
 
 

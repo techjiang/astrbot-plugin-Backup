@@ -2,7 +2,7 @@
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import date, datetime
 import zipfile
 from pathlib import Path
 from typing import Iterable, Optional
@@ -60,7 +60,7 @@ def read_manifest(archive: str | Path) -> dict:
 
 
 # 包清单里「可被独立校验」的部分：把它们和消息一起哈希，改动清单就能被发现
-_MANIFEST_FIELDS = ("group_id", "group_name", "group_info", "members")
+_MANIFEST_FIELDS = ("group_id", "group_name", "group_info", "members", "trusted")
 
 
 def compute_manifest_checksum(manifest: dict) -> str:
@@ -74,6 +74,45 @@ def compute_manifest_checksum(manifest: dict) -> str:
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
+
+
+def _normalize(value):
+    """把快照里的时间、数字规整成同一种写法，好让「导出端写的」和「库里读出来的」逐字节可删。"""
+    if isinstance(value, datetime):
+        return value.isoformat(timespec="microseconds")
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): _normalize(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize(v) for v in value]
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
+def diff_snapshot(actual: dict, trusted) -> list[str]:
+    """包里自带的群信息/成员表，和可信快照对不上就返回差异说明。
+
+    `trusted` 是导出时按本机库写进清单的那份（`manifest['trusted']`）。老包没有
+    这个字段，返回空表——不能因为少个新字段把旧包全判成损坏。
+    """
+    if not isinstance(trusted, dict):
+        return []
+    problems: list[str] = []
+    real_info = (actual or {}).get("group_info") or {}
+    want_info = trusted.get("group_info") or {}
+    for key in ("group_name", "owner_id", "member_count"):
+        got, want = _normalize(real_info.get(key)), _normalize(want_info.get(key))
+        if want and got != want:
+            problems.append(f"群信息 {key}（包里 {got!r}，应为 {want!r}）")
+    real_members = {
+        str(m.get("user_id")): _normalize(m) for m in ((actual or {}).get("members") or [])
+    }
+    want_members = {str(m.get("user_id")): _normalize(m) for m in (trusted.get("members") or [])}
+    if want_members and real_members != want_members:
+        problems.append(f"成员列表（包里 {len(real_members)} 人，应为 {len(want_members)} 人）")
+    return problems
 
 
 def verify_zip(path: str | Path, expected_checksum: Optional[str] = None) -> tuple[bool, str]:

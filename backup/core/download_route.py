@@ -103,7 +103,13 @@ def handle_download(path: str, exports, range_header: Optional[str] = None) -> D
     if not token:
         return _error(404, "not found")
 
-    target = exports.resolve_token(token)
+    # token 一次性，但「一次性」指的是只能领走一份，不是「只准发一个请求」。
+    # 浏览器下载大文件一定先发 `Range: bytes=0-` 探测再续传；原来每次兑换都删
+    # token，探测就成了唯一一次，真正要数据的那次请求拿到 410——
+    # 用户看到的是「下了一半断了」，而不是「链接过期」。
+    # 所以区间请求按「同一次下载的后续片段」处理，只有整份取走才作废。
+    partial = bool(range_header)
+    target = exports.resolve_token(token, shared=partial)
     if target is None:
         return _error(410, "链接已失效或不存在")
 

@@ -271,7 +271,15 @@ class BackupEngine:
             covered = self.db.get_source_messages(record.backup_id, group_id)
             if own_ids:
                 logger.info("群 %s 收编 %s 条无主消息", group_id, len(own_ids))
-                record.message_count = max(record.message_count, len(covered))
+            # 记录里的 message_count 名义上是「这次存进库的新消息数」，增量备份跑一轮
+            # 全是已在库消息时报 0 条——`/backup list` 里明晃晃写着「覆盖 0 条」，
+            # 像是备份了个寂寞，而这轮实实在在覆盖了 50 条。
+            # 现在它回答「这份备份保住了多少条消息」：按来源清单算。新增了多少由
+            # `new_count` 单独交代，两者都得能看见——只改 message_count 的话，
+            # 「这次又存进来几条」这个信息就没了。
+            record.new_count = len(collected)
+            if covered:
+                record.message_count = len(covered)
             # 群信息/成员快照每轮都存：一条新消息都没有的那轮，导出仍然需要群名
             if covered or info is not None or members:
                 self.db.save_bundle(record.backup_id, group_id, info, members)

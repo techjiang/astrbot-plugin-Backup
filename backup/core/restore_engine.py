@@ -14,9 +14,10 @@ from .database import (
     group_info_from_dict,
     members_from_list,
 )
+from .export_manager import snapshot_of
 from .models import Message
 from .parser import parse_message
-from .verifier import compute_checksum, read_manifest, verify_zip
+from .verifier import compute_checksum, diff_snapshot, read_manifest, verify_zip
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +205,19 @@ class RestoreEngine:
                 raise RestoreError(
                     f"备份包含 {len(stray)} 条不属于备份 {record.backup_id} 的消息，拒绝恢复"
                 )
+            # 消息对得上，不代表群名和成员对得上：这两样是自由文本，改完消息校验和
+            # 纹丝不动，恢复时照样写进目标群。导出时按本机库写下的「可信快照」就
+            # 是为了这一刻——包里被换成别的群名、别的人名，一比就露。
+            packed = read_manifest(archive) or {}
+            problems = diff_snapshot(
+                snapshot_of(
+                    group_info_from_dict(packed.get("group_info") or {}, record.group_id),
+                    members_from_list(packed.get("members") or [], record.group_id),
+                ),
+                packed.get("trusted"),
+            )
+            if problems:
+                raise RestoreError("备份包的群信息与可信快照不一致：" + "；".join(problems))
             return
         # 记录里的 checksum 只覆盖「那次备份新增的消息」。整群恢复（一次全新的
         # 全量备份把库里所有消息都接手过）之后，按库取出的是全群消息，天然不等于

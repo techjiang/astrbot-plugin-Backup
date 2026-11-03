@@ -50,7 +50,10 @@ class BackupRecord:
     status: BackupStatus
     started_at: datetime
     finished_at: Optional[datetime] = None
+    # 这份备份覆盖住多少条消息（来源清单口径），不是「这次新存了几条」
     message_count: int = 0
+    # 这次真正新存进库的条数；重跑一轮全是已在库的消息时它是 0，而 message_count 不是
+    new_count: int = 0
     media_count: int = 0
     total_size: int = 0
     is_incremental: bool = False

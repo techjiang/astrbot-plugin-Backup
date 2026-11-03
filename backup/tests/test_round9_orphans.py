@@ -32,7 +32,9 @@ class TestRepeatBackupChecksum:
         second = await engine.backup_group(100, _platform(history), download_media=False)
 
         assert first.status.value == "completed"
-        assert second.message_count == 0
+        # 第二轮一条没新增（new_count 0），但它覆盖的还是这 5 条
+        assert second.new_count == 0
+        assert second.message_count == 5
         assert second.checksum == first.checksum
         assert second.checksum != compute_checksum([])
 

@@ -65,12 +65,13 @@ class TestRepeatBackup:
         await engine.backup_group(100, platform, incremental=False, download_media=False)
         await engine.backup_group(100, platform, incremental=False, download_media=False)
 
-        # 库里不膨胀就够。第二次全量一条也没新增，它不该再记 5 条，
-        # 「这次备份覆盖了哪些消息」由 backup_id 归属来回答
+        # 库里不膨胀就够。第二次全量一条也没新增（new_count 0），
+        # 但它确实把整群重新覆盖了一遍（message_count 5、来源清单 5 条）
         assert db.count_messages(100) == 5
         records = db.list_records(100)
-        assert records[0].message_count == 0
-        assert db.count_backup_source(records[0].backup_id) == 0
+        assert records[0].new_count == 0
+        assert records[0].message_count == 5
+        assert db.count_backup_source(records[0].backup_id) == 5
         assert db.count_backup_source(records[1].backup_id) == 5
 
     async def test_empty_backup_does_not_mask_previous(self, db, tmp_path):
@@ -410,7 +411,8 @@ class TestRealtimeArchiveOwnership:
         platform = FakePlatform(history=raw_history(8))
         record = await engine.backup_group(100, platform, incremental=True, download_media=False)
         # 增量点仍停在 m4，m5..m7 必须补进来
-        assert record.message_count == 3
+        assert record.new_count == 3
+        assert record.message_count == 8
         assert db.count_messages(100) == 9
 
 
@@ -438,7 +440,8 @@ class TestResumeAfterInterruption:
         second = await engine.backup_group(100, platform, incremental=False, download_media=True)
 
         assert downloads == ["m0"]
-        assert second.message_count == 0
+        assert second.new_count == 0
+        assert second.message_count == 3
         assert second.media_count == 0
         assert db.count_messages(100) == 3
 
@@ -450,5 +453,6 @@ class TestResumeAfterInterruption:
 
         record = await engine.backup_group(100, full, incremental=True, download_media=False)
 
-        assert record.message_count == 60
+        assert record.new_count == 60
+        assert record.message_count == 120
         assert db.count_messages(100) == 120

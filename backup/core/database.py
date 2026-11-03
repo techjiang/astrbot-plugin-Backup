@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS backup_records (
   started_at DATETIME,
   finished_at DATETIME,
   message_count INTEGER DEFAULT 0,
+  new_count INTEGER DEFAULT 0,
   media_count INTEGER DEFAULT 0,
   total_size INTEGER DEFAULT 0,
   is_incremental BOOLEAN DEFAULT 0,
@@ -226,6 +227,18 @@ def _migrate_messages_unique(conn) -> None:
     )
 
 
+def _migrate_record_columns(conn) -> None:
+    """老库的 backup_records 没有 new_count 列。
+
+    `CREATE TABLE IF NOT EXISTS` 只管「表不存在时建表」，已有的表它不会补列。
+    升级到这一版后第一次读记录就会撞 `no such column`，整个插件起不来。
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info('backup_records')")}
+    if "new_count" not in cols:
+        conn.execute("ALTER TABLE backup_records ADD COLUMN new_count INTEGER DEFAULT 0")
+        conn.commit()
+
+
 # 老库升级：media_files 加 (message_id, original_url) 唯一键，顺带去掉重复行。
 _MEDIA_UNIQUE = ("message_id", "original_url")
 
@@ -364,6 +377,7 @@ class Database:
         self._conn.commit()
         _migrate_messages_unique(self._conn)
         _migrate_media_unique(self._conn)
+        _migrate_record_columns(self._conn)
 
     def close(self) -> None:
         self._conn.close()
@@ -748,8 +762,9 @@ class Database:
         self.execute(
             """INSERT OR REPLACE INTO backup_records
                (backup_id, group_id, status, started_at, finished_at, message_count,
-                media_count, total_size, is_incremental, base_backup_id, checksum, error)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                new_count, media_count, total_size, is_incremental, base_backup_id,
+                checksum, error)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 record.backup_id,
                 record.group_id,
@@ -757,6 +772,7 @@ class Database:
                 to_db(record.started_at),
                 to_db(record.finished_at),
                 record.message_count,
+                record.new_count,
                 record.media_count,
                 record.total_size,
                 1 if record.is_incremental else 0,
@@ -809,20 +825,28 @@ class Database:
         )
 
     def count_backup_source(self, backup_id: str, group_id: Optional[int] = None) -> int:
-        """某次备份目前还挂在多少条消息上。
+        """某次备份覆盖了多少条消息（来源清单口径）。
 
-        唯一键去掉 backup_id 之后，「这次备份到底留下了什么」只能按归属反查，
-        `/backup diff` 就是靠它比两次备份的真实差异。
+        这个数回答的是「这份备份保住了什么」。不能按 `messages.backup_id` 数：
+        那个归属只有一个值，记的是最后归档这条消息的备份，一次全量重跑就把整群
+        划到新备份名下，老备份数出来是 0 —— 而它明明还在那儿、还能恢复。
+
+        升级前的老库没有来源清单，此时才退回按归属数。
         """
-        if group_id is None:
-            row = self.query_one(
-                "SELECT COUNT(*) AS c FROM messages WHERE backup_id = ?", (backup_id,)
-            )
-        else:
-            row = self.query_one(
-                "SELECT COUNT(*) AS c FROM messages WHERE backup_id = ? AND group_id = ?",
-                (backup_id, group_id),
-            )
+        sql = "SELECT COUNT(*) AS c FROM backup_sources WHERE backup_id = ?"
+        params: list = [backup_id]
+        if group_id is not None:
+            sql += " AND group_id = ?"
+            params.append(group_id)
+        row = self.query_one(sql, params)
+        if row and row["c"]:
+            return int(row["c"])
+        sql = "SELECT COUNT(*) AS c FROM messages WHERE backup_id = ?"
+        params = [backup_id]
+        if group_id is not None:
+            sql += " AND group_id = ?"
+            params.append(group_id)
+        row = self.query_one(sql, params)
         return int(row["c"]) if row else 0
 
     def list_backup_ids_with_messages(self, group_id: int) -> list[str]:
@@ -851,6 +875,7 @@ class Database:
             started_at=from_db(row["started_at"]) or datetime.min,
             finished_at=from_db(row["finished_at"]),
             message_count=row["message_count"] or 0,
+            new_count=(row["new_count"] if "new_count" in row.keys() else 0) or 0,
             media_count=row["media_count"] or 0,
             total_size=row["total_size"] or 0,
             is_incremental=bool(row["is_incremental"]),

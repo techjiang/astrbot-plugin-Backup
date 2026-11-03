@@ -18,6 +18,8 @@ class ExportContext:
     backup_id: str = ""
     # 导出前的消息集校验和。导出器拼出来的清单要跟它一致，ZIP 包才恢复得回去
     checksum: str = ""
+    # 群信息 + 成员表的「可信快照」，写进 ZIP 清单供恢复端比对；见 verifier.diff_snapshot
+    trusted: dict = field(default_factory=dict)
 
     @property
     def group_name(self) -> str:
