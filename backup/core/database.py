@@ -483,6 +483,20 @@ class Database:
         sql += " ORDER BY m.timestamp ASC, m.id ASC"
         return [self._row_to_message(r) for r in self.query(sql, params)]
 
+    def source_message_ids(self, backup_id: str, group_id: Optional[int] = None) -> set[str]:
+        """来源清单里登记过的消息 ID，**不**管这些行还在不在库里。
+
+        这条和 `get_source_messages` 的区别正是「被清理掉之后」：JOIN messages 会
+        把已经删掉的行一并过滤掉，于是清单和库同时变小，差集永远为空。判断「这份
+        备份原本有多少、后来少了多少」必须直接查清单表。
+        """
+        sql = "SELECT message_id FROM backup_sources WHERE backup_id = ?"
+        params: list = [backup_id]
+        if group_id is not None:
+            sql += " AND group_id = ?"
+            params.append(group_id)
+        return {str(r["message_id"]) for r in self.query(sql, params)}
+
     def adopt_orphans(self, group_id: int, backup_id: str, message_ids) -> int:
         """把「归属的备份已经不存在」的消息改归给本次备份，并登记进来源清单。
 

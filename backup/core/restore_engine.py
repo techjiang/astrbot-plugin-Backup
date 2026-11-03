@@ -113,6 +113,14 @@ class RestoreEngine:
 
         messages = self._load_messages(backup_id, archive, source_group)
         if not messages:
+            # 来源清单还在、库里却一条都对不上：这不是「备份里没消息」，而是库里
+            # 那批被清掉了。这种时候能救回来的只有包，句子里得说清楚，否则用户
+            # 会拿一个一模一样的命令反复试
+            if archive is None and record is not None and self.db.count_sources(backup_id):
+                raise RestoreError(
+                    f"备份 {backup_id} 登记过 {self.db.count_sources(backup_id)} 条消息，"
+                    "本机库里一条都没剩下；请用导出包恢复：/backup restore <备份ID> <包路径>"
+                )
             raise RestoreError("备份里没有可恢复的消息")
         # 校验必须在「按群过滤」之前做。反过来写，包里被改成别群的消息会在过滤那一步
         # 被静默丢掉，`_check_content` 拿到一个空列表，篡改的包一路通过——
@@ -232,7 +240,29 @@ class RestoreEngine:
         if record.checksum and actual != record.checksum:
             if not self._record_owns(record, messages):
                 return
-            raise RestoreError("消息校验和不一致，备份可能已损坏")
+            # 消息还全归这条记录管、校验和却对不上：可能是库被改过，也可能只是有
+            # 消息被清理掉了（媒体淘汰、手工删行、迁移只搬了一截）。后者是本插件
+            # 自己的行为，按「留下的这部分」恢复才叫合理——一律拒绝等于备份被打扫
+            # 过一次之后就再也恢复不了。库里为这条记录认得、现在却取不出来的那些，
+            # 就是被清掉的；一条不少，才是真的对不上。
+            alive = {m.message_id for m in self._load_messages(
+                record.backup_id, None, record.group_id
+            )}
+            known = self._record_message_ids(record)
+            # 来源清单里登记过、现在库里却查不到的，就是被清理掉的那些。
+            # 只看「归属」不够：`delete_messages` 删行时不会动来源清单，而
+            # `_record_message_ids` 又是按归属查库——两边都只看现存行的话，
+            # 被清掉的那条在两边同时消失，差集恒为空。
+            counted = self.db.source_message_ids(record.backup_id, record.group_id)
+            deleted = len((set(known) | counted) - set(alive))
+            if deleted == 0:
+                raise RestoreError("消息校验和不一致，备份可能已损坏")
+            logger.warning(
+                "备份 %s 名下有 %s 条消息已不在库里，按现存的 %s 条恢复",
+                record.backup_id,
+                deleted,
+                len(messages),
+            )
 
     def _check_snapshot(self, record, packed: dict, archive) -> None:
         """包里的群信息/成员表 必须与本地留存的那份一致。
