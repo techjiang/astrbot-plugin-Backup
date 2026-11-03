@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from .database import Database
+from .database import REALTIME_BACKUP_ID, Database
 from .incremental import IncrementalTracker
 from .media_downloader import MediaDownloader
 from .models import BackupRecord, BackupStatus, Message
@@ -123,15 +123,19 @@ class BackupEngine:
             (self.config.get("incremental") or {}).get("enabled", True)
         )
         base = self.db.latest_completed_record(group_id) if incremental_enabled else None
-        # 这一轮往下跑的水位，取两者更靠后的：
-        # - 增量点：平台接口还翻得到的老消息不必每轮从头分页；
-        # - 库里非实时归档的最新一条：上一轮中途断掉时增量点不会推进（只有整轮
-        #   跑完才 advance），但库里已经有半截数据，续传不该把半截再下一遍。
-        # 实时归档的行两边都不参与：它按到达顺序写库、时间戳乱序，拿它当水位会
-        # 跳过一整个时间段的正常消息
+        # 水位只认「谁都不管」的行能不能被收编，而不是「哪个时间点之后不再看」。
+        # 原来的写法取 backup_meta 增量点和库里最新非实时归档消息的较大值，把两个
+        # 不同维度的东西混成了一个数：
+        # - backup_meta 推进过、而消息一条都不剩（`/backup clean` 淘汰了记录）时，
+        #   水位留在天上，平台照旧返回的那批消息全被判成「太旧」。备份报成功、
+        #   消息 0 条、校验和是空数据的——恢复时一条也取不出来；
+        # - 续传点要防的是「半截数据重拉一遍」，这件事由「这条消息在不在库里」直接
+        #   回答，不需要再猜一个时间点。
+        # 所以现在两条都只用来判断「增量盘跑过没有」，真正的跳过条件是
+        # 「库里已有且无主」。库里有主说明它已经在某次备份的来源清单里，跳过没有
+        # 损失；库里没有、或归属的备份已经消失（淘汰/迁移残留）→ 一律重新收进本次
+        # 备份。重复下载由 `message_exists` 之外的所有路径各自去重。
         stored_point = self.tracker.get_stored_point(group_id)
-        candidates = [k for k in (stored_point, self.db.latest_backup_message_key(group_id)) if k]
-        skip_key = max(candidates) if candidates else (datetime.min, "")
 
         # 只要库里有这个群的消息，这一轮就不是「首次全量」：哪怕增量点是空的，
         # 也只会退化成从最新一条往前翻。报成「全量」会让人以为把历史重备了一遍。
@@ -195,6 +199,8 @@ class BackupEngine:
             failed_media = 0
             skipped = 0
             seen_on_pages: set[str] = set()
+            own_ids: list[str] = []
+            owned_seen: list[Message] = []
             while True:
                 batch = await adapter.get_group_history(
                     group_id, count=PAGE_SIZE, offset=page * PAGE_SIZE
@@ -215,18 +221,19 @@ class BackupEngine:
                 seen_on_pages.update(str(_raw_id(raw)) for raw in fresh)
                 for raw in fresh:
                     msg = parse_message(raw, group_id)
-                    # 两道判断不能合并成「早于水位」：全量重跑时库里可能已经堆了
-                    # 实时归档的消息（时间靠后），拿它当水位会把正常消息一起跳掉。
-                    # 所以水位只在增量盘跑过之后才生效，库里有没有则逐条问。
-                    too_old = stored_point is not None and (
-                        (msg.timestamp, str(msg.message_id)) <= skip_key
-                    )
-                    if too_old or self.db.message_exists(msg.message_id, group_id):
+                    if self.db.message_exists(msg.message_id, group_id):
+                        # 已在库里的消息不改内容，但「归属的备份已经不存在」的那些
+                        # 要收编（见上面水位的说明）：不收编就永远进不了任何来源
+                        # 清单。实时归档的归属也不动——改成归给本次备份，等于把
+                        # 「群被炸时的兜底数据」从实时归档入口上摘掉。
+                        if self.db.adopt_orphans(
+                            group_id, record.backup_id, [str(msg.message_id)]
+                        ):
+                            own_ids.append(str(msg.message_id))
+                        else:
+                            owned_seen.append(msg)
                         skipped += 1
                         continue
-                    # 已在库里的消息归属不动——包括实时归档的 backup_id='realtime'。
-                    # 改成归给本次备份，等于把「群被炸时的兜底数据」从实时归档那个
-                    # 入口上摘掉，`export latest` 从此看不到它
                     if download_media and msg.media_paths:
                         ok, bad = await self._download_media(msg)
                         record.media_count += ok
@@ -240,15 +247,30 @@ class BackupEngine:
                 if len(batch) < PAGE_SIZE:
                     break
 
-            # 6. 增量点
-            if collected:
-                self.tracker.advance(group_id, collected)
-                # 来源清单和归属是两回事：归属会被后续备份接手，这里记的不会
-                self.db.add_sources(record.backup_id, collected)
+            # 6. 来源清单 + 快照
+            # 来源清单和归属是两回事：归属会被后续备份接手，这里记的不会。
+            # 除了本轮新收的，还要带上「遍历到、已在库且归属仍是某份现存备份」的
+            # 消息——它们确实是这一轮覆盖到的。只登记新消息会得到一个空清单，
+            # 校验和跟着退化成空数据的哈希，恢复时按来源取出一整批再比对必然失败。
+            self.db.add_sources(record.backup_id, collected)
+            self.db.add_sources(record.backup_id, owned_seen)
+            covered = self.db.get_source_messages(record.backup_id, group_id)
+            if own_ids:
+                logger.info("群 %s 收编 %s 条无主消息", group_id, len(own_ids))
+                record.message_count = max(record.message_count, len(covered))
+            # 群信息/成员快照每轮都存：一条新消息都没有的那轮，导出仍然需要群名
+            if covered or info is not None or members:
                 self.db.save_bundle(record.backup_id, group_id, info, members)
 
-            # 7. 校验和
-            record.checksum = compute_checksum(collected)
+            # 7. 增量点与校验和
+            # 增量点只用于「下次从哪儿开始翻」的提示，不再参与跳过判断（见上方水位
+            # 那段）；时间戳乱序的实时归档不该被它带偏，而 covered 里混不进实时归档。
+            if covered:
+                self.tracker.advance(group_id, covered)
+            # 算「这次备份覆盖的全部消息」，不是「这次新拉到的消息」：增量为 0 条时
+            # 只算 collected 会得到空数据的校验和，恢复时按来源取出一整批消息再比对
+            # 必然对不上——数据一个字节没坏，却被判成「备份可能已损坏」。
+            record.checksum = compute_checksum(covered) if covered else compute_checksum(collected)
             logger.debug(
                 "备份 group=%s 新增=%s 已在库=%s", group_id, record.message_count, skipped
             )

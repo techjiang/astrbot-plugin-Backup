@@ -457,6 +457,45 @@ class Database:
         sql += " ORDER BY m.timestamp ASC, m.id ASC"
         return [self._row_to_message(r) for r in self.query(sql, params)]
 
+    def adopt_orphans(self, group_id: int, backup_id: str, message_ids) -> int:
+        """把「归属的备份已经不存在」的消息改归给本次备份，并登记进来源清单。
+
+        调用方只在确实翻到过新消息的那一轮里调用它：水位之后的页里全是已在库的
+        消息，说明这一轮压根没打算重扫它们，不该顺手改归属。
+
+        `/backup clean` 删记录时连带删了名下的消息行，但更早的版本、手工动过库、
+        迁移失败都可能留下指向已消失 backup_id 的行。这些行占着唯一键
+        (message_id, group_id)，后续备份看到「已在库里」直接跳过，于是它们永远进不了
+        任何一次备份的来源清单——备份显示成功，恢复却是空的。
+
+        只认两种无主：`backup_id` 在 backup_records 里找不到，或者是实时归档标记。
+        实时归档那批本来就该被本次备份覆盖。
+        """
+        ids = [str(i) for i in message_ids]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" * len(ids))
+        rows = self.query(
+            f"""SELECT message_id FROM messages
+                WHERE group_id = ? AND message_id IN ({placeholders})
+                  AND (backup_id = ? OR backup_id NOT IN (SELECT backup_id FROM backup_records))""",
+            (group_id, *ids, REALTIME_BACKUP_ID),
+        )
+        adopted = [r["message_id"] for r in rows]
+        if not adopted:
+            return 0
+        self._conn.executemany(
+            "UPDATE messages SET backup_id = ? WHERE group_id = ? AND message_id = ?",
+            [(backup_id, group_id, mid) for mid in adopted],
+        )
+        self._conn.executemany(
+            """INSERT OR IGNORE INTO backup_sources (backup_id, group_id, message_id)
+               VALUES (?,?,?)""",
+            [(backup_id, group_id, mid) for mid in adopted],
+        )
+        self._conn.commit()
+        return len(adopted)
+
     def count_sources(self, backup_id: str) -> int:
         row = self.query_one(
             "SELECT COUNT(*) AS c FROM backup_sources WHERE backup_id = ?", (backup_id,)
@@ -801,6 +840,16 @@ class Database:
         )
 
     def delete_record(self, backup_id: str) -> None:
+        """删一条备份记录。
+
+        连带删掉它名下的消息：`messages.backup_id` 是「最后一次归档这条消息的
+        备份」，记录没了，这行归属就指向一个不存在的 ID，既不属于任何备份、又
+        把唯一键 (message_id, group_id) 占住。占住的后果比丢行更严重：之后的备份
+        看到「已在库里」就跳过，于是这批消息永远进不了任何备份的来源清单，恢复时
+        一条也取不出来。
+
+        只删归属是本条的，别人接手的那些一行不动。
+        """
         self.execute("DELETE FROM messages WHERE backup_id = ?", (backup_id,))
         self.execute("DELETE FROM backup_records WHERE backup_id = ?", (backup_id,))
 
@@ -875,12 +924,13 @@ class Database:
     def prune_records(
         self, keep_count: Optional[int] = None, keep_days: Optional[int] = None
     ) -> int:
-        """按保留策略删备份记录，返回删掉的条数。
+        """按保留策略淘汰备份记录，返回淘汰的条数。
 
-        只删记录，不删消息：消息按 (message_id, group_id) 唯一、一条消息只归属最后
-        归档它的那次备份，删记录顺手删消息等于把一个群的聊天记录连根拔掉——连
-        别的备份名下还在用的都不管了。真占地方的是导出文件和媒体，另走
-        `clean_exports` 与 `prune_media`。
+        淘汰 = 记录消失，消息**还在**，只是不再属于任何一次备份（走
+        `backup_sources`）。这里必须和 `delete_record` 一致：只删 rows、留 messages，
+        否则一次自动清理就能把群里的聊天记录连根拔掉，而备份插件最该保住的就是
+        这些。`delete_record` 连消息一起删，因为它是显式「不要这条备份了」，
+        记录没了还留着指向废墟的归属只会在唯一键上占位。
 
         `keep_days <= 0` 表示不做时间淘汰：留空或写 0 的配置不该被理解成「立刻
         全删」。
@@ -905,7 +955,8 @@ class Database:
             doomed += [str(row["backup_id"]) for row in rows]
         for backup_id in dict.fromkeys(doomed):
             self.execute("DELETE FROM backup_records WHERE backup_id = ?", (backup_id,))
-            # 记录走了，它的来源清单和快照也留不住；messages 一行不动
+            # 记录走了，它的来源清单和快照也留不住；messages 一行不动，归属也不改，
+            # 交给 `adopt_orphans` 在下一次备份时收编
             self.execute("DELETE FROM backup_sources WHERE backup_id = ?", (backup_id,))
             self.execute("DELETE FROM backup_bundle WHERE backup_id = ?", (backup_id,))
             removed += 1
