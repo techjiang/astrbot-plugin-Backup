@@ -145,7 +145,12 @@ class RestoreEngine:
                     skipped += 1
                     continue
                 if strategy == "overwrite":
+                    # 删完要连来源清单一起清。`save_message` 是 upsert，行还在库里时
+                    # 它会走 UPDATE 分支、返回 False，于是下面那句 `assign_message_backup`
+                    # 不会执行——消息内容换成了备份里的，来源清单却还挂着「这条属于别的
+                    # 备份」的记录，之后按来源导出/恢复取出来的仍是旧内容。
                     self.db.delete_messages(target, [msg.message_id])
+                    self.db.delete_sources(target, [msg.message_id])
                     overwritten += 1
                 # merge：保留原有，仅补齐缺失字段（这里等同跳过，但不计数为 skip）
             if self.db.save_message(msg, backup_id):

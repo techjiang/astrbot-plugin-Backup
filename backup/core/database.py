@@ -725,6 +725,21 @@ class Database:
         )
         return cur.rowcount
 
+    def delete_sources(self, group_id: int, message_ids: list[str]) -> int:
+        """撤销这些消息在**本群**的来源登记。
+
+        消息被覆盖写入后，旧记录不能再说「我覆盖过这条」——否则按来源导出或恢复时
+        取出来的还是覆盖前的内容。别的群同 ID 的消息不受影响。
+        """
+        if not message_ids:
+            return 0
+        marks = ",".join("?" * len(message_ids))
+        cur = self.execute(
+            f"DELETE FROM backup_sources WHERE group_id = ? AND message_id IN ({marks})",
+            [group_id, *message_ids],
+        )
+        return cur.rowcount
+
     # ---------- 媒体 ----------
     def save_media(
         self,
