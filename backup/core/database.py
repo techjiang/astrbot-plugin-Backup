@@ -87,6 +87,27 @@ CREATE TABLE IF NOT EXISTS group_members (
   UNIQUE(group_id, user_id)
 );
 
+-- 一次备份到底覆盖了哪些消息。messages.backup_id 只能记「最后归档它的那次备份」，
+-- 全量重跑会把归属全部接手，于是「最早那份备份里有什么」就没地方问了——而这个
+-- 问题恰恰是恢复老备份时要回答的。
+CREATE TABLE IF NOT EXISTS backup_sources (
+  backup_id TEXT NOT NULL,
+  group_id INTEGER NOT NULL,
+  message_id TEXT NOT NULL,
+  PRIMARY KEY (backup_id, group_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_src_msg ON backup_sources(group_id, message_id);
+
+-- 每份备份自己的群信息/成员快照。group_info / group_members 是「当前状态」，
+-- 随每次备份覆盖；换台机器恢复时，库里根本没有对应的群那一行，导出包也就带
+-- 不出群名和成员，HTML 里一片空白。
+CREATE TABLE IF NOT EXISTS backup_bundle (
+  backup_id TEXT NOT NULL,
+  group_id INTEGER NOT NULL,
+  payload TEXT NOT NULL,
+  PRIMARY KEY (backup_id, group_id)
+);
+
 CREATE TABLE IF NOT EXISTS backup_meta (
   group_id INTEGER PRIMARY KEY,
   last_timestamp DATETIME,
@@ -220,6 +241,70 @@ def _migrate_media_unique(conn) -> None:
 _DT_FMT = "%Y-%m-%d %H:%M:%S.%f"
 
 
+def _group_info_to_dict(info) -> dict:
+    return {
+        "group_id": info.group_id,
+        "group_name": info.group_name,
+        "owner_id": info.owner_id,
+        "created_at": to_db(info.created_at),
+        "member_count": info.member_count,
+        "max_members": info.max_members,
+        "group_level": info.group_level,
+    }
+
+
+def _member_to_dict(member) -> dict:
+    return {
+        "user_id": member.user_id,
+        "group_id": member.group_id,
+        "nickname": member.nickname,
+        "card": member.card,
+        "role": member.role,
+        "join_time": to_db(member.join_time),
+        "last_active": to_db(member.last_active),
+    }
+
+
+def group_info_from_dict(raw: dict, fallback_group_id: int = 0):
+    """快照 dict → GroupInfo。字段缺失时按空值兜底。"""
+    from .models import GroupInfo
+
+    if not raw:
+        return None
+    return GroupInfo(
+        group_id=int(raw.get("group_id") or fallback_group_id),
+        group_name=str(raw.get("group_name") or ""),
+        owner_id=int(raw.get("owner_id") or 0),
+        created_at=from_db(raw.get("created_at")),
+        member_count=int(raw.get("member_count") or 0),
+        max_members=int(raw.get("max_members") or 0),
+        group_level=int(raw.get("group_level") or 0),
+    )
+
+
+def members_from_list(raw_members, fallback_group_id: int = 0) -> list:
+    """快照 dict 列表 → GroupMember 列表。"""
+    from .models import GroupMember
+
+    out = []
+    for raw in raw_members or []:
+        try:
+            out.append(
+                GroupMember(
+                    user_id=int(raw.get("user_id") or 0),
+                    group_id=int(raw.get("group_id") or fallback_group_id),
+                    nickname=str(raw.get("nickname") or ""),
+                    card=str(raw.get("card") or ""),
+                    role=str(raw.get("role") or "member"),
+                    join_time=from_db(raw.get("join_time")),
+                    last_active=from_db(raw.get("last_active")),
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def to_db(dt: Optional[datetime]) -> Optional[str]:
     return dt.strftime(_DT_FMT) if dt else None
 
@@ -305,6 +390,86 @@ class Database:
         )
         # upsert 的 rowcount 恒为 1，区分「新增」与「接管」只能靠写入前的探测
         return existed is None
+
+    # ---------- 备份来源 ----------
+    def add_sources(self, backup_id: str, messages: Iterable[Message]) -> None:
+        """登记「这次备份覆盖了哪些消息」。与归属分开记：归属只有一个，来源可以多份。"""
+        rows = [
+            (backup_id, m.group_id, str(m.message_id))
+            for m in messages
+            if m is not None and m.message_id
+        ]
+        if not rows:
+            return
+        self._conn.executemany(
+            """INSERT OR IGNORE INTO backup_sources (backup_id, group_id, message_id)
+               VALUES (?,?,?)""",
+            rows,
+        )
+        self._conn.commit()
+
+    def get_source_messages(self, backup_id: str, group_id: Optional[int] = None) -> list[Message]:
+        """按来源表取这次备份覆盖的消息。`group_id` 为空则取全部群。
+
+        同一个 message_id 在多个群都有时按 (message_id, group_id) 区分——恢复时
+        可能把一份备份搬到另一个群，不能靠消息 ID 单键认人。
+        """
+        sql = """SELECT m.* FROM messages m
+                 JOIN backup_sources s
+                   ON s.message_id = m.message_id AND s.group_id = m.group_id
+                 WHERE s.backup_id = ?"""
+        params: list = [backup_id]
+        if group_id is not None:
+            sql += " AND s.group_id = ?"
+            params.append(group_id)
+        sql += " ORDER BY m.timestamp ASC, m.id ASC"
+        return [self._row_to_message(r) for r in self.query(sql, params)]
+
+    def count_sources(self, backup_id: str) -> int:
+        row = self.query_one(
+            "SELECT COUNT(*) AS c FROM backup_sources WHERE backup_id = ?", (backup_id,)
+        )
+        return int(row["c"]) if row else 0
+
+    def source_group_ids(self, backup_id: str) -> list[int]:
+        return [
+            int(r["group_id"])
+            for r in self.query(
+                "SELECT DISTINCT group_id FROM backup_sources WHERE backup_id = ?",
+                (backup_id,),
+            )
+        ]
+
+    # ---------- 每份备份的群信息 / 成员快照 ----------
+    def save_bundle(self, backup_id: str, group_id: int, group_info, members=None) -> None:
+        payload = {
+            "group_info": _group_info_to_dict(group_info) if group_info else None,
+            "members": [_member_to_dict(m) for m in (members or [])],
+        }
+        self.execute(
+            """INSERT OR REPLACE INTO backup_bundle (backup_id, group_id, payload)
+               VALUES (?,?,?)""",
+            (backup_id, group_id, json.dumps(payload, ensure_ascii=False)),
+        )
+
+    def get_bundle(self, backup_id: str, group_id: Optional[int] = None) -> dict:
+        """取快照。不给 group_id 时：只有一份就直接用，多份则挑消息最多的那份。"""
+        rows = self.query(
+            "SELECT group_id, payload FROM backup_bundle WHERE backup_id = ?", (backup_id,)
+        )
+        if not rows:
+            return {}
+        if group_id is not None:
+            for row in rows:
+                if int(row["group_id"]) == int(group_id):
+                    return json.loads(row["payload"])
+        best = None
+        for row in rows:
+            payload = json.loads(row["payload"])
+            score = len(payload.get("members") or [])
+            if best is None or score > best[0]:
+                best = (score, payload)
+        return best[1] if best else {}
 
     def update_message_media(self, message_id: str, group_id: int, media_paths: list) -> int:
         """媒体补下后回填路径。"""
@@ -683,21 +848,29 @@ class Database:
         全删」。
         """
         removed = 0
+        doomed: list[str] = []
         if keep_days and keep_days > 0:
             cutoff = datetime.now() - timedelta(days=keep_days)
-            cur = self.execute(
-                "DELETE FROM backup_records WHERE started_at < ?", (to_db(cutoff),)
-            )
-            removed += cur.rowcount if cur else 0
+            doomed += [
+                str(r["backup_id"])
+                for r in self.query(
+                    "SELECT backup_id FROM backup_records WHERE started_at < ?",
+                    (to_db(cutoff),),
+                )
+            ]
         if keep_count and keep_count > 0:
             rows = self.query(
                 """SELECT backup_id FROM backup_records
                    ORDER BY started_at DESC LIMIT -1 OFFSET ?""",
                 (int(keep_count),),
             )
-            for row in rows:
-                self.execute("DELETE FROM backup_records WHERE backup_id = ?", (row["backup_id"],))
-                removed += 1
+            doomed += [str(row["backup_id"]) for row in rows]
+        for backup_id in dict.fromkeys(doomed):
+            self.execute("DELETE FROM backup_records WHERE backup_id = ?", (backup_id,))
+            # 记录走了，它的来源清单和快照也留不住；messages 一行不动
+            self.execute("DELETE FROM backup_sources WHERE backup_id = ?", (backup_id,))
+            self.execute("DELETE FROM backup_bundle WHERE backup_id = ?", (backup_id,))
+            removed += 1
         return removed
 
     def prune_media(self, keep_days: int) -> int:

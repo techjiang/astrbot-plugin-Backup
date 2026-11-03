@@ -18,7 +18,7 @@ from typing import Optional
 from ..exporters import get_exporter
 from ..exporters.base import ExportContext
 from ..exporters.html_exporter import HtmlExporter
-from .database import REALTIME_BACKUP_ID, Database
+from .database import REALTIME_BACKUP_ID, Database, group_info_from_dict, members_from_list
 from .models import Message
 from .verifier import compute_checksum
 
@@ -87,18 +87,33 @@ class ExportManager:
     def build_context(self, group_id: int, backup_id: Optional[str] = None) -> ExportContext:
         """取导出用的数据。
 
-        不给 backup_id 就导整个群；给了就导这次备份覆盖到的消息——消息按
-        (message_id, group_id) 唯一、归属最后一次归档它的备份，所以一次全量
-        备份之后再来一次增量，增量只拿到自己新增的那几条，不会把全量再算一遍。
+        给了 backup_id 就按「来源清单」取这次备份覆盖到的消息。不能按
+        `messages.backup_id` 取：那只是「最后归档它的那次备份」，一次全量重跑会把
+        全群消息的归属全接手，老备份名下就空了——而恢复老备份恰恰要找它。
+
+        群信息/成员优先用这份备份自己的快照（`backup_bundle`），没有才退回当前
+        状态。换台机器恢复时靠的就是快照，否则导出包里群名和成员是空的。
         """
         if backup_id is None:
             messages = self.db.get_messages(group_id=group_id)
         else:
-            messages = self.db.get_messages(group_id=group_id, backup_id=backup_id)
+            messages = self.db.get_source_messages(backup_id, group_id)
+            if not messages:
+                # 来源清单是后加的，升级前的老备份没有这份登记。空手而归说明这
+                # 「不是真的没消息」，而是没有清单可查，退回按归属取
+                messages = self.db.get_messages(group_id=group_id, backup_id=backup_id)
+        group_info = self.db.get_group_info(group_id)
+        members = self.db.get_members(group_id)
+        if backup_id:
+            bundle = self.db.get_bundle(backup_id, group_id)
+            snapshot_info = group_info_from_dict(bundle.get("group_info") or {}, group_id)
+            snapshot_members = members_from_list(bundle.get("members") or [], group_id)
+            group_info = snapshot_info or group_info
+            members = snapshot_members or members
         return ExportContext(
             messages=messages,
-            group_info=self.db.get_group_info(group_id),
-            members=self.db.get_members(group_id),
+            group_info=group_info,
+            members=members,
             backup_id=backup_id or "",
         )
 
@@ -203,12 +218,19 @@ class ExportManager:
             # 记录里那份校验和：本地库留着的可信指纹，恢复端靠它认出「包被整体
             # 改写后重新算过校验和」这种情况。包里的 checksum 是包自己的，谁都能改
             "record_checksum": (record.checksum if record else "") or "",
-            "group_id": ctx.group_id,
+            # ctx.group_id 在没有 group_info 时会退回「第一条消息的群号」，那不是
+            # 这份备份的归属群。记录里有就先用记录，保证换机器恢复能定下目标群
+            "group_id": (record.group_id if record else ctx.group_id),
             "group_name": ctx.group_name,
             "message_count": len(ctx.messages),
             "member_count": len(ctx.members),
             "exported_at": datetime.now().isoformat(),
             "checksum": ctx.checksum or compute_checksum(ctx.messages),
+            # 换台机器恢复时本地库里没有这条记录、也没有这个群的任何行。包必须
+            # 自带「我是谁、我给谁备的份」，否则 restore 会先卡在「备份不存在」。
+            "record": _record_to_dict(record),
+            "group_info": group_info_to_dict(ctx.group_info),
+            "members": [member_to_dict(m) for m in ctx.members],
             "author": {"name": "科技酱", "homepage": "https://www.asoe.cn"},
         }
         media_members: list[str] = []
@@ -297,3 +319,47 @@ class ExportManager:
             for chunk in iter(lambda: fh.read(1024 * 256), b""):
                 h.update(chunk)
         return h.hexdigest()
+
+
+def _record_to_dict(record) -> Optional[dict]:
+    if record is None:
+        return None
+    return {
+        "backup_id": record.backup_id,
+        "group_id": record.group_id,
+        "status": record.status.value,
+        "started_at": record.started_at.isoformat() if record.started_at else "",
+        "finished_at": record.finished_at.isoformat() if record.finished_at else None,
+        "message_count": record.message_count,
+        "media_count": record.media_count,
+        "total_size": record.total_size,
+        "is_incremental": record.is_incremental,
+        "base_backup_id": record.base_backup_id,
+        "checksum": record.checksum,
+    }
+
+
+def group_info_to_dict(info) -> Optional[dict]:
+    if info is None:
+        return None
+    return {
+        "group_id": info.group_id,
+        "group_name": info.group_name,
+        "owner_id": info.owner_id,
+        "created_at": info.created_at.isoformat() if info.created_at else None,
+        "member_count": info.member_count,
+        "max_members": info.max_members,
+        "group_level": info.group_level,
+    }
+
+
+def member_to_dict(member) -> dict:
+    return {
+        "user_id": member.user_id,
+        "group_id": member.group_id,
+        "nickname": member.nickname,
+        "card": member.card,
+        "role": member.role,
+        "join_time": member.join_time.isoformat() if member.join_time else None,
+        "last_active": member.last_active.isoformat() if member.last_active else None,
+    }

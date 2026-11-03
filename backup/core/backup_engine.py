@@ -113,24 +113,44 @@ class BackupEngine:
         candidates = [k for k in (stored_point, self.db.latest_backup_message_key(group_id)) if k]
         skip_key = max(candidates) if candidates else (datetime.min, "")
 
+        # 只要库里有这个群的消息，这一轮就不是「首次全量」：哪怕增量点是空的，
+        # 也只会退化成从最新一条往前翻。报成「全量」会让人以为把历史重备了一遍。
+        has_history = self.db.count_messages(group_id) > 0
         record = BackupRecord(
             backup_id=self._gen_backup_id(group_id),
             group_id=group_id,
             status=BackupStatus.RUNNING,
             started_at=datetime.now(),
-            is_incremental=incremental_enabled and stored_point is not None,
+            is_incremental=(incremental_enabled and stored_point is not None) or has_history,
             base_backup_id=base.backup_id if base else None,
         )
         self.db.save_record(record)
 
+        # 群信息/成员拉不到不等于备份失败：权限受限的适配器给不出成员列表，但历史
+        # 消息照样能拉。原来任何一个抛错都会把整次备份标成 failed，一条消息都不留。
+        info = None
+        members: list = []
+        auxiliary_errors: list[str] = []
         try:
-            # 1. 群信息
             info = parse_group_info(await adapter.get_group_info(group_id), group_id)
             self.db.save_group_info(info)
-
-            # 2. 成员
+        except Exception as e:
+            auxiliary_errors.append("群信息")
+            logger.warning("群信息拉取失败 group=%s: %s", group_id, type(e).__name__)
+        try:
             raw_members = await adapter.get_group_members(group_id)
-            self.db.save_members(group_id, parse_group_members(raw_members, group_id))
+            members = parse_group_members(raw_members, group_id)
+            self.db.save_members(group_id, members)
+        except Exception as e:
+            auxiliary_errors.append("成员列表")
+            logger.warning("成员列表拉取失败 group=%s: %s", group_id, type(e).__name__)
+        # 拿不到新的就沿用上次快照，别让导出里的群名/成员数变成空白
+        if info is None:
+            info = self.db.get_group_info(group_id)
+        if not members:
+            members = self.db.get_members(group_id)
+
+        try:
 
             # 3-5. 分页拉消息，解析、下载媒体、入库
             page = 0
@@ -174,10 +194,8 @@ class BackupEngine:
                         ok, bad = await self._download_media(msg)
                         record.media_count += ok
                         failed_media += bad
-                    existed = self.db.message_exists(msg.message_id, group_id)
                     self.db.save_message(msg, record.backup_id)
-                    if not existed:
-                        record.message_count += 1
+                    record.message_count += 1
                     collected.append(msg)
                 page += 1
                 if progress_callback:
@@ -188,6 +206,9 @@ class BackupEngine:
             # 6. 增量点
             if collected:
                 self.tracker.advance(group_id, collected)
+                # 来源清单和归属是两回事：归属会被后续备份接手，这里记的不会
+                self.db.add_sources(record.backup_id, collected)
+                self.db.save_bundle(record.backup_id, group_id, info, members)
 
             # 7. 校验和
             record.checksum = compute_checksum(collected)
@@ -196,7 +217,12 @@ class BackupEngine:
             )
             record.total_size = self._compute_size(group_id)
             record.status = BackupStatus.PARTIAL if failed_media else BackupStatus.COMPLETED
-            record.error = f"{failed_media} 个媒体文件下载失败" if failed_media else None
+            notes = []
+            if failed_media:
+                notes.append(f"{failed_media} 个媒体文件下载失败")
+            if auxiliary_errors:
+                notes.append("；".join(auxiliary_errors) + "拉取失败，沿用上次快照")
+            record.error = " · ".join(notes) if notes else None
             record.finished_at = datetime.now()
         except Exception as e:
             logger.error("备份失败 group=%s: %s", group_id, type(e).__name__)

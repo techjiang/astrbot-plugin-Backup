@@ -95,11 +95,35 @@ async def test_checksum_is_deterministic(db, tmp_path):
 
 @pytest.mark.asyncio
 async def test_backup_failure_marks_record_failed(db, tmp_path):
+    """历史消息拉不到才算失败：那才是备份的主体。"""
+
     class BrokenPlatform(FakePlatform):
-        async def get_group_members(self, group_id):
+        async def get_group_history(self, group_id, count=50, offset=0):
             raise RuntimeError("api error")
 
     engine = make_engine(db, tmp_path)
     record = await engine.backup_group(100, BrokenPlatform(history=[]), incremental=False)
     assert record.status is BackupStatus.FAILED
     assert "api error" in record.error
+
+
+@pytest.mark.asyncio
+async def test_member_api_failure_does_not_lose_messages(db, tmp_path):
+    """成员列表拉不到只是少一块元数据，消息必须照备。
+
+    权限受限的适配器给不出成员列表是常态，以前这里抛异常就把整次备份标成 failed，
+    已有的历史消息一条都没存下来。
+    """
+
+    class NoMemberApi(FakePlatform):
+        async def get_group_members(self, group_id):
+            raise RuntimeError("权限不足")
+
+    engine = make_engine(db, tmp_path)
+    record = await engine.backup_group(
+        100, NoMemberApi(history=raw_history(3)), incremental=False, download_media=False
+    )
+    assert record.status is BackupStatus.COMPLETED
+    assert record.message_count == 3
+    assert db.count_messages(100) == 3
+    assert "成员列表" in record.error

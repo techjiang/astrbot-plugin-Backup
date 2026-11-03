@@ -60,7 +60,7 @@ pip install -r astrbot-plugin-Backup/backup/requirements.txt
 | `/backup schedule set <群号> "<cron>"` | 设置定时备份 |
 | `/backup schedule list` | 查看定时任务 |
 | `/backup schedule remove <群号>` | 移除定时任务 |
-| `/backup list [群号]` | 备份列表（含大小 / 时间 / 消息数） |
+| `/backup list [群号]` | 备份列表（不填群号列全部备份，每条带群号） |
 | `/backup export [群号] <格式>` | 导出，返回 24 小时有效的临时链接 |
 | `/backup restore <备份ID> [目标群号] --confirm` | 恢复（危险操作，需二次确认） |
 | `/backup status [群号]` | 当前群备份状态 |
@@ -168,6 +168,19 @@ A：不会。消息按 `(message_id, group_id)` 唯一，重跑全量、失败�
 
 **Q：群号换了还能恢复吗？**
 A：可以。`/backup restore <备份ID> <新群号> --confirm`。
+
+**Q：原机器没了，手里只有一个导出包，能恢复吗？**
+A：能。包里的 manifest 带着备份记录、群信息和成员名单，所以不用先有本地记录：
+
+```bash
+/backup restore <备份ID> --confirm            # 目标群取包里的群号
+/backup restore <备份ID> <新群号> --confirm    # 或另指一个群
+```
+
+恢复完会按包内信息重建记录与群信息，之后 `list` / `export` 都认得它。
+
+**Q：以前那份备份还能恢复吗？（后来跑过全量备份）**
+A：能。每次备份都单独记着「覆盖过哪些消息」，后续备份接手归属不会把它清空。
 
 ## 开发与测试
 

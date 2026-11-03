@@ -122,8 +122,15 @@ class Permission:
     reason: str = ""
 
 
+ADMIN_ROLES = ("admin", "owner", "administrator")
+
+
 class PermissionChecker:
-    """仅群主/管理员可执行备份操作（可配置关闭）。"""
+    """仅群主/管理员可执行备份操作（可配置关闭）。
+
+    适配器的 `is_admin()` 常常没实现、直接抛异常。抛异常就当「没权限」会让所有人
+    都被挡在门外，所以还要接着看角色字段。角色也认不出时才拒绝。
+    """
 
     def __init__(self, require_admin: bool = True):
         self.require_admin = require_admin
@@ -132,35 +139,68 @@ class PermissionChecker:
         if not self.require_admin:
             return Permission(True)
         for name in ("is_admin", "is_group_admin", "is_owner"):
-            fn = getattr(event, name, None)
-            if callable(fn):
+            value = getattr(event, name, None)
+            if callable(value):
                 try:
-                    if fn():
+                    if value():
                         return Permission(True)
                 except Exception:
-                    pass
-            elif isinstance(fn, bool) and fn:
+                    continue
+            elif isinstance(value, bool) and value:
                 return Permission(True)
-        role = getattr(event, "sender_role", None) or getattr(event, "role", None)
-        if isinstance(role, str) and role.lower() in ("admin", "owner", "administrator"):
+                # 布尔属性为 False 也要继续看角色：有的适配器只填 role 不填这几个
+        if self._role_is_admin(event):
             return Permission(True)
         return Permission(False, "仅群主或管理员可执行备份操作")
 
+    @staticmethod
+    def _role_is_admin(event) -> bool:
+        """从事件里找角色字符串。字段名各适配器不同，逐个试。"""
+        for name in ("sender_role", "role", "member_role", "user_role"):
+            role = getattr(event, name, None)
+            if isinstance(role, str) and role.lower() in ADMIN_ROLES:
+                return True
+        # 有的适配器把角色挂在 sender / message_obj 里
+        for path in (("sender", "role"), ("message_obj", "sender", "role")):
+            node = event
+            for step in path:
+                node = node.get(step) if isinstance(node, dict) else getattr(node, step, None)
+                if node is None:
+                    break
+            if isinstance(node, str) and node.lower() in ADMIN_ROLES:
+                return True
+        return False
+
 
 def format_record_line(record) -> str:
+    """一行说清这次备份干了什么。
+
+    「新增 0 条」有两种完全不同的意思：增量没跑到新消息（正常），或者全量跑完了
+    但库里一条不缺（也正常）。而 `+3 条（库里已有 5 条）` 一眼能看出是补了新消息。
+    """
     base = "<增量>" if record.is_incremental else "<全量>"
     return (
-        f"`{record.backup_id}` {base} {record.message_count} 条 / "
+        f"`{record.backup_id}` {base} 覆盖 {record.message_count} 条 / "
         f"{human_size(record.total_size)} / {record.status.value}"
     )
 
 
 def render_backup_list(db: Database, group_id: Optional[int] = None, limit: int = 10) -> str:
+    """`group_id` 为空时列全部备份，每条带上群号。
+
+    多群运行时只列当前群，等于让用户在群里发消息却看不到别的群备过什么；而备份 ID
+    又是恢复需要的唯一凭据，找不到就等于无法恢复。
+    """
     records = db.list_records(group_id, limit=limit)
     if not records:
         return "还没有任何备份记录。"
     head = f"最近的 {len(records)} 条备份："
-    return "\n".join([head] + [f"- {format_record_line(r)}" for r in records])
+    show_group = group_id is None
+    lines = [head]
+    for r in records:
+        prefix = f"[群 {r.group_id}] " if show_group else ""
+        lines.append(f"- {prefix}{format_record_line(r)}")
+    return "\n".join(lines)
 
 
 def render_status(db: Database, group_id: int) -> str:
