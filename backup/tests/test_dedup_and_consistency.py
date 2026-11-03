@@ -84,7 +84,7 @@ class TestRepeatBackup:
 
         # 空跑一次不该顶掉上一次的实绩，否则「最近备份」永远显示 0 条
         assert db.latest_completed_record(100).backup_id == first.backup_id
-        assert "这次新增：4 条" in render_status(db, 100)
+        assert "这次覆盖：4 条" in render_status(db, 100)
 
 
 class TestExportOwnership:

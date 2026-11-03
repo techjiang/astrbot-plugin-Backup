@@ -496,6 +496,26 @@ class Database:
         self._conn.commit()
         return len(adopted)
 
+    def count_realtime_only(self, group_id: int, backup_id: Optional[str] = None) -> int:
+        """这个群里「只走过实时归档、还没被任何备份覆盖」的消息数。
+
+        只看归属算不出来：实时归档的消息被某次备份扫到之后，归属仍然是
+        `realtime`（那是故意的，群被炸时的兜底数据不能摘），但它已经在某份备份的
+        来源清单里了。老写法按归属数，于是一次全量备份跑完，`/backup status`
+        还在说「其中实时归档 N 条（还没被任何一次备份接手）」——永远不消失。
+        """
+        sql = """SELECT COUNT(*) AS c FROM messages m
+                 WHERE m.group_id = ? AND m.backup_id = ?
+                   AND NOT EXISTS (
+                     SELECT 1 FROM backup_sources s
+                     WHERE s.message_id = m.message_id AND s.group_id = m.group_id
+                 )"""
+        params: list = [group_id, REALTIME_BACKUP_ID]
+        if backup_id:
+            sql += " AND 0 = 1"  # 保留接口形状：指定备份时不重复计入
+        row = self.query_one(sql, params)
+        return int(row["c"]) if row else 0
+
     def count_sources(self, backup_id: str) -> int:
         row = self.query_one(
             "SELECT COUNT(*) AS c FROM backup_sources WHERE backup_id = ?", (backup_id,)
@@ -885,6 +905,47 @@ class Database:
             max_members=row["max_members"] or 0,
             group_level=row["group_level"] or 0,
         )
+
+    def replace_members(self, group_id: int, members: list[GroupMember]) -> int:
+        """整体覆盖一次成员快照，返回删掉的过期成员数。
+
+        成员列表是「当前状态」而不是流水：`save_members` 只做 upsert，谁退群了永远
+        不会消失，名单只会越攒越大。按快照语义整群替换，退群的人才会真的消失。
+        """
+        if not members:
+            return 0
+        now = to_db(datetime.now())
+        keep = {int(m.user_id) for m in members}
+        stale = [
+            r["user_id"]
+            for r in self.query(
+                "SELECT user_id FROM group_members WHERE group_id = ?", (group_id,)
+            )
+            if int(r["user_id"]) not in keep
+        ]
+        if stale:
+            marks = ",".join("?" * len(stale))
+            self.execute(
+                f"DELETE FROM group_members WHERE group_id = ? AND user_id IN ({marks})",
+                [group_id, *stale],
+            )
+        for m in members:
+            self.execute(
+                """INSERT OR REPLACE INTO group_members
+                   (group_id, user_id, nickname, card, role, join_time, last_active, synced_at)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    group_id,
+                    m.user_id,
+                    m.nickname,
+                    m.card,
+                    m.role,
+                    to_db(m.join_time),
+                    to_db(m.last_active),
+                    now,
+                ),
+            )
+        return len(stale)
 
     def save_members(self, group_id: int, members: list[GroupMember]) -> None:
         now = to_db(datetime.now())

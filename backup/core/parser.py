@@ -88,8 +88,13 @@ def _segments(raw: Any) -> list:
 
 
 def parse_message(raw: Any, group_id: Optional[int] = None) -> Message:
-    """解析单条平台原始消息。"""
-    gid = group_id or int(_get(raw, "group_id", 0) or 0)
+    """解析单条平台原始消息。
+
+    `group_id` 是「兜底群号」：消息自己带群号时以它为准。反过来写（参数优先）
+    会让导出包里的 group_id 形同虚设——包里的消息被改成哪个群都能算成原群，
+    「恢复时不许夹带别群消息」这条校验直接被绕过去。
+    """
+    gid = int(_get(raw, "group_id", 0) or 0) or (group_id or 0)
     sender = _get(raw, "sender", {}) or {}
     sender_id = int(_get(raw, "sender_id", _get(sender, "user_id", 0)) or 0)
     sender_name = (

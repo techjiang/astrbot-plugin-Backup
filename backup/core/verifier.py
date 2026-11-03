@@ -59,6 +59,23 @@ def read_manifest(archive: str | Path) -> dict:
         return {}
 
 
+# 包清单里「可被独立校验」的部分：把它们和消息一起哈希，改动清单就能被发现
+_MANIFEST_FIELDS = ("group_id", "group_name", "group_info", "members")
+
+
+def compute_manifest_checksum(manifest: dict) -> str:
+    """清单指纹：覆盖群号、群名、群信息、成员列表。
+
+    消息的校验和证明不了这几样。包里的群名、成员表是谁都能改的「自由文本」，
+    改完清单依然自洽（checksum 字段只覆盖消息），恢复时就把伪造的群名和成员
+    写进目标群。导出时把这几样一起算进指纹，恢复时对上才算没被动过。
+    """
+    payload = {k: (manifest or {}).get(k) for k in _MANIFEST_FIELDS}
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
 def verify_zip(path: str | Path, expected_checksum: Optional[str] = None) -> tuple[bool, str]:
     """校验 ZIP 备份包：CRC 全量扫描 + manifest 校验和比对 + 包内文件齐不齐。
 
@@ -93,6 +110,12 @@ def verify_zip(path: str | Path, expected_checksum: Optional[str] = None) -> tup
             # 恢复前就该说清，而不是恢复完发现缺了一段
             if not any(n.endswith(".json") and n.startswith("json/") for n in names):
                 return False, "包内没有消息文件"
+            # 清单被整体改写过吗？消息校验和只管 messages，群名/群成员改了它照样
+            # 对得上。带 manifest_checksum 的包（新导出的）必须自洽，老包没有这个
+            # 字段就跳过——不能因为少了新字段把旧包全判成损坏
+            declared = manifest.get("manifest_checksum")
+            if declared and declared != compute_manifest_checksum(manifest):
+                return False, "备份包的群信息与清单指纹不符，备份可能被修改"
             expected_media = {
                 n
                 for n in (manifest.get("media_files") or [])

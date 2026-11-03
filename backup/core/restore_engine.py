@@ -107,6 +107,9 @@ class RestoreEngine:
         messages = self._load_messages(backup_id, archive, source_group)
         if not messages:
             raise RestoreError("备份里没有可恢复的消息")
+        # 校验必须在「按群过滤」之前做。反过来写，包里被改成别群的消息会在过滤那一步
+        # 被静默丢掉，`_check_content` 拿到一个空列表，篡改的包一路通过——
+        # 「恢复 0 条」看着像成功，实际什么也没恢复，也没告诉任何人包被动过
         self._check_content(record, messages, archive)
 
         # 一份备份可能横跨多个群（全量备份把库里同群的旧数据一起收了进来，或者
@@ -121,6 +124,10 @@ class RestoreEngine:
                 source_group,
             )
             messages = [m for m in messages if m.group_id == source_group]
+        if not messages:
+            raise RestoreError(
+                f"备份包里的消息都不属于群 {source_group}，拒绝恢复"
+            )
 
         inserted = skipped = overwritten = 0
         for msg in messages:
@@ -186,6 +193,13 @@ class RestoreEngine:
             # 上面这条就形同虚设。所以再拿库里那份可信指纹（备份记录的 checksum）
             # 对一遍消息的「身份」：列表里出现记录之外的消息，说明夹带了东西。
             stray = self._messages_outside_record(record, messages, archive)
+            if not stray:
+                # 包里记着它当初是给哪个群备的。改掉这一项等于把别的群的聊天记录
+                # 塞进目标群，而消息 ID 在本地库里可能恰好存在（另一个群的同 ID
+                # 消息），身份检查就绕过去了
+                declared_group = (read_manifest(archive) or {}).get("group_id")
+                if declared_group and int(declared_group) != int(record.group_id):
+                    stray = [f"包内群号 {declared_group}"]
             if stray:
                 raise RestoreError(
                     f"备份包含 {len(stray)} 条不属于备份 {record.backup_id} 的消息，拒绝恢复"
@@ -303,14 +317,27 @@ class RestoreEngine:
         logger.info("按备份包重建记录 %s → 群 %s", backup_id, target)
 
     def _ensure_snapshot(self, backup_id: str, target: int, manifest: dict) -> None:
-        """没有快照就用包清单里的群信息/成员补一份。"""
-        if self.db.get_bundle(backup_id, target):
-            return
-        info = group_info_from_dict((manifest or {}).get("group_info") or {}, target)
-        members = members_from_list((manifest or {}).get("members") or [], target)
-        if info is None and not members:
-            return
-        self.db.save_bundle(backup_id, target, info, members)
+        """用包清单里的群信息/成员补一份快照。
+
+        除了 restore_bundle（导出时的证据），还要写进「当前状态」表：刚换机器
+        恢复完，`/backup status` 报「成员数 0」、导出的 HTML 里没有群名和成员
+        列表，看着像恢复失败——其实数据都在包里，只是没人搬进群状态表。
+        """
+        if self.db.get_bundle(backup_id, target) is None:
+            info = group_info_from_dict((manifest or {}).get("group_info") or {}, target)
+            members = members_from_list((manifest or {}).get("members") or [], target)
+            if info is not None or members:
+                self.db.save_bundle(backup_id, target, info, members)
+        # 群状态表只在「本机还没有这个群的任何记录」时补：换机器是这种情况，
+        # 而本机已经有更新的实时状态时不该被一个旧包覆盖回去
+        if self.db.get_group_info(target) is None:
+            info = group_info_from_dict((manifest or {}).get("group_info") or {}, target)
+            if info is not None:
+                self.db.save_group_info(info)
+        if not self.db.get_members(target):
+            members = members_from_list((manifest or {}).get("members") or [], target)
+            if members:
+                self.db.save_members(target, members)
 
     @staticmethod
     def _parse_dt(value) -> Optional[datetime]:

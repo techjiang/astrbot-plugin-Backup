@@ -247,17 +247,20 @@ def render_status(db: Database, group_id: int) -> str:
     lines.append(f"消息总数：{db.count_messages(group_id)}")
     lines.append(f"成员数：{len(members)}")
     if record:
-        # 记录里的 message_count 是「那次新增了多少」，和库里的总数不是一回事
+        # 记录里的 message_count 是「那次备份覆盖了多少」，不是「新增了多少」：
+        # 一轮全是已在库消息的增量备份 message_count 是 0，却实实在在覆盖了整批。
+        # 写「这次新增：0 条」，用户看到的就是「备份了个寂寞」。
         lines.append(f"最近备份：{record.started_at:%Y-%m-%d %H:%M:%S}")
+        covered = db.count_sources(record.backup_id)
         lines.append(
-            f"这次新增：{record.message_count} 条 · 媒体 {record.media_count} 个"
-            f" · 累计 {human_size(record.total_size)}"
+            f"这次覆盖：{covered or record.message_count} 条 · "
+            f"媒体 {record.media_count} 个 · {human_size(record.total_size)}"
         )
     else:
         lines.append("还没有完成过备份")
     # 定时备份开着的时候，群消息其实一直在进库（实时归档），只报「没备份过」会让人
     # 以为一条都没存下来
-    realtime = db.count_messages(group_id, backup_id=REALTIME_BACKUP_ID)
+    realtime = db.count_realtime_only(group_id)
     if realtime:
         lines.append(f"其中实时归档 {realtime} 条（还没被任何一次备份接手）")
     return "\n".join(lines)

@@ -164,7 +164,11 @@ class BackupEngine:
         try:
             raw_members = await adapter.get_group_members(group_id)
             members = parse_group_members(raw_members, group_id)
-            self.db.save_members(group_id, members)
+            # 成员列表是「当前状态」：整群替换，退群的人才会真的从名单里消失。
+            # 只做 upsert 的话名单只会越攒越大，`/backup status` 的成员数永远不降。
+            # 拉回来是空的（权限不足的适配器常见）就当没拉到，不能拿空表把快照清空。
+            if members:
+                self.db.replace_members(group_id, members)
         except Exception as e:
             auxiliary_errors.append("成员列表")
             logger.warning("成员列表拉取失败 group=%s: %s", group_id, type(e).__name__)
@@ -195,6 +199,7 @@ class BackupEngine:
 
             # 3-5. 分页拉消息，解析、下载媒体、入库
             page = 0
+            offset = 0
             collected: list[Message] = []
             failed_media = 0
             skipped = 0
@@ -203,7 +208,7 @@ class BackupEngine:
             owned_seen: list[Message] = []
             while True:
                 batch = await adapter.get_group_history(
-                    group_id, count=PAGE_SIZE, offset=page * PAGE_SIZE
+                    group_id, count=PAGE_SIZE, offset=offset
                 )
                 if not batch:
                     break
@@ -219,6 +224,10 @@ class BackupEngine:
                     )
                     break
                 seen_on_pages.update(str(_raw_id(raw)) for raw in fresh)
+                # 偏移量按平台真正吐回来的条数推进，不能按页码 × 页大小：
+                # 平台过滤掉一部分（撤回/系统消息不计入）时，按页码算会整段跳过，
+                # 那些消息永远不会被备份，而备份报成功
+                offset += len(batch)
                 for raw in fresh:
                     msg = parse_message(raw, group_id)
                     if self.db.message_exists(msg.message_id, group_id):
@@ -244,7 +253,12 @@ class BackupEngine:
                 page += 1
                 if progress_callback:
                     await progress_callback(record.message_count)
-                if len(batch) < PAGE_SIZE:
+                # 只按「平台吐回来多少」判断翻页到头是错的：适配器不认 count、每页
+                # 固定给 30 条时，第一页就小于 PAGE_SIZE，循环当场退出，剩下 3 倍
+                # 的消息一条没备，备份还报 completed。低于半页才算到头（正常的最后
+                # 一页），否则继续要下一页。收工条件由「翻过的消息集合」兜底，
+                # 不会因为平台始终不认 offset 而死循环。
+                if len(batch) < PAGE_SIZE // 2:
                     break
 
             # 6. 来源清单 + 快照
@@ -274,7 +288,7 @@ class BackupEngine:
             logger.debug(
                 "备份 group=%s 新增=%s 已在库=%s", group_id, record.message_count, skipped
             )
-            record.total_size = self._compute_size(group_id)
+            record.total_size = self._compute_size(group_id, covered or collected)
             record.status = BackupStatus.PARTIAL if failed_media else BackupStatus.COMPLETED
             notes = []
             if failed_media:
@@ -335,11 +349,24 @@ class BackupEngine:
             return latest
         return max(point, latest)
 
-    def _compute_size(self, group_id: int) -> int:
+    def _compute_size(self, group_id: int, messages=None) -> int:
+        """这条记录覆盖的消息所占的媒体体积。
+
+        以前是「这个群所有媒体加起来」，于是每条记录的 total_size 都等于全群总量，
+        `/backup list` 里 10 条记录的体积完全相同、加起来是实际的十倍。按记录覆盖
+        的消息算才是它自己的账。
+        """
+        if messages is None:
+            messages = self.db.get_messages(group_id=group_id)
+        ids = {str(m.message_id) for m in messages}
+        if not ids:
+            return 0
         total = 0
         for row in self.db.query(
-            "SELECT local_path FROM media_files WHERE group_id = ?", (group_id,)
+            "SELECT message_id, local_path FROM media_files WHERE group_id = ?", (group_id,)
         ):
+            if str(row["message_id"]) not in ids:
+                continue
             p = Path(row["local_path"] or "")
             if p.is_file():
                 total += p.stat().st_size

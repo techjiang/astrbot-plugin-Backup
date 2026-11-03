@@ -20,7 +20,7 @@ from ..exporters.base import ExportContext
 from ..exporters.html_exporter import HtmlExporter
 from .database import REALTIME_BACKUP_ID, Database, group_info_from_dict, members_from_list
 from .models import Message
-from .verifier import compute_checksum
+from .verifier import compute_checksum, compute_manifest_checksum
 
 EXPIRY_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
@@ -98,6 +98,10 @@ class ExportManager:
             messages = self.db.get_messages(group_id=group_id)
         else:
             messages = self.db.get_source_messages(backup_id, group_id)
+            # 来源清单是「这次备份覆盖过哪些消息」，一次全量备份可能连带把库里别的群
+            # 的旧数据也收了进来。导出某群的包却夹着别群的聊天记录，是隐私问题，
+            # 不是数据完整性问题——按群筛一遍
+            messages = [m for m in messages if m.group_id == group_id]
             if not messages:
                 # 来源清单是后加的，升级前的老备份没有这份登记。空手而归说明这
                 # 「不是真的没消息」，而是没有清单可查，退回按归属取
@@ -269,6 +273,9 @@ class ExportManager:
             "group_files": group_files,
             "author": {"name": "科技酱", "homepage": "https://www.asoe.cn"},
         }
+        # 群名、群信息、成员表不在消息校验和的覆盖范围内，单独算一个指纹：
+        # 否则改掉包里的群名和成员表，清单依然「自洽」，恢复时照单全收
+        manifest["manifest_checksum"] = compute_manifest_checksum(manifest)
         media_members: list[str] = []
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for file in work.rglob("*"):
