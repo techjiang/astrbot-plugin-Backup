@@ -81,7 +81,9 @@ backup:
     web_roots: []             # 数据目录不允许落在这里面，否则启动直接报错
   scope:
     group_messages: true      # 群消息
-    private_messages: false   # 私聊（默认关）
+    private_messages: false   # 私聊（默认关；开则落在虚拟群号 -1 下，命令/导出照旧）
+    group_announcements: true # 群公告
+    group_files: true         # 群文件列表
     group_members: true       # 成员列表
     download_media: true      # 下载图片/语音/视频/文件
   media:
@@ -90,21 +92,25 @@ backup:
     retry_count: 3
     timeout: 30
   schedule:
+    enabled: true             # 总闸：关掉则所有 cron 只存不跑
     default_cron: "0 3 * * *"
   retention:
     keep_days: 90
     keep_count: 30
     auto_clean: true
   export:
+    default_format: "sqlite"  # /backup export 不带格式时用它
     download_link_expire: "24h"
     base_url: ""              # 填 https://你的域名，导出链接才是完整 URL
   permission:
     require_admin: true       # 仅群主/管理员可用
+    allow_private: true       # 私聊里没有管理员概念，关掉则私聊一律拒绝
   incremental:
     enabled: true
   auto_trigger:
     mass_leave_threshold: 10  # 10 分钟内退群超过该数触发备份
     on_group_disband: true
+    on_bot_kicked: true       # 机器人被踢前补最后一次备份
 ```
 
 ## 数据存放
@@ -168,6 +174,14 @@ A：不会。消息按 `(message_id, group_id)` 唯一，重跑全量、失败�
 
 **Q：群号换了还能恢复吗？**
 A：可以。`/backup restore <备份ID> <新群号> --confirm`。
+
+**Q：群公告和群文件列表也会备份吗？**
+A：会。每次备份整群覆盖一次快照，ZIP 包里单独存 `announcements.json` / `group_files.json`，
+换机器恢复也带得走。接口拉不到只记一条 warning，不影响消息备份。
+
+**Q：私聊消息怎么备？**
+A：把 `scope.private_messages` 打开。私聊没有群号，消息统一落在虚拟群号 `-1` 下，
+`list` / `export -1 html` 等命令照常用。
 
 **Q：原机器没了，手里只有一个导出包，能恢复吗？**
 A：能。包里的 manifest 带着备份记录、群信息和成员名单，所以不用先有本地记录：

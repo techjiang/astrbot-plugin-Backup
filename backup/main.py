@@ -90,14 +90,17 @@ class BackupPlugin(Star):
             self.config,
         )
         self.restore_engine = RestoreEngine(self.db)
+        permission_cfg = self.config.get("permission") or {}
         self.permission = PermissionChecker(
-            (self.config.get("permission") or {}).get("require_admin", True)
+            permission_cfg.get("require_admin", True),
+            permission_cfg.get("allow_private", True),
         )
         self.auto_trigger = AutoTrigger(self.config.get("auto_trigger") or {})
         self.scheduler = BackupScheduler(
             self.db,
             self._scheduled_backup,
             (self.config.get("schedule") or {}).get("default_cron", "0 3 * * *"),
+            enabled=bool((self.config.get("schedule") or {}).get("enabled", True)),
         )
         self.hooks = EventHooks(
             self.db,
@@ -105,6 +108,7 @@ class BackupPlugin(Star):
             archive=bool((self.config.get("scope") or {}).get("group_messages", True)),
             on_leave=bool((self.config.get("auto_trigger") or {}).get("on_bot_kicked", True)),
             on_disband=bool((self.config.get("auto_trigger") or {}).get("on_group_disband", True)),
+            archive_private=bool((self.config.get("scope") or {}).get("private_messages", False)),
         )
         self.scheduler.restore_jobs()
         if self.config.get("retention", {}).get("auto_clean"):
@@ -194,8 +198,8 @@ class BackupPlugin(Star):
         归档，不属于任何一次备份。两个参数位置都认（群号在格式前或后）。
         """
         if not args:
-            yield event.plain_result("用法：/backup export [群号] <格式>")
-            return
+            fmt = (self.config.get("export") or {}).get("default_format", "sqlite")
+            args = [str(fmt)]
         formats = set(SUPPORTED_FORMATS) | {"md", "htm"}
         group_id = None
         fmt = ""

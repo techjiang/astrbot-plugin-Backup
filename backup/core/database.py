@@ -127,6 +127,38 @@ CREATE TABLE IF NOT EXISTS schedules (
   enabled BOOLEAN DEFAULT 1,
   updated_at DATETIME
 );
+
+-- 群公告与群文件列表。scope.group_announcements / scope.group_files 两个开关
+-- 一直写在配置里，但备份时没人读——开关是空头支票。这两张表把它们接上：
+-- 都是「当前状态」表，每次备份整群覆盖。
+CREATE TABLE IF NOT EXISTS group_announcements (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  group_id INTEGER NOT NULL,
+  content TEXT,
+  sender_id INTEGER,
+  sender_name TEXT,
+  published_at DATETIME,
+  raw_content TEXT,
+  synced_at DATETIME,
+  UNIQUE(group_id, content, published_at)
+);
+CREATE INDEX IF NOT EXISTS idx_ann_group ON group_announcements(group_id, published_at);
+
+CREATE TABLE IF NOT EXISTS group_files (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  group_id INTEGER NOT NULL,
+  file_id TEXT NOT NULL,
+  name TEXT,
+  size INTEGER,
+  busid INTEGER,
+  upload_time DATETIME,
+  uploader_id INTEGER,
+  uploader_name TEXT,
+  raw_content TEXT,
+  synced_at DATETIME,
+  UNIQUE(group_id, file_id)
+);
+CREATE INDEX IF NOT EXISTS idx_gfile_group ON group_files(group_id, upload_time);
 """
 
 # 实时归档写入的 messages.backup_id。它不是一次备份，只是「已经在库里了」的标记。
@@ -565,11 +597,17 @@ class Database:
         return ts, str(row["message_id"] or "")
 
     def latest_message_key(self, group_id: int) -> Optional[tuple[datetime, str]]:
-        """库里该群最新一条消息的 (timestamp, message_id)，用作续传水位。"""
+        """库里该群最新一条「备份下来的」消息，用作续传水位。
+
+        实时归档的行不算。它的时间戳按到达顺序写、可能乱序，而这里要回答的是
+        「备份已经覆盖到哪」——`backup_group` 那边就是这么用的（见 candidates）。
+        拿实时归档当水位，会把一整段正常消息判成「已经备过」而跳过。
+        """
         row = self.query_one(
-            """SELECT timestamp, message_id FROM messages WHERE group_id = ?
+            """SELECT timestamp, message_id FROM messages
+               WHERE group_id = ? AND backup_id != ?
                ORDER BY timestamp DESC, id DESC LIMIT 1""",
-            (group_id,),
+            (group_id, REALTIME_BACKUP_ID),
         )
         if row is None:
             return None
@@ -895,6 +933,82 @@ class Database:
                 continue
             self.execute("DELETE FROM media_files WHERE id = ?", (row["id"],))
         return removed
+
+    # ---------- 群公告 / 群文件 ----------
+    def save_announcements(self, group_id: int, items: list[dict]) -> int:
+        """整群覆盖式写入公告快照，返回条数。"""
+        now = to_db(datetime.now())
+        self.execute("DELETE FROM group_announcements WHERE group_id = ?", (group_id,))
+        rows = [
+            (
+                group_id,
+                str(a.get("content") or ""),
+                int(a.get("sender_id") or 0),
+                str(a.get("sender_name") or ""),
+                to_db(a.get("published_at")),
+                str(a.get("raw") or ""),
+                now,
+            )
+            for a in items or []
+        ]
+        if rows:
+            self._conn.executemany(
+                """INSERT OR IGNORE INTO group_announcements
+                   (group_id, content, sender_id, sender_name, published_at, raw_content, synced_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                rows,
+            )
+            self._conn.commit()
+        return len(rows)
+
+    def get_announcements(self, group_id: int) -> list[dict]:
+        return [
+            dict(row)
+            for row in self.query(
+                "SELECT * FROM group_announcements WHERE group_id = ? ORDER BY published_at",
+                (group_id,),
+            )
+        ]
+
+    def save_group_files(self, group_id: int, items: list[dict]) -> int:
+        """整群覆盖式写入群文件列表快照，返回条数。"""
+        now = to_db(datetime.now())
+        self.execute("DELETE FROM group_files WHERE group_id = ?", (group_id,))
+        rows = [
+            (
+                group_id,
+                str(f.get("file_id") or f.get("name") or ""),
+                str(f.get("name") or ""),
+                int(f.get("size") or 0),
+                int(f.get("busid") or 0),
+                to_db(f.get("upload_time")),
+                int(f.get("uploader_id") or 0),
+                str(f.get("uploader_name") or ""),
+                str(f.get("raw") or ""),
+                now,
+            )
+            for f in items or []
+            if (f.get("file_id") or f.get("name"))
+        ]
+        if rows:
+            self._conn.executemany(
+                """INSERT OR REPLACE INTO group_files
+                   (group_id, file_id, name, size, busid, upload_time,
+                    uploader_id, uploader_name, raw_content, synced_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                rows,
+            )
+            self._conn.commit()
+        return len(rows)
+
+    def get_group_files(self, group_id: int) -> list[dict]:
+        return [
+            dict(row)
+            for row in self.query(
+                "SELECT * FROM group_files WHERE group_id = ? ORDER BY upload_time",
+                (group_id,),
+            )
+        ]
 
     # ---------- 定时任务 ----------
     def save_schedule(self, group_id: int, cron: str, enabled: bool = True) -> None:

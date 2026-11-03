@@ -114,8 +114,30 @@ class ExportManager:
             messages=messages,
             group_info=group_info,
             members=members,
+            media_index=self._media_index(messages),
             backup_id=backup_id or "",
         )
+
+    def _media_index(self, messages: list[Message]) -> dict[str, Path]:
+        """库里记录的媒体路径 → 本机真实文件。
+
+        换台机器恢复后（或从导出包回灌）拿到的 `media_paths` 是原机器的绝对路径，
+        本机上不存在。HTML/ZIP 之前只认那个路径，于是「自包含单文件」里的图片全成了
+        断链。这里按 message_id 去 media_files 表找本机实际落盘的那份。
+        """
+        index: dict[str, Path] = {}
+        for m in messages:
+            for media in m.media_paths or []:
+                if not media or str(media).startswith("[下载失败]") or str(media).startswith("http"):
+                    continue
+                if Path(str(media)).is_file():
+                    continue
+                for row in self.db.get_media_for_message(m.message_id):
+                    local = Path(row["local_path"] or "")
+                    if local.is_file():
+                        index[str(media)] = local
+                        break
+        return index
 
     def export_latest(self, group_id: int, fmt: str, own_user_id: Optional[int] = None) -> ExportResult:
         """导出该群「最近一次备份」，外加只在实时归档里的那部分消息。
@@ -210,6 +232,16 @@ class ExportManager:
         get_exporter("txt").export(ctx, work / "messages.txt")
         get_exporter("markdown").export(ctx, work / "markdown")
         (work / "chat.html").write_text(HtmlExporter().render(ctx), encoding="utf-8")
+        announcements = [_jsonable(a) for a in self.db.get_announcements(ctx.group_id)]
+        group_files = [_jsonable(f) for f in self.db.get_group_files(ctx.group_id)]
+        if announcements:
+            (work / "announcements.json").write_text(
+                json.dumps(announcements, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        if group_files:
+            (work / "group_files.json").write_text(
+                json.dumps(group_files, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
 
         zip_path = base.with_suffix(".zip")
         record = self.db.get_record(ctx.backup_id) if ctx.backup_id else None
@@ -231,6 +263,10 @@ class ExportManager:
             "record": _record_to_dict(record),
             "group_info": group_info_to_dict(ctx.group_info),
             "members": [member_to_dict(m) for m in ctx.members],
+            # 群公告 / 群文件列表。这两样原来是没人采的空配置，现在采了就得能
+            # 带走——否则换台机器恢复，公告和文件清单全留在原机上
+            "announcements": announcements,
+            "group_files": group_files,
             "author": {"name": "科技酱", "homepage": "https://www.asoe.cn"},
         }
         media_members: list[str] = []
@@ -240,9 +276,11 @@ class ExportManager:
                     zf.write(file, file.relative_to(work))
             for m in ctx.messages:
                 for media in m.media_paths:
-                    p = Path(media)
+                    p = Path(ctx.media_index.get(str(media), media))
                     if p.is_file() and self._is_inside(p, self.media_dir):
-                        member = str(Path("media") / p.parent.name / p.name)
+                        # 同名不同目录的媒体（同一天两条消息都叫 image.png）以前会
+                        # 压成同一个成员名，后写的覆盖前一个，包里的图张冠李戴
+                        member = str(Path("media") / p.parent.name / f"{m.message_id}_{p.name}")
                         zf.write(p, member)
                         media_members.append(member)
             # 媒体清单写进 manifest，校验时才知道包里该有哪些文件
@@ -319,6 +357,14 @@ class ExportManager:
             for chunk in iter(lambda: fh.read(1024 * 256), b""):
                 h.update(chunk)
         return h.hexdigest()
+
+
+def _jsonable(row: dict) -> dict:
+    """sqlite3.Row 里的 datetime 不能直接 json 序列化。"""
+    return {
+        k: (v.isoformat(sep=" ") if isinstance(v, datetime) else v)
+        for k, v in dict(row).items()
+    }
 
 
 def _record_to_dict(record) -> Optional[dict]:

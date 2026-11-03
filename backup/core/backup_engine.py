@@ -13,7 +13,13 @@ from .database import Database
 from .incremental import IncrementalTracker
 from .media_downloader import MediaDownloader
 from .models import BackupRecord, BackupStatus, Message
-from .parser import parse_group_info, parse_group_members, parse_message
+from .parser import (
+    parse_announcements,
+    parse_group_files,
+    parse_group_info,
+    parse_group_members,
+    parse_message,
+)
 from .verifier import compute_checksum
 
 logger = logging.getLogger(__name__)
@@ -60,6 +66,20 @@ class PlatformAdapter:
     async def get_group_members(self, group_id: int) -> list:
         result = await self._call(
             ("get_group_member_list", "get_group_members", "get_members"), group_id=group_id
+        )
+        return result or []
+
+    async def get_group_announcements(self, group_id: int) -> list:
+        """群公告。适配器多半叫 _get_group_notice，取不到就返回空表。"""
+        return await self._call(
+            ("get_group_notice", "get_group_announcements", "get_group_notices"),
+            group_id=group_id,
+        ) or []
+
+    async def get_group_files(self, group_id: int) -> list:
+        result = await self._call(
+            ("get_group_files", "get_group_file_list", "get_files"),
+            group_id=group_id,
         )
         return result or []
 
@@ -149,6 +169,23 @@ class BackupEngine:
             info = self.db.get_group_info(group_id)
         if not members:
             members = self.db.get_members(group_id)
+
+        # 群公告 / 群文件：开关在配置里，之前没人读。同样不影响主流程成败
+        scope = self.config.get("scope") or {}
+        if scope.get("group_announcements", True):
+            try:
+                raw_notices = await adapter.get_group_announcements(group_id)
+                self.db.save_announcements(group_id, parse_announcements(raw_notices, group_id))
+            except Exception as e:
+                auxiliary_errors.append("群公告")
+                logger.warning("群公告拉取失败 group=%s: %s", group_id, type(e).__name__)
+        if scope.get("group_files", True):
+            try:
+                raw_files = await adapter.get_group_files(group_id)
+                self.db.save_group_files(group_id, parse_group_files(raw_files, group_id))
+            except Exception as e:
+                auxiliary_errors.append("群文件")
+                logger.warning("群文件拉取失败 group=%s: %s", group_id, type(e).__name__)
 
         try:
 

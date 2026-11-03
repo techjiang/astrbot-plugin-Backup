@@ -45,10 +45,12 @@ class BackupScheduler:
         db: Database,
         run_backup: Callable[[int], Awaitable],
         default_cron: str = "0 3 * * *",
+        enabled: bool = True,
     ):
         self.db = db
         self.run_backup = run_backup
         self.default_cron = default_cron
+        self.enabled = enabled
         self._scheduler = None
 
     def _ensure_scheduler(self):
@@ -82,6 +84,9 @@ class BackupScheduler:
         if not self.validate_cron(cron):
             return False
         self.db.save_schedule(group_id, cron, enabled=True)
+        if not self.enabled:
+            logger.info("schedule.enabled=false，群 %s 的任务只保存不调度", group_id)
+            return True
         sched = self._ensure_scheduler()
         if sched is None:
             return True
@@ -117,8 +122,14 @@ class BackupScheduler:
         return self.db.list_schedules()
 
     def restore_jobs(self) -> int:
-        """启动时把库里的定时任务重新挂回调度器。"""
+        """启动时把库里的定时任务重新挂回调度器。
+
+        `schedule.enabled` 是总闸：关掉时一条都不挂，库里已存的 cron 保留着，
+        下次打开就全回来。之前这个开关写了没人读。
+        """
         count = 0
+        if not self.enabled:
+            return 0
         for job in self.db.list_schedules():
             if job["enabled"] and self.add_job(job["group_id"], job["cron"]):
                 count += 1

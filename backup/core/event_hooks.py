@@ -19,6 +19,9 @@ DISBAND_SUBTYPES = {"disband", "dismiss", "group_disband", "group_dismiss"}
 # 成员变动类通知：群里正常有人退群也走这里，先聚合再判断
 DECREASE_SUBTYPES = {"decrease", "leave", "quit", "member_leave", "kick"}
 
+# 私聊消息在库里的 group_id。负数，和真实群号（正整数）区分开
+PRIVATE_ARCHIVE_GROUP = -1
+
 
 def _get(obj: Any, name: str, default=None):
     if isinstance(obj, dict):
@@ -103,10 +106,17 @@ class EventHooks:
         on_leave: bool = True,
         on_disband: bool = True,
         cooldown_seconds: int = 1800,
+        archive_private: bool = False,
+        private_group_id: int = PRIVATE_ARCHIVE_GROUP,
     ):
         self.db = db
         self.trigger = auto_trigger
         self.archive = archive
+        # scope.private_messages 之前也是空头支票：配置项写着「私聊（默认关）」，
+        # 代码里私聊事件连归档都不进。开着它，私聊消息落在一个虚拟群号下，
+        # 与真正的群号（正整数）不会撞车，导出/恢复流程一行都不用改
+        self.archive_private = archive_private
+        self.private_group_id = private_group_id
         self.on_leave = on_leave
         self.on_disband = on_disband
         self.cooldown = cooldown_seconds
@@ -118,8 +128,10 @@ class EventHooks:
         if not self.archive:
             return None
         group_id = extract_group_id(event)
-        if group_id is None:  # 私聊归档暂未支持，留出口给后续
-            return None
+        if group_id is None:
+            if not self.archive_private:
+                return None
+            group_id = self.private_group_id
         msg = parse_event_message(event, group_id)
         if msg is None:
             return None

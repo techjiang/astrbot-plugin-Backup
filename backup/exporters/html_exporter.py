@@ -78,7 +78,7 @@ class HtmlExporter(BaseExporter):
         return out
 
     # ---------- 单条消息 ----------
-    def _render_message(self, m, ctx: ExportContext) -> str:
+    def _render_message(self, m, ctx: ExportContext) -> str:  # noqa: C901 - 单条消息的分支就是多
         mine = self.own_user_id is not None and m.sender_id == self.own_user_id
         initial = html.escape((m.sender_name or str(m.sender_id))[:1].upper())
         text_for_search = html.escape((m.content or "").lower())
@@ -102,7 +102,7 @@ class HtmlExporter(BaseExporter):
             )
 
         for media in m.media_paths:
-            bubble_parts.append(self._render_media(media))
+            bubble_parts.append(self._render_media(media, ctx))
 
         return (
             f'<div class="msg{" mine" if mine else ""}" data-sender="{m.sender_id}" data-text="{text_for_search}">'
@@ -112,10 +112,10 @@ class HtmlExporter(BaseExporter):
             f'<div class="bubble">{"".join(bubble_parts)}</div></div></div>'
         )
 
-    def _render_media(self, media: str) -> str:
+    def _render_media(self, media: str, ctx: Optional[ExportContext] = None) -> str:
         if not media:
             return ""
-        p = Path(media)
+        p = self._local_path(media, ctx)
         is_image = p.suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
         data_uri = self._inline(p) if is_image else None
         if data_uri:
@@ -123,6 +123,21 @@ class HtmlExporter(BaseExporter):
         if is_image:
             return f'<a class="file" href="{html.escape(media)}" target="_blank" rel="noopener">🖼 {html.escape(p.name)}</a>'
         return f'<a class="file" href="{html.escape(media)}" target="_blank" rel="noopener">📎 {html.escape(p.name)}</a>'
+
+    @staticmethod
+    def _local_path(media: str, ctx: Optional[ExportContext]) -> Path:
+        """媒体在导出机上的真实路径。
+
+        库里存的是下载机的绝对路径（`~/.astrbot-backup/media/...`）。换台机器导出
+        时那个路径不存在，图片就退化成指向原始 url 的裸链接——而 html 的卖点正是
+        「单文件自包含」。所以先用 ctx.media_index（按 message_id 索引的本地副本），
+        再退回原路径。
+        """
+        if ctx is not None and ctx.media_index:
+            hit = ctx.media_index.get(media) or ctx.media_index.get(str(media))
+            if hit:
+                return Path(hit)
+        return Path(media)
 
     @staticmethod
     def _inline(path: Path) -> Optional[str]:

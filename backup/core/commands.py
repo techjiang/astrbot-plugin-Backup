@@ -125,6 +125,33 @@ class Permission:
 ADMIN_ROLES = ("admin", "owner", "administrator")
 
 
+def _is_private_event(event) -> bool:
+    """判断是不是私聊事件。
+
+    只认明确的私聊标记，没有就按群聊处理——「认不出＝私聊」会让一个只实现
+    is_admin() 的群聊适配器悄悄跳过权限检查，等于把门开着。
+    """
+    for name in ("is_private", "is_private_chat", "is_direct"):
+        value = getattr(event, name, None)
+        if isinstance(value, bool):
+            return value
+    scope = getattr(event, "message_type", None)
+    if isinstance(scope, str) and scope.lower() in ("private", "friend", "direct"):
+        return True
+    for name in ("group_id", "group"):
+        value = getattr(event, name, None)
+        if isinstance(value, int) and value > 0:
+            return False
+        if isinstance(value, str) and value.isdigit() and int(value) > 0:
+            return False
+    inner = getattr(event, "message_obj", None)
+    gid = getattr(inner, "group_id", None) if inner is not None else None
+    if isinstance(gid, int) and gid > 0:
+        return False
+    # 没有任何私聊标记，也没有群号：按群聊处理，走进正常的角色检查
+    return False
+
+
 class PermissionChecker:
     """仅群主/管理员可执行备份操作（可配置关闭）。
 
@@ -132,10 +159,17 @@ class PermissionChecker:
     都被挡在门外，所以还要接着看角色字段。角色也认不出时才拒绝。
     """
 
-    def __init__(self, require_admin: bool = True):
+    def __init__(self, require_admin: bool = True, allow_private: bool = True):
         self.require_admin = require_admin
+        self.allow_private = allow_private
 
     def check_event(self, event) -> Permission:
+        # 私聊里没有「群主/管理员」这个概念。allow_private 关掉就一律拒绝，
+        # 开着就跳过角色检查，否则私聊会永远被挡在「仅群主或管理员」外面
+        if _is_private_event(event):
+            if not self.allow_private:
+                return Permission(False, "私聊已禁用备份操作（permission.allow_private）")
+            return Permission(True)
         if not self.require_admin:
             return Permission(True)
         for name in ("is_admin", "is_group_admin", "is_owner"):

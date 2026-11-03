@@ -102,6 +102,11 @@ def parse_message(raw: Any, group_id: Optional[int] = None) -> Message:
     # 恢复时走的就是这条路径。不显式接住的话内容会变成空串，校验和必然对不上。
     flat_content = _get(raw, "content")
     flat_type = _get(raw, "message_type")
+    # content 是 list 说明这是消息链形态（`{'content': [...]}`），不是导出摊平后的
+    # 纯文本。_segments 已经在上面处理过它，这里不能再来一次，否则同一段话进
+    # 两次 content
+    if isinstance(flat_content, (list, dict)):
+        flat_content = ""
     timestamp = _to_datetime(
         _get(raw, "timestamp", _get(raw, "time", _get(raw, "created_at")))
     )
@@ -246,3 +251,75 @@ def parse_group_info(raw: Any, group_id: int):
         max_members=int(_get(raw, "max_members", 0) or 0),
         group_level=int(_get(raw, "group_level", _get(raw, "level", 0)) or 0),
     )
+
+
+def _unwrap_list(raw: Any, *keys: str) -> list:
+    """平台返回的列表可能包一层 dict（{'notices': [...]} / {'files': [...]}）。"""
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return raw
+    for key in keys:
+        value = _get(raw, key)
+        if isinstance(value, list):
+            return value
+    for key in ("data", "list", "items"):
+        value = _get(raw, key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            for sub in keys:
+                inner = _get(value, sub)
+                if isinstance(inner, list):
+                    return inner
+    return []
+
+
+def parse_announcements(raw: Any, group_id: int) -> list[dict]:
+    """解析群公告列表。认不出结构就返回空表，绝不抛异常。"""
+    out = []
+    for item in _unwrap_list(raw, "notices", "announcements", "feeds"):
+        sender = _get(item, "sender", {}) or {}
+        content = _get(item, "content") or _get(item, "message") or _get(item, "text") or ""
+        # 公告正文有时是消息链形态
+        if isinstance(content, list):
+            text = " ".join(
+                str(_get(_get(seg, "data", seg) or {}, "text") or "")
+                for seg in content
+            ).strip() or json.dumps(content, ensure_ascii=False, default=str)
+        else:
+            text = str(content or "")
+        published = _get(item, "publish_time") or _get(item, "time") or _get(item, "published_at")
+        out.append(
+            {
+                "content": text,
+                "sender_id": _get(item, "sender_id") or _get(sender, "user_id") or 0,
+                "sender_name": _get(sender, "card") or _get(sender, "nickname") or "",
+                "published_at": _to_datetime(published) if published else None,
+                "raw": _raw_json(item),
+            }
+        )
+    return out
+
+
+def parse_group_files(raw: Any, group_id: int) -> list[dict]:
+    """解析群文件列表。"""
+    out = []
+    for item in _unwrap_list(raw, "files", "file_list"):
+        uploader = _get(item, "uploader") or {}
+        upload_time = _get(item, "upload_time") or _get(item, "time") or _get(item, "dead_time")
+        out.append(
+            {
+                "file_id": _get(item, "file_id") or _get(item, "id") or "",
+                "name": _get(item, "file_name") or _get(item, "name") or "",
+                "size": int(_get(item, "file_size", _get(item, "size", 0)) or 0),
+                "busid": _get(item, "busid") or 0,
+                "upload_time": _to_datetime(upload_time) if upload_time else None,
+                "uploader_id": _get(item, "uploader_id") or 0,
+                "uploader_name": str(
+                    _get(item, "uploader_name") or _get(uploader, "nickname") or ""
+                ),
+                "raw": _raw_json(item),
+            }
+        )
+    return out
