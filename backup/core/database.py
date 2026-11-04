@@ -368,6 +368,24 @@ def members_from_list(raw_members, fallback_group_id: int = 0) -> list:
     return out
 
 
+def _jsonable_row(row) -> dict:
+    """快照条目 → 可 json 序列化的 dict。
+
+    解析器给的公告/文件条目里，`published_at` / `upload_time` 是 `datetime`，
+    直接塞进 `json.dumps` 会抛 `TypeError: Object of type datetime is not JSON
+    serializable`。而 `save_bundle` 是在备份主流程里调的——**一条带发布时间的
+    公告就能让整轮备份被判 failed，消息却已经全落库了**。用户看到「备份失败」，
+    实际数据都在，最坏的是他会以为没备上而反复重跑。
+    """
+    out = {}
+    for key, value in dict(row).items():
+        if isinstance(value, datetime):
+            out[key] = to_db(_naive_dt(value))
+        else:
+            out[key] = value
+    return out
+
+
 def to_db(dt: Optional[datetime | str]) -> Optional[str]:
     """datetime → 库里的时间字符串。
 
@@ -650,9 +668,9 @@ class Database:
             "members": [_member_to_dict(m) for m in (members or [])],
         }
         if announcements is not None:
-            payload["announcements"] = list(announcements)
+            payload["announcements"] = [_jsonable_row(a) for a in announcements]
         if group_files is not None:
-            payload["group_files"] = list(group_files)
+            payload["group_files"] = [_jsonable_row(f) for f in group_files]
         self.execute(
             """INSERT OR REPLACE INTO backup_bundle (backup_id, group_id, payload)
                VALUES (?,?,?)""",
@@ -998,16 +1016,22 @@ class Database:
         只按状态过滤会让一次什么都没备份的新记录顶掉上一次的实绩——那之后
         「最近备份」就永远显示 0 条。这里改为按消息数筛，全空时退回任意完成记录。
         """
+        # PARTIAL 也要算数：它的意思是「消息都备上了，只是有几个媒体没下下来」。
+        # 只认 COMPLETED 的话，一次媒体下载失败就会让 `/backup status` 报
+        # 「还没有完成过备份」、`export latest` 导不出任何东西、`/backup list`
+        # 里那条最完整的备份被当成不存在——而数据明明就在库里。
+        ok = (BackupStatus.COMPLETED.value, BackupStatus.PARTIAL.value)
+        marks = ",".join("?" * len(ok))
         row = self.query_one(
-            """SELECT * FROM backup_records
-               WHERE group_id = ? AND status = ? AND message_count > 0
-               ORDER BY started_at DESC LIMIT 1""",
-            (group_id, BackupStatus.COMPLETED.value),
+            f"""SELECT * FROM backup_records
+                WHERE group_id = ? AND status IN ({marks}) AND message_count > 0
+                ORDER BY started_at DESC LIMIT 1""",
+            (group_id, *ok),
         ) or self.query_one(
-            """SELECT * FROM backup_records
-               WHERE group_id = ? AND status = ?
-               ORDER BY started_at DESC LIMIT 1""",
-            (group_id, BackupStatus.COMPLETED.value),
+            f"""SELECT * FROM backup_records
+                WHERE group_id = ? AND status IN ({marks})
+                ORDER BY started_at DESC LIMIT 1""",
+            (group_id, *ok),
         )
         return self._row_to_record(row) if row else None
 

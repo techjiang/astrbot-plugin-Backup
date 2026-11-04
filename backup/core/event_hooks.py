@@ -4,6 +4,7 @@
 真实适配器字段不一致时，改这一个文件即可，主流程不动。
 """
 
+import inspect
 import logging
 from datetime import datetime
 from typing import Any, Optional
@@ -45,6 +46,65 @@ def _get(obj: Any, name: str, default=None):
     if isinstance(obj, dict):
         return obj.get(name, default)
     return getattr(obj, name, default)
+
+
+# 从事件里摊出来的「结构字段」。只搬类型和号码，绝不碰消息内容——
+# 红线 1：消息是隐私，日志与中间结构里都不该出现正文。
+NOTICE_KEYS = (
+    "post_type",
+    "notice_type",
+    "message_type",
+    "sub_type",
+    "subtype",
+    "group_id",
+    "user_id",
+    "target_id",
+    "operator_id",
+)
+
+
+def _attr(obj, name, default=None):
+    """取属性但绕开 property，理由见 parser._safe_get。"""
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    try:
+        inspected = inspect.getattr_static(obj, name)
+    except AttributeError:
+        return default
+    if isinstance(inspected, property):
+        return default
+    return getattr(obj, name, default)
+
+
+def notice_payload(event) -> dict:
+    """把 AstrBot 事件里的通知结构摊成 dict，供 `handle_notice` 认类型。
+
+    AstrBot 不会把 `notice_type` / `sub_type` 挂到事件对象上：它把 OneBot 原始
+    事件整份塞进 `message_obj.raw_message`（aiocqhttp 的 `Event` 就是个 dict 子类）。
+    原来的写法只读 `event.post_type` / `event.message_obj.post_type`，在这两个位置
+    都是 None——于是每条通知都摊成 `{'group_id': '100'}`，`sub_type` 恒空。
+    退群聚合、群解散、机器人被踢三个功能因此一次都没触发过，日志里也看不出问题。
+    """
+    out: dict = {}
+
+    def collect(node) -> None:
+        if node is None:
+            return
+        for key in NOTICE_KEYS:
+            if key in out:
+                continue
+            value = node.get(key) if isinstance(node, dict) else _attr(node, key)
+            if value is None or value == "":
+                continue
+            out[key] = value
+
+    for holder in ("raw_message", "message_obj"):
+        inner = _attr(event, holder)
+        collect(inner)
+        # 关键的一层：OneBot 原始事件藏在 message_obj.raw_message 里
+        collect(_attr(inner, "raw_message"))
+    collect(event)
+    return out
 
 
 def extract_group_id(event) -> Optional[int]:

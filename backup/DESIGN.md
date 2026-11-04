@@ -214,13 +214,11 @@ OneBot v11 把类型放 `notice_type`（`group_decrease` / `group_disband`），
 `helloworld`。这不只是好看不好看：校验和是按 `content` 算的，同一段话两次解析结果不同，
 跨来源比对就会假阳性。现在按「相邻两段都是 ASCII 词才补空格」来拼，段内原有空白不动。
 
-**只能实机确认的三处，怎么对齐**
-`message_obj` 字段名、退群/被踢的 `sub_type` 取值、宿主自定义路由的挂载方式，代码里已经
-留好口袋：
-- `EventHooks.describe_event` / `describe_notice`：首次收到真实事件时打一行 **只含字段名**
-  的 debug 日志（值里可能有消息内容，不记），直接告出「认出群号 / 认出类型」的结果；
-- `event_hooks.py` 顶部三个 `*_SUBTYPES` 集合，适配器叫法不同就改这里；
-- `download_route.handle_download(path, exports)` 是纯函数，怎么挂都行。
+**当时以为「只能实机确认的三处」，其实源码就能确认**
+前面几轮反复说「`message_obj` 字段名、退群/被踢的 `sub_type` 取值、宿主自定义路由的挂载
+方式只能实机确认」。第 20 轮把 AstrBot 4.14.6 的源码拉下来逐处对照，发现那不是「猜得准不
+准」的问题，是**形状完全对不上**——而且「自洽的假设」让 350 个用例全绿却一条真实路径都
+走不通。详见 [第 20 轮](#第二十轮a-strbot-真实形状)。
 
 ### 第十轮：状态快照与包完整性
 
@@ -516,6 +514,105 @@ removed = self.db.purge_expired_tokens(now - max_age_days * 86400)
 包里自带 `record` / `group_id`，但命令层只把第一个参数当备份 ID，包路径没有入口——
 「从 ZIP 恢复」这条代码路径除了单测之外从来没有被用户走到，因为走不到。
 现在第一个参数可以是一个包路径（按扩展名/路径分隔符识别），包里没有记录也能定目标群。
+
+### 第二十轮：AstrBot 真实形状
+
+前面十九轮的用例全绿（350 个），但它们和代码共用同一套**臆想出来的** AstrBot API：
+消息段是 `{'type': 'image', 'data': {...}}` 这样的 dict、事件上有 `group_id` 属性、
+`is_admin` 是布尔字段、历史消息接口认 `offset`。把 AstrBot 4.14.6 的源码拉下来逐处对照，
+发现真实形状一处都不一样。这不是「猜得准不准」，是**每条主路径都走不通**。
+
+**`ComponentType` 是 str-Enum，`str()` 出来是 `ComponentType.Plain`**
+Python 3.11 上 `str(ComponentType.Plain)` 给 `"ComponentType.Plain"`（3.12 才改成返回值）。
+原代码 `str(type).lower()` 得到 `componenttype.plain`，查 `_TYPE_KEYS` 恒为 None，直接进
+else 分支——图片、语音、视频、文件全被当成文本，`media_paths` 永远是空的，`@` 和引用一起丢。
+备份"成功"了，导出的 HTML 里一张图都没有。
+现在 `_segment_type()` 先取枚举的 `.value`，再退回 `str()`，并剥掉 `ComponentType.` 前缀和
+`Poke:poke` 这类子类型尾巴。
+
+**消息段自己就是数据袋，没有 `data` 层**
+AstrBot 的 `Plain.text` / `Image.file` / `At.qq` 都直接挂在对象上。原来的代码一律
+`_get(seg, "data", seg)`，取到的就是段对象本身，靠 `_get` 的 getattr 兜底——能用，但
+`File.file` 是个**会触发同步下载的 property**：异步上下文里返回空串并打警告，非异步
+上下文里 `run_until_complete` 直接卡住事件循环。`_safe_get()` 用
+`inspect.getattr_static` 判断是不是 property，是就不碰。
+
+**适配器不提供 `get_group_history`，拉数据要走 OneBot `call_action`**
+`aiocqhttp` 适配器只做「收消息、转事件」，历史消息得走 OneBot。而 `CQHttp.__getattr__`
+把**任何**属性名变成 `functools.partial(call_action, 名字)`——探测式代码问「有没有
+`get_group_history`」会拿到一个可调用对象，调下去真的发请求，看起来万事大吉。
+更糟的是这类"方法"签名永远是 `(*args, **kwargs)`，所以 `PlatformAdapter._supports("offset")`
+不能拿 `**kwargs` 当证据，只能看有没有显式声明过的参数名。
+
+**OneBot 的历史消息只认 `message_seq`，不认 offset**
+传 `offset` 进去会被静默忽略，每次返回同一批最新消息。引擎的去重兜底（连续两页都是翻过
+的消息就判定到头）立刻收工——**每个群只备份最新一页，状态写 `completed`**。现在适配器自己
+维护「上一页最旧那条」当锚点，并在平台一次给不满时反复补齐。
+
+补齐还有个坑，是我改完第一版自己撞上的：补到 60 条、按 `count` 截成 50 条返回，被截掉的
+10 条**锚点已经推过去了**，之后再也翻不回来——那一小段消息永久丢失，而备份报
+`completed`。现在宁可一页多给几条，也不扔掉已经拿到的消息。
+
+**`is_admin()` / `is_private_chat()` / `get_group_id()` 都是方法**
+原代码 `getattr(event, "is_admin")` 拿到的是 bound method，`isinstance(value, bool)` 恒为
+False——每一项探测都判「没有这个标记」。后果是管理员发 `/backup` 被「仅群主或管理员」挡
+回去，`allow_private` 配置对真实私聊完全无效。
+
+**OneBot notice 事件被包成普通消息事件**
+适配器把 notice 也走 `handle_msg`，`type` 是 `OTHER_MESSAGE`、`message_str` 空，原始事件
+在 `message_obj.raw_message` 里。原来的 `_notice_payload` 只读 `event.post_type` /
+`event.message_obj.post_type`，两个位置都是 None——每条通知都摊成 `{'group_id': '100'}`，
+`sub_type` 恒空。退群聚合、群解散、机器人被踢**一次都没触发过**。
+现在 `notice_payload()` 直接钻 `raw_message`，并先判 `post_type == message` 直接返回，
+免得一次普通聊天把「大量退群」的阈值顶满。
+
+**`Context.get_platform` 也是方法**
+`getattr(self.context, "get_platform", lambda: None)()` 拿到的是 bound method 当平台用，
+后面每个 `_call` 都打在方法对象上全返回 None——`/backup now` 只会回一句「当前没有可用的
+平台适配器」，定时备份同样拿不到平台。现在按「事件平台 id → 名字 → 唯一那个实例」找，
+多开同类适配器时 id 才是唯一的。
+
+**带发布时间的群公告能让整轮备份判 failed**
+`published_at` 是 `datetime`，`json.dumps` 直接抛 `TypeError: Object of type datetime is
+not JSON serializable`，而 `save_bundle` 在主流程里——消息全落库了，备份却写 `failed`。
+这处是第 19 轮我自己引入的（那轮把公告塞进 bundle 时没考虑时间字段）。新增
+`_jsonable_row()` 统一转换。
+
+**`PARTIAL` 记录不算「最近一次备份」**
+`latest_completed_record` 只认 `COMPLETED`。一次媒体下载失败降级成 `partial` 之后，
+`/backup status` 报「还没有完成过备份」、`export latest` 导不出任何东西——数据明明都在库里。
+`partial` 的语义是「消息都备上了，只是有几个媒体没下下来」，它就该算数。
+
+**`/backup verify <包>` 拿记录的校验和比包清单**
+记录的 `checksum` 覆盖「这次备份覆盖的消息」，`export latest` 的包还含只在实时归档里的
+消息，两者天然不等。拿它当期望值，自己刚导出的包会被自己的校验判成「备份可能被修改」。
+`verify_zip` 里早写了这个道理，命令层却一直在传。
+
+**`json` / `markdown` 导出的是目录，下载链接下不动**
+目录交给下载路由：`Content-Type` 退成 `octet-stream`，读流时 `open(dir)` 抛
+`IsADirectoryError`。用户点出来的是一条打不开的链接。现在目录型产物在给链接前打成一个
+zip，目录本身留着（本地翻着方便）。
+
+**平铺消息从包里读回来变了样**
+导出器把消息写成 `{message_type, content, media_paths, ...}` 平铺 dict。原来的解析要求
+`content` 非空才认：纯图片、纯语音、纯文件消息的 `content` 本来就是空的，于是整条消息退化
+成 `unknown`、媒体和引用全丢——**自己导出的包自己恢复不了**，报的还是一句「备份可能已
+损坏」。另外平铺 dict 会被当成一个消息段遍历，`content` 被当正文捡走，平铺分支根本进不去。
+新增 `_is_flat()` 先识别形态。
+
+还有一处：链解析出「文本 + 引用」会归成 `REPLY`，但摊平消息自带权威的 `message_type`，
+不能再改——改了就成了「库里 `text`、包里 `reply`」，校验和必然对不上。
+
+**插件市场的两个缺口**
+AstrBot 只认 `logo.png` 当插件图标（`logo_fname = "logo.png"`），只有 SVG 就是空白方块；
+配置面板靠 `_conf_schema.json` 渲染，只有 `config.yaml` 的话面板里什么都看不到。都补上了，
+并加了一个用例保证 schema 与 yaml 的 26 个默认值逐项一致——漂移了用户就会看到「面板写着
+90 天、实际按 30 天清理」。
+
+**这一轮的教训**
+十九轮里我一直在「代码内部找矛盾」，用例和代码共用同一套假设，所以永远绿。真正该问的是
+**「这套假设和外面那个东西对得上吗」**——而这件事不需要实机，源码就能回答，我早该去翻。
+前面几轮反复说「只能实机确认」，是把「我懒得去读依赖的源码」包装成了「环境限制」。
 
 ## 红线对照
 

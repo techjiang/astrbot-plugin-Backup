@@ -1,0 +1,195 @@
+{
+  "storage_dir": {
+    "type": "string",
+    "description": "数据根目录（备份/媒体/数据库/导出）。留空 = ~/.astrbot-backup，刻意避开插件目录",
+    "default": ""
+  },
+  "storage": {
+    "type": "object",
+    "description": "存储安全",
+    "items": {
+      "web_roots": {
+        "type": "list",
+        "description": "不允许落在这些 Web 根目录内（红线 3）",
+        "default": []
+      }
+    }
+  },
+  "scope": {
+    "type": "object",
+    "description": "备份范围",
+    "items": {
+      "group_messages": {
+        "type": "bool",
+        "description": "群消息（实时归档）",
+        "default": true
+      },
+      "private_messages": {
+        "type": "bool",
+        "description": "私聊消息（落在虚拟群号 -1 下）",
+        "default": false
+      },
+      "group_announcements": {
+        "type": "bool",
+        "description": "群公告",
+        "default": true
+      },
+      "group_files": {
+        "type": "bool",
+        "description": "群文件列表",
+        "default": true
+      },
+      "group_members": {
+        "type": "bool",
+        "description": "群成员列表",
+        "default": true
+      },
+      "download_media": {
+        "type": "bool",
+        "description": "下载图片/语音/视频/文件",
+        "default": true
+      }
+    }
+  },
+  "media": {
+    "type": "object",
+    "description": "媒体下载",
+    "items": {
+      "max_file_size": {
+        "type": "string",
+        "description": "单文件大小上限，如 100MB",
+        "default": "100MB"
+      },
+      "max_concurrent": {
+        "type": "int",
+        "description": "并发下载数",
+        "default": 3
+      },
+      "retry_count": {
+        "type": "int",
+        "description": "重试次数",
+        "default": 3
+      },
+      "timeout": {
+        "type": "int",
+        "description": "单文件超时（秒）",
+        "default": 30
+      }
+    }
+  },
+  "schedule": {
+    "type": "object",
+    "description": "定时备份",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "总闸：关掉后库里已存的 cron 保留但不调度",
+        "default": true
+      },
+      "default_cron": {
+        "type": "string",
+        "description": "默认 cron（分 时 日 月 周）",
+        "default": "0 3 * * *"
+      }
+    }
+  },
+  "retention": {
+    "type": "object",
+    "description": "保留策略",
+    "items": {
+      "keep_days": {
+        "type": "int",
+        "description": "保留天数（<=0 表示不按时间淘汰）",
+        "default": 90
+      },
+      "keep_count": {
+        "type": "int",
+        "description": "最多保留几份备份记录",
+        "default": 30
+      },
+      "auto_clean": {
+        "type": "bool",
+        "description": "启动时自动清理过期导出",
+        "default": true
+      }
+    }
+  },
+  "export": {
+    "type": "object",
+    "description": "导出",
+    "items": {
+      "default_format": {
+        "type": "string",
+        "description": "默认格式",
+        "default": "sqlite",
+        "options": [
+          "sqlite",
+          "json",
+          "csv",
+          "txt",
+          "markdown",
+          "html",
+          "zip"
+        ]
+      },
+      "download_link_expire": {
+        "type": "string",
+        "description": "临时链接有效期，如 24h",
+        "default": "24h"
+      },
+      "base_url": {
+        "type": "string",
+        "description": "拼下载链接用的域名，如 https://your.host",
+        "default": ""
+      }
+    }
+  },
+  "permission": {
+    "type": "object",
+    "description": "权限",
+    "items": {
+      "require_admin": {
+        "type": "bool",
+        "description": "仅群主/管理员可执行",
+        "default": true
+      },
+      "allow_private": {
+        "type": "bool",
+        "description": "允许私聊使用",
+        "default": true
+      }
+    }
+  },
+  "incremental": {
+    "type": "object",
+    "description": "增量备份",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "只备上次之后的新消息",
+        "default": true
+      }
+    }
+  },
+  "auto_trigger": {
+    "type": "object",
+    "description": "触发式备份",
+    "items": {
+      "mass_leave_threshold": {
+        "type": "int",
+        "description": "10 分钟内退群多少人触发备份",
+        "default": 10
+      },
+      "on_group_disband": {
+        "type": "bool",
+        "description": "群解散时触发",
+        "default": true
+      },
+      "on_bot_kicked": {
+        "type": "bool",
+        "description": "机器人被踢时触发",
+        "default": true
+      }
+    }
+  }
+}

@@ -3,6 +3,7 @@
 作者：科技酱 · https://www.asoe.cn
 """
 
+import json
 import logging
 from pathlib import Path
 from typing import Optional
@@ -28,7 +29,12 @@ from .core.download_route import handle_download
 from .core.export_manager import ExportManager
 from .exporters import SUPPORTED_FORMATS
 from .core.auto_trigger import AutoTrigger
-from .core.event_hooks import EventHooks, extract_group_id
+from .core.event_hooks import (
+    EventHooks,
+    extract_group_id,
+    is_message_echo,
+    notice_payload,
+)
 from .core.paths import assert_writable_target, resolve_storage_root
 from .core.restore_engine import RestoreEngine, RestoreError
 from .core.scheduler import BackupScheduler
@@ -50,14 +56,82 @@ def _looks_like_archive(token: str) -> bool:
     return text.lower().endswith(".zip") or "/" in text or "\\" in text
 
 
+def _event_self_id(event):
+    """机器人自己的 QQ/用户 id，用来把「我说的话」放在气泡右侧。"""
+    for name in ("get_self_id", "self_id", "bot_id"):
+        value = getattr(event, name, None)
+        if callable(value):
+            try:
+                value = value()
+            except Exception:
+                continue
+        if value not in (None, ""):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+    inner = getattr(event, "message_obj", None)
+    value = getattr(inner, "self_id", None) if inner is not None else None
+    try:
+        return int(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _schema_defaults() -> dict:
+    """`_conf_schema.json` 里的默认值，摊成 config.yaml 那种嵌套 dict。"""
+    try:
+        schema = json.loads((PLUGIN_DIR / "_conf_schema.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    out: dict = {}
+    for key, spec in (schema or {}).items():
+        if not isinstance(spec, dict):
+            continue
+        if spec.get("type") == "object":
+            out[key] = _schema_defaults_from(spec.get("items") or {})
+        else:
+            out[key] = spec.get("default")
+    return out
+
+
+def _schema_defaults_from(items: dict) -> dict:
+    out: dict = {}
+    for key, spec in (items or {}).items():
+        if not isinstance(spec, dict):
+            continue
+        if spec.get("type") == "object":
+            out[key] = _schema_defaults_from(spec.get("items") or {})
+        else:
+            out[key] = spec.get("default")
+    return out
+
+
 def _load_config() -> dict:
+    """配置：`config.yaml` 为主，`_conf_schema.json` 补默认值。
+
+    面板改配置改的是 AstrBot 自己那份（`_conf_schema.json` 驱动），而插件这边
+    只有 `config.yaml`。两边都读一遍，才不至于「面板里改了不生效」。
+    """
     try:
         import yaml
 
         data = yaml.safe_load((PLUGIN_DIR / "config.yaml").read_text(encoding="utf-8")) or {}
-        return data.get("backup", data) or {}
+        config = data.get("backup", data) or {}
     except Exception:
-        return {}
+        config = {}
+    merged = _schema_defaults()
+    _deep_update(merged, config)
+    return merged
+
+
+def _deep_update(base: dict, extra: dict) -> dict:
+    for key, value in (extra or {}).items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_update(base[key], value)
+        else:
+            base[key] = value
+    return base
 
 
 def _save_config(config: dict) -> bool:
@@ -179,7 +253,7 @@ class BackupPlugin(Star):
             yield result
 
     async def _cmd_now(self, event, args):
-        group_id = parse_group_arg(args[0]) if args else getattr(event, "group_id", None)
+        group_id = parse_group_arg(args[0]) if args else extract_group_id(event)
         if not group_id:
             yield event.plain_result("请在群内使用，或指定群号：/backup now 123456")
             return
@@ -195,7 +269,7 @@ class BackupPlugin(Star):
         yield event.plain_result(render_backup_list(self.db, group_id))
 
     async def _cmd_status(self, event, args):
-        group_id = parse_group_arg(args[0]) if args else getattr(event, "group_id", None)
+        group_id = parse_group_arg(args[0]) if args else extract_group_id(event)
         if not group_id:
             yield event.plain_result("请指定群号：/backup status 123456")
             return
@@ -223,11 +297,11 @@ class BackupPlugin(Star):
         if not fmt:
             yield event.plain_result("请指定导出格式：sqlite/json/csv/txt/markdown/html/zip")
             return
-        group_id = group_id or getattr(event, "group_id", None)
+        group_id = group_id or extract_group_id(event)
         if not group_id:
             yield event.plain_result("请指定群号：/backup export 123456 sqlite")
             return
-        own = getattr(event, "self_id", None) or getattr(event, "bot_id", None)
+        own = _event_self_id(event)
         try:
             result = self.exports.export_latest(group_id, fmt, own_user_id=own)
         except Exception as e:
@@ -293,6 +367,14 @@ class BackupPlugin(Star):
         )
 
     async def _cmd_verify(self, event, args):
+        """校验备份完整性。
+
+        给包的时候**不能**把记录里的 `checksum` 当期望值传下去：那个数覆盖的是
+        「这次备份新增/覆盖的消息」，而 `export latest` 的包还含只在实时归档里的
+        那部分消息，两个数天然不等。拿它去比包里 manifest 的 `checksum`，结果
+        就是自己刚导出的包被自己的校验判成「备份可能被修改」——`verify_zip` 里
+        那段注释早就写了这个道理，命令层却一直在传。
+        """
         if not args:
             yield event.plain_result("用法：/backup verify <备份ID> [备份包路径]")
             return
@@ -301,9 +383,11 @@ class BackupPlugin(Star):
             yield event.plain_result("备份 ID 不存在")
             return
         if len(args) > 1:
-            ok, reason = verify_zip(args[1], record.checksum or None)
+            ok, reason = verify_zip(args[1])
+            if ok:
+                reason += "（包与自身清单一致；群信息/成员表在恢复时才与本机留存的快照比对）"
         else:
-            ok, reason = True, "数据库记录校验和：" + (record.checksum[:16] or "（空）")
+            ok, reason = True, "本机记录校验和：" + (record.checksum[:16] or "（空）")
         yield event.plain_result(f"{'✅' if ok else '❌'} {reason}")
 
     async def _cmd_clean(self, event, args):
@@ -419,6 +503,13 @@ class BackupPlugin(Star):
         以前 `_on_notice_impl` 写好了却没人调，等于退群聚合、解散预警、离群前
         最后一次备份三个功能从来没上线过。钩子里抛错一律吞掉：备份插件不能因为
         一条通知就把机器人的消息处理链路带崩。
+
+        顺带说清楚一件事：AstrBot 把 OneBot 的 notice 事件也包成**普通消息事件**
+        投进管道（`aiocqhttp` 的 `_convert_handle_notice_event` → `handle_msg`），
+        `type` 是 `OTHER_MESSAGE`、`message_str` 为空、原始事件在
+        `message_obj.raw_message` 里。所以这个钩子和 `on_message` 收的是同一类
+        事件，靠 `raw_message.post_type` 区分——这里先判 `post_type`，不是
+        notice 就直接返回，别把正常聊天当成退群。
         """
         try:
             await self._handle_notice(event)
@@ -426,10 +517,12 @@ class BackupPlugin(Star):
             logger.error("通知处理失败: %s", type(e).__name__)
 
     async def _handle_notice(self, event):
-        payload = getattr(event, "message_obj", None) or getattr(event, "raw_message", None)
-        if payload is None:
-            payload = self._notice_payload(event)
-        if not self._notice_probe_done:
+        payload = notice_payload(event)
+        if is_message_echo(payload):
+            # 普通消息：`on_message` 已经归档过了，不能在这里再走一遍退群聚合，
+            # 否则一次普通聊天就能把「大量退群」的阈值顶满
+            return
+        if not self._notice_probe_done and payload:
             self._notice_probe_done = True
             logger.debug(self.hooks.describe_notice(payload))
         group_id, subtype, should_backup = self.hooks.handle_notice(payload, event)
@@ -444,28 +537,72 @@ class BackupPlugin(Star):
         finally:
             self._silent_backup = False
 
-    @staticmethod
-    def _notice_payload(event):
-        """把 AstrBot 的事件对象摊成 dict，供 handle_notice 认类型。
+    def _resolve_platform(self, event=None):
+        """找到能拉数据的平台对象。
 
-        只搬「结构字段」，不碰消息内容——日志和内存里都不该出现聊天记录。
+        原来写的是 `getattr(self.context, "get_platform", lambda: None)()`：
+        AstrBot 的 `Context.get_platform` 是**方法**，`getattr` 拿到的是 bound
+        method 而不是平台，那句 `if platform is None` 于是永远不成立，接下去
+        `PlatformAdapter(bound_method)` 里的每个 `_call` 都打在方法对象上、全返回
+        None——`/backup now` 只会回一句「当前没有可用的平台适配器」。
+
+        真实路径是先拿到事件所属平台的 **id**（多开同类适配器时名字会重复，
+        id 才是唯一的），再问 Context 要实例；拿不到才退回按名字/第一个。
         """
-        for holder in ("message_obj", "raw_message"):
-            inner = getattr(event, holder, None)
-            if isinstance(inner, dict):
-                return inner
-        data = {}
-        for name in ("post_type", "notice_type", "sub_type", "group_id", "user_id"):
-            value = getattr(event, name, None)
-            if value not in (None, ""):
-                data[name] = value
-        obj = getattr(event, "message_obj", None)
-        if obj is not None:
-            for name in ("post_type", "notice_type", "sub_type", "group_id", "user_id"):
-                value = getattr(obj, name, None)
-                if value not in (None, "") and name not in data:
-                    data[name] = value
-        return data
+        if event is not None:
+            # aiocqhttp 的事件自带 bot（OneBot 客户端），最直接
+            for name in ("bot", "client"):
+                candidate = getattr(event, name, None)
+                # `bot` 是 OneBot 客户端对象；有些适配器把它做成可调用对象，
+                # 那就不是我们要的客户端，跳过
+                if candidate is not None and not callable(candidate):
+                    return candidate
+            for name in ("get_platform_id", "get_platform_name"):
+                fn = getattr(event, name, None)
+                if not callable(fn):
+                    continue
+                try:
+                    key = fn()
+                except Exception:
+                    continue
+                found = self._platform_by(key, by_id=name == "get_platform_id")
+                if found is not None:
+                    return found
+        # 定时任务没有事件：库里/配置里只有一个平台时就它了
+        return self._platform_by(None, by_id=False)
+
+    def _platform_by(self, key, by_id: bool):
+        """按 id / 名字 / 「随便哪个」找平台实例。"""
+        ctx = self.context
+        for name in ("get_platform_inst",):
+            fn = getattr(ctx, name, None)
+            if by_id and callable(fn) and key:
+                try:
+                    found = fn(key)
+                except Exception:
+                    found = None
+                if found is not None:
+                    return found
+        manager = getattr(ctx, "platform_manager", None)
+        insts = list(getattr(manager, "platform_insts", []) or [])
+        if not insts:
+            fn = getattr(ctx, "get_platform", None)
+            if callable(fn) and key:
+                try:
+                    return fn(key)
+                except Exception:
+                    return None
+            return None
+        if key:
+            for inst in insts:
+                meta = inst.meta() if callable(getattr(inst, "meta", None)) else None
+                if meta is not None and str(getattr(meta, "id", "")) == str(key):
+                    return inst
+            for inst in insts:
+                meta = inst.meta() if callable(getattr(inst, "meta", None)) else None
+                if meta is not None and str(getattr(meta, "name", "")) == str(key):
+                    return inst
+        return insts[0]
 
     async def _backup(self, group_id: int, event=None):
         """统一的备份入口：优先用事件自带的平台对象，退回全局平台。
@@ -473,9 +610,7 @@ class BackupPlugin(Star):
         通知钩子触发的那次带 `_silent_backup`：触发式备份的现场往往来不及再手动
         跑一次导出，这里顺手把包做出来，且不在群里回任何话。
         """
-        platform = getattr(event, "bot", None) if event is not None else None
-        if platform is None:
-            platform = getattr(self.context, "get_platform", lambda: None)()
+        platform = self._resolve_platform(event)
         if platform is None:
             return None
         record = await self.engine.backup_group(

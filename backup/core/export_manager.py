@@ -227,6 +227,18 @@ class ExportManager:
             else:
                 path = exporter.export(ctx, target.with_suffix(exporter.extension))
 
+        if path.is_dir():
+            # json / markdown 导出的是**目录**（按日期分片）。下载路由拿到的是一
+            # 个目录：`Content-Type` 退成 octet-stream，读流时 `open(dir)` 直接
+            # `IsADirectoryError`——浏览器那边就是「下了一半什么都没有」。
+            # 用户点 `/backup export <群> json` 拿到的链接必须真能下东西，所以
+            # 目录型产物在给链接之前先打成一个 zip；目录本身留着（本地翻着方便）。
+            archived = path.with_suffix(".zip")
+            with zipfile.ZipFile(archived, "w", zipfile.ZIP_DEFLATED) as zf:
+                for file in path.rglob("*"):
+                    if file.is_file():
+                        zf.write(file, f"{path.name}/{file.relative_to(path)}")
+            path = archived
         size = path.stat().st_size if path.is_file() else sum(
             f.stat().st_size for f in path.rglob("*") if f.is_file()
         )

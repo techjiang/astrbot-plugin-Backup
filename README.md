@@ -205,15 +205,19 @@ python -m pytest -q
 python -m coverage run --source=backup/core,backup/exporters -m pytest -q && python -m coverage report
 ```
 
-覆盖率要求 ≥ 80%。`backup/main.py` 是 AstrBot 接线层，不进覆盖率统计口径。
+覆盖率要求 ≥ 80%（当前 90%，按 `backup/core` + `backup/exporters` 口径统计）。
+`backup/main.py` 是 AstrBot 接线层，用一份照真实形状写的 astrbot 替身在
+`tests/test_round20_plugin_wiring.py` 里跑到 36%——它的 bug 恰恰不在纯逻辑里。
 
 项目结构：
 
 ```
 backup/
 ├── metadata.yaml          # 插件元数据
-├── main.py                # 命令注册
+├── _conf_schema.json      # 面板配置 schema（与 config.yaml 同源）
+├── main.py                # 命令注册 + 事件钩子（唯一依赖 AstrBot 的文件）
 ├── config.yaml            # 默认配置
+├── logo.png               # 插件市场图标（AstrBot 只认 logo.png）
 ├── assets/                # SVG 品牌素材（logo / icon / banner）
 ├── core/                  # 备份、恢复、导出调度、解析、校验、调度器
 ├── exporters/             # 6 种格式导出器 + ZIP

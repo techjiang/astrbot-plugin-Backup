@@ -4,6 +4,7 @@
 这里对两种形态都做兼容，取不到就退化为 UNKNOWN，绝不抛异常打断备份。
 """
 
+import inspect
 import json
 import logging
 import time
@@ -37,6 +38,50 @@ def _get(obj: Any, key: str, default=None):
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
+
+
+def _safe_get(obj: Any, key: str, default=None):
+    """取属性，但绝不触发 property。
+
+    AstrBot 的 `File.file` 是个 property：拿到时会**同步下载文件**，异步上下文里
+    直接返回空串并打一条警告，非异步上下文里会 `run_until_complete` 卡住事件循环。
+    只是想知道「这条消息带了什么附件」而已，代价不能是下载。
+    """
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    try:
+        inspected = inspect.getattr_static(obj, key)
+    except AttributeError:
+        return default
+    if isinstance(inspected, property):
+        return default
+    return getattr(obj, key, default)
+
+
+# AstrBot 的 `ComponentType` 是 `class ComponentType(str, Enum)`。`str(ComponentType.Plain)`
+# 在 Python 3.11 上给出 `"ComponentType.Plain"`（3.12 才改成返回 value），
+# `.lower()` 之后是 `componenttype.plain`——一个永远查不到的键。
+# 于是每种真实消息段落进 `_TYPE_KEYS` 都是 None，最后走 else 分支：
+# 图片/语音/视频/文件全当文本、`media_paths` 空、`@` 和引用丢失。
+_COMPONENT_PREFIX = "componenttype."
+
+
+def _segment_type(seg: Any) -> str:
+    """消息段类型，统一成 `plain` / `image` / `at` 这种小写短名。
+
+    兼容三种形态：dict 里的 `"type": "image"`、AstrBot 的 `ComponentType` 枚举、
+    以及 `Poke` 那种把子类型拼进 type 的写法（`Poke:poke` → `poke`）。
+    """
+    raw = _safe_get(seg, "type", "") if not isinstance(seg, dict) else seg.get("type", "")
+    if raw is None:
+        return ""
+    # 枚举先取 value（str 枚举的 value 才是 `Plain`），再退回 str()
+    value = getattr(raw, "value", raw)
+    text = str(value or "").lower()
+    if text.startswith(_COMPONENT_PREFIX):
+        text = text[len(_COMPONENT_PREFIX):]
+    # `Poke:poke` / `poke:poke` 这类带子类型的，只要前半截
+    return text.split(":", 1)[0]
 
 
 def _to_datetime(value) -> datetime:
@@ -76,12 +121,24 @@ def _raw_json(obj: Any) -> str:
     `default=str` 在这条路径上是错的：平台对象变成 `"<astrbot... object at
     0x7f...>"`，看着存下来了，其实什么也没存到。退化成 `repr()` 更糟——对象
     repr 里常带大段正文，红线 1 说了消息内容不进日志/落盘。取不到就存空串。
+
+    AstrBot 传进来的是 `AstrBotMessage` 对象，本身没法直接 json 序列化；但它身上
+    的 `raw_message` 就是 OneBot 原始事件（一个 dict），那才是「保底」该存的东西。
     """
-    try:
-        return json.dumps(obj, ensure_ascii=False)
-    except (TypeError, ValueError):
-        logger.debug("原始消息无法序列化，raw_content 留空：%s", type(obj).__name__)
-        return ""
+    if isinstance(obj, dict):
+        try:
+            return json.dumps(obj, ensure_ascii=False)
+        except (TypeError, ValueError):
+            pass
+    # 平台对象：优先落它的 raw_message（可序列化、且是真正的原始事件）
+    inner = _safe_get(obj, "raw_message")
+    if isinstance(inner, dict):
+        try:
+            return json.dumps(inner, ensure_ascii=False)
+        except (TypeError, ValueError):
+            pass
+    logger.debug("原始消息无法序列化，raw_content 留空：%s", type(obj).__name__)
+    return ""
 
 
 def _segments(raw: Any) -> list:
@@ -136,46 +193,84 @@ def parse_message(raw: Any, group_id: Optional[int] = None) -> Message:
     is_forward = False
     forward_chain: list[dict] = []
 
-    for seg in _segments(raw):
-        stype = str(_get(seg, "type", "") or "").lower()
-        data = _get(seg, "data", seg) or {}
+    flat = _is_flat(raw)
+    for seg in ([] if flat else _segments(raw)):
+        stype = _segment_type(seg)
+        # 段对象自己就是数据袋（AstrBot 的 `Plain.text` / `Image.file`）；
+        # 只有 OneBot 原始 dict 才多一层 `data`
+        data = _safe_get(seg, "data", seg) if not isinstance(seg, dict) else seg.get("data", seg)
+        if not isinstance(data, dict) and data is None:
+            data = seg
         mtype = _TYPE_KEYS.get(stype)
 
         if mtype is MessageType.REPLY:
-            reply_to = _get(data, "id") or _get(data, "message_id") or reply_to
+            reply_to = (
+                _safe_get(data, "id")
+                or _safe_get(data, "message_id")
+                or _safe_get(seg, "id")
+                or reply_to
+            )
         elif mtype is MessageType.AT:
             name = _get(data, "name") or _get(data, "qq") or ""
             texts.append(f"@{name}" if name else "@")
         elif mtype is MessageType.FORWARD:
             is_forward = True
             types.append(MessageType.FORWARD)
-            chain = _get(data, "content", _get(data, "messages", [])) or []
+            chain = _safe_get(data, "content", _safe_get(data, "messages", [])) or []
+            if not chain:
+                # AstrBot 的合并转发是 `Nodes(nodes=[Node(...)])`，节点挂在 `nodes` 上
+                chain = _safe_get(seg, "nodes", []) or []
             if isinstance(chain, list):
                 forward_chain = [_forward_node(n) for n in chain]
         elif mtype in (MessageType.IMAGE, MessageType.VOICE, MessageType.VIDEO, MessageType.FILE):
             types.append(mtype)
-            url = _get(data, "url") or _get(data, "file") or _get(data, "path") or ""
+            url = _media_url(seg, data, mtype)
             if url:
-                media_paths.append(str(url))
-            label = _get(data, "name") or _get(data, "file_name")
+                media_paths.append(url)
+            label = (
+                _safe_get(data, "name")
+                or _safe_get(data, "file_name")
+                or _safe_get(seg, "name")
+                or _safe_get(seg, "file_name")
+            )
             if mtype is MessageType.FILE and label:
                 texts.append(f"[文件] {label}")
         else:
-            text = _get(data, "text") or _get(seg, "text")
+            text = _get(data, "text") or _safe_get(seg, "text")
             if text is None and not stype:
                 # 没有 type 的 dict 常见于导出后回灌（message_type/content 平铺），
                 # 也见于单段纯文本对象；取不到就算空，不要拼出整段 JSON
-                text = _get(seg, "content")
+                text = _safe_get(seg, "content")
             if text:
                 types.append(MessageType.TEXT)
                 texts.append(str(text))
 
-    if not types and flat_content and flat_type:
-        texts.append(str(flat_content))
+    if not types and flat_type:
+        # 导出器把消息摊平成一条 dict（`message_type` / `content` / `media_paths`
+        # 都在顶层），从 ZIP 包恢复走的就是这条路。原来要求 `flat_content` 非空：
+        # 纯图片、纯文件消息的 content 本来就是空的，于是整条消息退化成本地
+        # `unknown`、媒体、引用、转发链一起丢——包里的消息和包自己的校验和对不上，
+        # **自己导出的包自己恢复不了**，报的还是一句「备份可能已损坏」。
+        if flat_content:
+            texts.append(str(flat_content))
         try:
             types.append(MessageType(str(flat_type)))
         except ValueError:
             types.append(MessageType.UNKNOWN)
+        # 摊平消息里的媒体/引用/转发链也要原样接住，否则 HTML 里是断图、
+        # ZIP 里没文件，校验和还少了几项。混合消息（text+image）也走这条：
+        # 段落空了、`message_type` 是 `mixed`，媒体只在顶层那一项里
+        for item in _get(raw, "media_paths") or []:
+            text = str(item or "")
+            if text and text not in media_paths:
+                media_paths.append(text)
+        if reply_to is None:
+            reply_to = _get(raw, "reply_to") or _get(raw, "reply_id")
+        if _get(raw, "is_forward"):
+            is_forward = True
+        chain = _get(raw, "forward_chain") or []
+        if isinstance(chain, list) and chain:
+            forward_chain = chain
 
     if not types:
         # 兜底：raw 本身就是纯文本
@@ -200,7 +295,10 @@ def parse_message(raw: Any, group_id: Optional[int] = None) -> Message:
         message_type = MessageType.MIXED
     else:
         message_type = types[0]
-    if reply_to and message_type is MessageType.TEXT:
+    # 有引用的纯文本从链里解析出来时归成 REPLY。但摊平消息（导出包里那条）
+    # 已经自带权威的 message_type，不能再改：改了就成了「库里 text、包里 reply」，
+    # 校验和必然对不上，自己导出的包自己恢复不了
+    if reply_to and message_type is MessageType.TEXT and not flat:
         message_type = MessageType.REPLY
 
     return Message(
@@ -217,6 +315,46 @@ def parse_message(raw: Any, group_id: Optional[int] = None) -> Message:
         is_forward=is_forward,
         forward_chain=forward_chain,
     )
+
+
+def _is_flat(raw: Any) -> bool:
+    """这条 raw 是不是「导出器摊平的那一条」。
+
+    导出器把消息写成 `{message_type, content, media_paths, reply_to, ...}` 平铺
+    dict（见 BaseExporter.message_to_dict），从 ZIP 包恢复走的就是它。它的
+    `content` 是字符串、没有 `message`/`segments` 链，如果照普通消息段去遍历，
+    整个 dict 会被当成「一段」、`content` 被当正文捡走，于是平铺分支永远进不去：
+    媒体、引用、转发链全丢，校验和必然对不上。
+    """
+    if not isinstance(raw, dict) or "message_type" not in raw:
+        return False
+    for key in ("message", "segments", "chain"):
+        if isinstance(raw.get(key), list):
+            return False
+    return not isinstance(raw.get("content"), list)
+
+
+def _media_url(seg: Any, data: Any, mtype: MessageType) -> str:
+    """一条媒体段落里能拿来下载的地址。
+
+    只有 http(s) 才值得收：`base64://` 是 AstrBot 内部表示（已经在内存里了，
+    落盘另有其路），`file:///` 指向机器人的临时目录，备份到别的机器上必然失效。
+    AstrBot 的 `Image` / `Record` 把地址放 `url` 或 `file`，`File` 则把本地路径
+    放 `file_`、远程地址放 `url`——注意 `File.file` 是个会触发下载的 property，
+    只能走 `_safe_get`。
+    """
+    # 一律走 _safe_get：`File.file` 是会触发同步下载的 property，`_get` 会踩上去
+    candidates = [
+        _safe_get(data, "url"),
+        _safe_get(data, "file"),
+        _safe_get(data, "file_"),
+        _safe_get(data, "path"),
+    ]
+    for value in candidates:
+        text = str(value or "").strip()
+        if text.startswith(("http://", "https://")):
+            return text
+    return ""
 
 
 def _nested_texts(raw: Any, depth: int = 0, in_data: bool = False) -> list[str]:

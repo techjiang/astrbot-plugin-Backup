@@ -125,28 +125,67 @@ class Permission:
 ADMIN_ROLES = ("admin", "owner", "administrator")
 
 
+def _call_or_value(event, name):
+    """取属性；是方法就调一次。抛异常当作「没有这个信息」。
+
+    AstrBot 的 `is_private_chat()` / `is_admin()` / `get_group_id()` 都是**方法**，
+    原来用 `getattr(...)` 拿到的是一堆 bound method，`isinstance(value, bool)`
+    恒为 False——于是每一项探测都判「没有这个标记」。
+    """
+    value = getattr(event, name, None)
+    if value is None:
+        return None
+    if callable(value):
+        try:
+            return value()
+        except Exception:
+            return None
+    return value
+
+
 def _is_private_event(event) -> bool:
     """判断是不是私聊事件。
 
     只认明确的私聊标记，没有就按群聊处理——「认不出＝私聊」会让一个只实现
     is_admin() 的群聊适配器悄悄跳过权限检查，等于把门开着。
     """
-    for name in ("is_private", "is_private_chat", "is_direct"):
-        value = getattr(event, name, None)
+    for name in ("is_private_chat", "is_private", "is_direct"):
+        value = _call_or_value(event, name)
         if isinstance(value, bool):
             return value
+    # AstrBot 不给 `message_type` 这个属性，真正的类型在 `message_obj.type` 上，
+    # 取值是 `MessageType.FRIEND_MESSAGE`（枚举）。两种形态都认。
     scope = getattr(event, "message_type", None)
-    if isinstance(scope, str) and scope.lower() in ("private", "friend", "direct"):
+    if scope is None:
+        inner = getattr(event, "message_obj", None)
+        scope = getattr(inner, "type", None) if inner is not None else None
+    scope_value = getattr(scope, "value", scope)
+    if isinstance(scope_value, str) and scope_value.lower() in (
+        "private",
+        "friend",
+        "direct",
+        "friendmessage",
+    ):
         return True
-    for name in ("group_id", "group"):
-        value = getattr(event, name, None)
+    if isinstance(scope_value, str) and scope_value.lower() in (
+        "group",
+        "groupmessage",
+        "othermessage",
+    ):
+        return False
+    # 有群号就是群聊。AstrBot 的群号只从 `get_group_id()` 拿得到（返回字符串），
+    # 私聊时是空串；`event.group_id` 这个属性根本不存在。
+    for name in ("get_group_id", "group_id", "group"):
+        value = _call_or_value(event, name)
         if isinstance(value, int) and value > 0:
             return False
-        if isinstance(value, str) and value.isdigit() and int(value) > 0:
+        if isinstance(value, str) and value.strip().isdigit() and int(value) > 0:
             return False
     inner = getattr(event, "message_obj", None)
-    gid = getattr(inner, "group_id", None) if inner is not None else None
+    gid = _call_or_value(inner, "group_id") if inner is not None else None
     if isinstance(gid, int) and gid > 0:
+        return False
+    if isinstance(gid, str) and gid.strip().isdigit() and int(gid) > 0:
         return False
     # 没有任何私聊标记，也没有群号：按群聊处理，走进正常的角色检查
     return False
@@ -172,17 +211,12 @@ class PermissionChecker:
             return Permission(True)
         if not self.require_admin:
             return Permission(True)
+        # AstrBot 的 `is_admin()` 是**方法**：原来只判 `isinstance(value, bool)`，
+        # 拿到 bound method 恒判否，管理员发命令也被一句「仅群主或管理员」挡回去。
+        # 返回 False 也要继续看角色字段：有的适配器只填 role 不填这几个。
         for name in ("is_admin", "is_group_admin", "is_owner"):
-            value = getattr(event, name, None)
-            if callable(value):
-                try:
-                    if value():
-                        return Permission(True)
-                except Exception:
-                    continue
-            elif isinstance(value, bool) and value:
+            if _call_or_value(event, name) is True:
                 return Permission(True)
-                # 布尔属性为 False 也要继续看角色：有的适配器只填 role 不填这几个
         if self._role_is_admin(event):
             return Permission(True)
         return Permission(False, "仅群主或管理员可执行备份操作")

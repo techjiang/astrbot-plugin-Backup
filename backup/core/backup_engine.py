@@ -1,6 +1,7 @@
 """备份引擎。一次备份 = 一次完整的数据快照（全量或增量）。"""
 
 import asyncio
+import inspect
 import json
 import logging
 import mimetypes
@@ -38,14 +39,92 @@ def _raw_id(raw) -> str:
     return str(value) if value else repr(raw)[:512]
 
 
-class PlatformAdapter:
-    """把 AstrBot 平台对象适配成备份引擎要的四个方法。
+def _oldest_id(batch: list) -> str:
+    """一页消息里最旧那条的 ID，用来当下一页的翻页锚点。"""
+    if not batch:
+        return ""
+    first = batch[0]
+    ts = getattr(first, "timestamp", None) if not isinstance(first, dict) else first.get("timestamp")
+    try:
+        numeric = float(ts)
+    except (TypeError, ValueError):
+        numeric = None
+    if numeric is None:
+        return _raw_id(first)
+    oldest = first
+    for raw in batch[1:]:
+        other = getattr(raw, "timestamp", None) if not isinstance(raw, dict) else raw.get("timestamp")
+        try:
+            value = float(other)
+        except (TypeError, ValueError):
+            continue
+        if value < numeric:
+            numeric, oldest = value, raw
+    return _raw_id(oldest)
 
-    平台 API 名字因适配器而异，这里做多名字兜底，取不到就让上层明确失败。
+
+class PlatformAdapter:
+    """把 AstrBot 平台对象适配成备份引擎要的几个方法。
+
+    真实的 AstrBot 适配器（以 aiocqhttp 为例）并不直接提供
+    `get_group_history` / `get_group_members` 这些方法：它只做「收消息、转成事件」，
+    拉数据要靠 OneBot API，而 OneBot 客户端对象的 `__getattr__` 会把任意属性名变成
+    `functools.partial(call_action, 名字)`。于是 `getattr(bot, "get_group_info")`
+    看起来是个可调用对象、调下去也真的会发请求——这一类「长得像」的接口最容易
+    骗过探测式代码，所以这里分三层取：
+
+    1. 事件/适配器自己实现了同名方法 → 直接用；
+    2. 找到客户端（`get_client()` / `bot` / `api`）→ 走 OneBot `call_action`；
+    3. 都没有 → 返回 None，由上层明确降级，而不是假装成功。
+
+    `get_group_history` 还要额外承担一件事：**把 OneBot 的 message_seq 翻页
+    翻译成引擎认的「一页 count 条」**。OneBot 的 `get_group_msg_history` 只认
+    「从哪条开始」，不认 offset；不翻译的话引擎第二次翻页拿到的是同一批
+    最新消息，去重兜底立刻判定「分页到头」，于是每个群只备份最新的一页，
+    状态还写 `completed`。
     """
+
+    # 内部补齐一页的最多轮次：平台一次给不满 count 时继续往前要，
+    # 上限防止平台永远只回固定几条时死循环
+    MAX_FILL_ROUNDS = 10
 
     def __init__(self, platform):
         self.platform = platform
+        self._anchor: dict[int, str] = {}
+
+    def _client(self):
+        """真正的 OneBot/aiohttp 客户端对象，取不到就退回平台对象本身。
+
+        注意 `CQHttp` 的 `__getattr__` 把**任何**属性名都变成
+        `functools.partial(call_action, 名字)`：拿它当「有没有这个方法」的证据，
+        连 `bot` / `api` 这种探测都会变成一次真实的 OneBot API 调用（名字还不
+        存在），日志里多出一堆看不懂的失败，探测本身也不再是免费的。所以先认
+        「它自己就是客户端」——有 `call_action` 的那个。
+        """
+        platform = self.platform
+        if callable(getattr(platform, "call_action", None)):
+            return platform
+        fn = getattr(platform, "get_client", None)
+        if callable(fn):
+            try:
+                client = fn()
+            except Exception:
+                client = None
+            if client is not None:
+                return client
+        for name in ("bot", "api", "client"):
+            if isinstance(platform, dict):
+                candidate = platform.get(name)
+            else:
+                # 绕开 `__getattr__` 造出来的假属性：只认对象上真有的
+                try:
+                    inspected = inspect.getattr_static(platform, name)
+                except AttributeError:
+                    continue
+                candidate = getattr(platform, name, None) if not isinstance(inspected, property) else None
+            if candidate is not None and not isinstance(candidate, type(lambda: 0)):
+                return candidate
+        return platform
 
     async def _call(self, names, *args, **kwargs):
         """按名字顺序试，逐个真的调一次。
@@ -56,37 +135,66 @@ class PlatformAdapter:
         一次都没成功过。签名不匹配就换下一个名字，全都不行才返回 None。
         """
         last_error: Optional[Exception] = None
-        for name in names:
-            fn = getattr(self.platform, name, None)
-            if not callable(fn):
-                continue
-            try:
-                result = fn(*args, **kwargs)
-            except TypeError as e:
-                last_error = e
-                continue
-            if asyncio.iscoroutine(result):
-                result = await result
-            return result
+        client = self._client()
+        targets = [self.platform]
+        if client is not None and client is not self.platform:
+            targets.append(client)
+        for target in targets:
+            for name in names:
+                fn = getattr(target, name, None)
+                if not callable(fn):
+                    continue
+                try:
+                    result = fn(*args, **kwargs)
+                except TypeError as e:
+                    last_error = e
+                    continue
+                except Exception as e:
+                    # ActionFailed / 网络错误：这不是「签名不对」，是平台真的拒绝
+                    # 或失败了。继续试下一个名字没有意义，直接交给上层降级
+                    logger.debug("平台接口 %s 调用失败: %s", name, type(e).__name__)
+                    return None
+                if asyncio.iscoroutine(result):
+                    result = await result
+                return result
         if last_error is not None:
             logger.debug("平台接口签名不匹配 %s: %s", ",".join(names), last_error)
         return None
 
+    async def _action(self, action: str, **params):
+        """直接发一个 OneBot action。客户端不支持时返回 None。"""
+        client = self._client()
+        fn = getattr(client, "call_action", None)
+        if not callable(fn):
+            return None
+        try:
+            result = fn(action=action, **params)
+            if asyncio.iscoroutine(result):
+                result = await result
+        except Exception as e:
+            logger.debug("OneBot action %s 失败: %s", action, type(e).__name__)
+            return None
+        return result
+
     async def get_group_info(self, group_id: int):
-        return await self._call(
-            ("get_group_info", "get_group", "call_action"),
-            group_id=group_id,
-        ) or {"group_id": group_id}
+        result = await self._call(
+            ("get_group_info", "get_group"), group_id=group_id
+        )
+        if result is None:
+            result = await self._action("get_group_info", group_id=group_id)
+        return result or {"group_id": group_id}
 
     async def get_group_members(self, group_id: int) -> list:
         result = await self._call(
             ("get_group_member_list", "get_group_members", "get_members"), group_id=group_id
         )
+        if result is None:
+            result = await self._action("get_group_member_list", group_id=group_id)
         return result or []
 
     async def get_group_announcements(self, group_id: int) -> list:
-        """群公告。适配器多半叫 _get_group_notice，取不到就返回空表。"""
-        return await self._call(
+        """群公告。OneBot 里叫 `_get_group_notice`（Lagrange/NapCat）或 `get_group_notice`。"""
+        result = await self._call(
             (
                 "get_group_notice",
                 "get_group_notices",
@@ -94,27 +202,104 @@ class PlatformAdapter:
                 "_get_group_notice",
             ),
             group_id=group_id,
-        ) or []
+        )
+        if result is None:
+            result = await self._action("_get_group_notice", group_id=group_id)
+        return result or []
 
     async def get_group_files(self, group_id: int) -> list:
         result = await self._call(
             ("get_group_files", "get_group_file_list", "get_files", "_get_group_files"),
             group_id=group_id,
         )
+        if result is None:
+            # OneBot v11 的标准名字是两个：root 与文件夹内两种
+            result = await self._action("get_group_root_files", group_id=group_id)
         return result or []
 
     async def get_group_history(
         self, group_id: int, count: int = PAGE_SIZE, offset: int = 0
     ) -> list:
+        """取一页历史消息，**保证尽量给满 `count` 条**。
+
+        `offset == 0` 表示从头开始（引擎每一轮备份都从 0 起），顺便重置锚点。
+        OneBot 只认 `message_seq`（从哪条开始往回翻），于是这里自己维护「上一页
+        最旧那条」当锚点，并反复补齐——引擎是按「本页不足半页就收工」判到尾的，
+        一次只给 20 条的平台会让它备份 20 条就报成功。
+        """
+        # 有 offset 语义的实现（适配器自己写的方法、测试替身）就照旧按 offset 翻页：
+        # 引擎那套「连续两页都是翻过的才收工」的判定本来就是为它写的
+        if self._supports("offset"):
+            return await self._fetch_page(group_id, count, offset, None)
+
+        if offset == 0:
+            self._anchor.pop(group_id, None)
+        collected: list = []
+        seen: set[str] = set()
+        anchor = self._anchor.get(group_id)
+        for _ in range(self.MAX_FILL_ROUNDS):
+            want = max(count - len(collected), 1)
+            page = await self._fetch_page(group_id, want, offset, anchor)
+            if not page:
+                break
+            fresh = [raw for raw in page if _raw_id(raw) not in seen]
+            if not fresh:
+                break  # 平台不认锚点，原地打转
+            for raw in fresh:
+                seen.add(_raw_id(raw))
+                collected.append(raw)
+            oldest = _oldest_id(page)
+            if not oldest or oldest == anchor:
+                break  # 翻不动了，锚点没推进
+            anchor = oldest
+            self._anchor[group_id] = anchor
+            if len(collected) >= count:
+                break
+        # 不能截断到 count：补齐时最后那一轮往往整页吐回来，截掉的几条（比如
+        # 补到 60 条只留 50）锚点已经推过去了，之后就再也翻不回来——群里那一
+        # 小段消息永久丢失，而备份报 completed。宁可这一页多给几条，让调用方
+        # 自己按条数判断，也不能把已拿到的消息扔掉
+        return collected
+
+    def _supports(self, param: str) -> bool:
+        """平台的历史消息接口接不接受这个参数名。
+
+        只看**显式声明**的参数：`**kwargs` 什么都不算——OneBot 客户端靠
+        `__getattr__` 造方法，签名永远是 `(*args, **kwargs)`，它并不认 offset。
+        """
+        for target in (self.platform, self._client()):
+            if target is None:
+                continue
+            for name in ("get_group_msg_history", "get_group_history", "get_history"):
+                fn = getattr(target, name, None)
+                if not callable(fn):
+                    continue
+                try:
+                    sig = inspect.signature(fn)
+                except (TypeError, ValueError):
+                    continue
+                if param in sig.parameters:
+                    return True
+        return False
+
+    async def _fetch_page(
+        self, group_id: int, count: int, offset: int, anchor: Optional[str]
+    ) -> list:
+        """发一次历史消息请求。"""
+        params = {"group_id": group_id, "count": count}
+        if anchor:
+            params["message_seq"] = anchor
+        else:
+            params["offset"] = offset
+        # 适配器自己实现的（有 offset 语义）优先
         result = await self._call(
-            ("get_group_msg_history", "get_group_history", "get_history"),
-            group_id=group_id,
-            count=count,
-            offset=offset,
+            ("get_group_msg_history", "get_group_history", "get_history"), **params
         )
+        if result is None:
+            result = await self._action("get_group_msg_history", **params)
         if isinstance(result, dict):
             result = result.get("messages") or result.get("data") or []
-        return result or []
+        return list(result or [])
 
 
 class BackupEngine:
