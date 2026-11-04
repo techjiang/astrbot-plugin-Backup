@@ -392,6 +392,8 @@ class ExportManager:
             return 0
         """删过期 token 与过期导出文件。返回删除数量。"""
         now = time.time()
+        # token 按真实时间过期。原先传的是「文件 mtime 的截止刻」，比 now 小一个
+        # 保留期，于是 `expires < cutoff` 恒不成立，过期 token 一条也清不掉。
         removed = self.db.purge_expired_tokens(now)
         cutoff = now - max_age_days * 86400
         for f in self.export_dir.iterdir():

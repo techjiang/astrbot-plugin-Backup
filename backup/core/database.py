@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Optional
@@ -425,6 +426,7 @@ class Database:
         backup_id 记最后一次归档它的那次备份。否则全量重跑、重试、恢复都会留下
         重复行，导出和聊天记录里就会出现同一条消息好几遍。
         """
+
         existed = self.query_one(
             "SELECT 1 FROM messages WHERE message_id = ? AND group_id = ? LIMIT 1",
             (msg.message_id, msg.group_id),
@@ -436,9 +438,37 @@ class Database:
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(message_id, group_id) DO UPDATE SET
                  backup_id = excluded.backup_id,
+                 -- 媒体路径取并集。实时归档（backup_id='realtime'）刻意不下载媒体，
+                 -- 它写进来时 media_paths 是空的；直接覆盖会把上一次完整备份存下的
+                 -- 图片/语音路径洗成 []，从此那条消息导出不带媒体、也下载不了——
+                 -- 而实时归档的初衷恰恰是「群被炸时别丢东西」。反过来，同一份完整
+                 -- 备份重跑时解析少了一两个附件，也不该把它们从库里抹掉。
                  media_paths = CASE
-                   WHEN excluded.media_paths IN ('[]', '') THEN messages.media_paths
-                   ELSE excluded.media_paths
+                   WHEN excluded.media_paths IN ('[]', '', 'null') THEN messages.media_paths
+                   WHEN messages.media_paths IN ('[]', '', 'null') THEN excluded.media_paths
+                   WHEN json_extract(messages.media_paths, '$') IS NULL
+                     THEN excluded.media_paths
+                   ELSE CASE
+                     WHEN EXISTS (
+                       SELECT 1 FROM json_each(messages.media_paths) old
+                       WHERE NOT EXISTS (
+                         SELECT 1 FROM json_each(excluded.media_paths) new
+                         WHERE new.value = old.value
+                       )
+                     ) THEN (
+                       SELECT json_group_array(value) FROM (
+                         SELECT value FROM json_each(messages.media_paths)
+                         UNION
+                         SELECT value FROM json_each(excluded.media_paths)
+                       )
+                     )
+                     ELSE excluded.media_paths
+                   END
+                 END,
+                 -- 发送者名字同理：解析不出昵称时不要用空串盖掉已知的名字
+                 sender_name = CASE
+                   WHEN excluded.sender_name IN ('', 'null') THEN messages.sender_name
+                   ELSE excluded.sender_name
                  END""",
             (
                 msg.message_id,
@@ -554,13 +584,16 @@ class Database:
         来源清单里了。老写法按归属数，于是一次全量备份跑完，`/backup status`
         还在说「其中实时归档 N 条（还没被任何一次备份接手）」——永远不消失。
         """
+        # 判据是「有没有落在**别的**备份的清单里」。只写「清单里没有它」就成了
+        # `REALTIME_BACKUP_ID` 与 `REALTIME_BACKUP_ID` 相消的死条件，这个数恒为 0
         sql = """SELECT COUNT(*) AS c FROM messages m
                  WHERE m.group_id = ? AND m.backup_id = ?
                    AND NOT EXISTS (
                      SELECT 1 FROM backup_sources s
                      WHERE s.message_id = m.message_id AND s.group_id = m.group_id
+                       AND s.backup_id <> ?
                  )"""
-        params: list = [group_id, REALTIME_BACKUP_ID]
+        params: list = [group_id, REALTIME_BACKUP_ID, REALTIME_BACKUP_ID]
         if backup_id:
             sql += " AND 0 = 1"  # 保留接口形状：指定备份时不重复计入
         row = self.query_one(sql, params)
@@ -1028,6 +1061,11 @@ class Database:
         # 消息、再拿一条不存在的记录去比对，报出来的是一句看不懂的话。
         # 淘汰记录不动消息，别的备份对同一条消息的登记也不动——只删这一份的。
         self.execute("DELETE FROM backup_sources WHERE backup_id = ?", (backup_id,))
+        # 快照和导出证据同属这条记录。以前只删 records/sources，bundle 和
+        # export_evidence 留在库里；等某次导出复用到同一个 backup_id 时，恢复端会
+        # 拿上一世代留下的证据去比对，正常包也能被判成「被改过」。
+        self.execute("DELETE FROM backup_bundle WHERE backup_id = ?", (backup_id,))
+        self.execute("DELETE FROM export_evidence WHERE backup_id = ?", (backup_id,))
         self.execute("DELETE FROM backup_records WHERE backup_id = ?", (backup_id,))
 
     # ---------- 群信息 / 成员 ----------
@@ -1177,6 +1215,7 @@ class Database:
             # 交给 `adopt_orphans` 在下一次备份时收编
             self.execute("DELETE FROM backup_sources WHERE backup_id = ?", (backup_id,))
             self.execute("DELETE FROM backup_bundle WHERE backup_id = ?", (backup_id,))
+            self.execute("DELETE FROM export_evidence WHERE backup_id = ?", (backup_id,))
             removed += 1
         return removed
 
@@ -1376,6 +1415,14 @@ class Database:
     def delete_token(self, token: str) -> None:
         self.execute("DELETE FROM download_tokens WHERE token = ?", (token,))
 
-    def purge_expired_tokens(self, now: float) -> int:
-        cur = self.execute("DELETE FROM download_tokens WHERE expires < ?", (now,))
+    def purge_expired_tokens(self, now: float) -> Optional[int]:
+        """清掉过期 token。`now` 给 None 表示按真实时间。
+
+        原来调用方传的是「文件 mtime 的截止刻」——`time.time() - keep_days*86400`，
+        比 `time.time()` 小整整一个保留期。于是 `expires < cutoff` 永远不成立，
+        过期 token 从来没被清过，`download_tokens` 只会越攒越多。
+        """
+        cur = self.execute(
+            "DELETE FROM download_tokens WHERE expires < ?", (time.time() if now is None else now,)
+        )
         return cur.rowcount if cur else 0

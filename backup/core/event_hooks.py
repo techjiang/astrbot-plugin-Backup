@@ -172,10 +172,16 @@ class EventHooks:
         msg = parse_event_message(event, group_id)
         if msg is None:
             return None
-        if self.db.message_exists(msg.message_id, group_id):
-            return None
+        existed = self.db.message_exists(msg.message_id, group_id)
+        # 已在库的消息也要再写一次：同一条消息被投递两次时，第二次解析出的媒体路径
+        # 和昵称不该因为「库里有了」就丢掉（`save_message` 的更新分支只取并集，
+        # 不会覆盖内容）。只是不再返回，调用方拿到的「新归档」必须真的是新的。
         self.db.save_message(msg, backup_id)
-        return msg
+        if not existed:
+            # 新消息才有「从没覆盖过」这回事。已在库的不登记：那份备份早就登记过，
+            # 重复登记只会让清单无谓变大
+            self.db.add_sources(backup_id, [msg])
+        return None if existed else msg
 
     async def archive_with_media(self, event, downloader=None, backup_id: str = "realtime"):
         """实时归档 + 顺带补下载媒体。

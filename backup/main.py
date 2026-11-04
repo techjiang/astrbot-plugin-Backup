@@ -19,6 +19,7 @@ from .core.commands import (
     human_size,
     parse_group_arg,
     render_backup_list,
+    render_backup_result,
     render_diff,
     render_status,
 )
@@ -112,6 +113,9 @@ class BackupPlugin(Star):
         )
         self._notice_probe_done = False
         self._event_probe_done = False
+        # 通知钩子里触发的那次「最后备份」不回话：群解散/被踢的现场，回复既发不出去
+        # （群没了），也可能把被踢这件事再暴露给在场的人。手动 `/backup` 才回话
+        self._silent_backup = False
         self.scheduler.restore_jobs()
         if self.config.get("retention", {}).get("auto_clean"):
             self.exports.clean_exports(
@@ -173,13 +177,7 @@ class BackupPlugin(Star):
         if record is None:
             yield event.plain_result("❌ 当前没有可用的平台适配器，无法拉取历史消息")
             return
-        state = {"完成": "✅", "partial": "⚠️", "failed": "❌"}.get(record.status.value, "•")
-        yield event.plain_result(
-            f"{state} 备份 {'增量' if record.is_incremental else '全量'}结束\n"
-            f"消息 {record.message_count} 条 · 媒体 {record.media_count} 个 · "
-            f"{human_size(record.total_size)}\n备份 ID：`{record.backup_id}`"
-            + (f"\n备注：{record.error}" if record.error else "")
-        )
+        yield event.plain_result(render_backup_result(record))
 
     async def _cmd_list(self, event, args):
         group_id = parse_group_arg(args[0]) if args else None
@@ -410,10 +408,13 @@ class BackupPlugin(Star):
         if group_id is None or not should_backup:
             return
         logger.warning("群 %s 事件 %s，触发备份", group_id, subtype or "unknown")
+        self._silent_backup = True
         try:
             await self._backup(group_id, event)
         except Exception as e:
             logger.error("触发式备份失败 group=%s: %s", group_id, type(e).__name__)
+        finally:
+            self._silent_backup = False
 
     @staticmethod
     def _notice_payload(event):
@@ -439,18 +440,31 @@ class BackupPlugin(Star):
         return data
 
     async def _backup(self, group_id: int, event=None):
-        """统一的备份入口：优先用事件自带的平台对象，退回全局平台。"""
+        """统一的备份入口：优先用事件自带的平台对象，退回全局平台。
+
+        通知钩子触发的那次带 `_silent_backup`：触发式备份的现场往往来不及再手动
+        跑一次导出，这里顺手把包做出来，且不在群里回任何话。
+        """
         platform = getattr(event, "bot", None) if event is not None else None
         if platform is None:
             platform = getattr(self.context, "get_platform", lambda: None)()
         if platform is None:
             return None
-        return await self.engine.backup_group(
+        record = await self.engine.backup_group(
             group_id,
             platform,
             incremental=(self.config.get("incremental") or {}).get("enabled", True),
             download_media=(self.config.get("scope") or {}).get("download_media", True),
         )
+        if self._silent_backup:
+            try:
+                self.exports.export_latest(
+                    group_id,
+                    (self.config.get("export") or {}).get("default_format", "zip"),
+                )
+            except Exception as e:  # 导出失败不能反过来说备份失败
+                logger.warning("触发式备份后导出失败 group=%s: %s", group_id, type(e).__name__)
+        return record
 
     # ---------- 下载路由 ----------
     def handle_download_request(self, path: str):

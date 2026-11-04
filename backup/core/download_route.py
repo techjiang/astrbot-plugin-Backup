@@ -97,9 +97,19 @@ def handle_download(path: str, exports, range_header: Optional[str] = None) -> D
     链接是分享给群成员点的，浏览器下载大文件时常常先发一个 Range 探测、再续传，
     所以这里必须回 206：回不了续传，用户拿到的是断掉的半个 ZIP。
     """
-    if not path or not path.startswith(PREFIX):
+    if not path:
         return _error(404, "not found")
-    token = path[len(PREFIX):].split("?", 1)[0].split("/", 1)[0].strip()
+    # 宿主注册路由时一般会把前缀吃掉，传进来的可能只是 `/download/<token>`。
+    # 只认完整前缀的话，这种接法一律 404——而 404 和「链接过期」在用户眼里是
+    # 同一个意思：都下不了。两种认法都接住，其余路径照旧 404，别把无关请求
+    # 也当成本插件的一条链接（那会变成 410「已失效」，把人误导到别处去）。
+    target_path = path.split("?", 1)[0]
+    token = ""
+    for prefix in (PREFIX, "/download/"):
+        if target_path.startswith(prefix):
+            token = target_path[len(prefix):]
+            break
+    token = token.split("/", 1)[0].strip()
     if not token:
         return _error(404, "not found")
 

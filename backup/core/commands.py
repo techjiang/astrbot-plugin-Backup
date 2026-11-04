@@ -220,6 +220,24 @@ def format_record_line(record) -> str:
     )
 
 
+def render_backup_result(record) -> str:
+    """一次备份的回执。
+
+    纯函数：手动命令才把它发给群里，触发式备份（退群/解散/被踢）不回话——
+    那时候回执要么发不出去，要么等于把事故现场再点一次。
+    """
+    state = {"completed": "✅", "partial": "⚠️", "failed": "❌"}.get(record.status.value, "•")
+    lines = [
+        f"{state} 备份 {'增量' if record.is_incremental else '全量'}结束",
+        f"消息 {record.message_count} 条（新 {record.new_count} 条） · "
+        f"媒体 {record.media_count} 个 · {human_size(record.total_size)}",
+        f"备份 ID：`{record.backup_id}`",
+    ]
+    if record.error:
+        lines.append(f"备注：{record.error}")
+    return "\n".join(lines)
+
+
 def render_backup_list(db: Database, group_id: Optional[int] = None, limit: int = 10) -> str:
     """`group_id` 为空时列全部备份，每条带上群号。
 

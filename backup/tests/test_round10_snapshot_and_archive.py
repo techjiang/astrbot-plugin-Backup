@@ -217,6 +217,11 @@ class TestStatusCounts:
         history = _raw(3)
         for raw in history:
             hooks.archive_message({"group_id": 100, "message_obj": raw})
+        # 实时归档自己也要登记来源：`count_realtime_only` 问的是「有没有被任何一份
+        # 备份覆盖过」，实时归档就是一份备份。不登记的话，一个开着实时归档、还没
+        # 跑过定时备份的群，`/backup status` 会一边说「其中实时归档 3 条（还没被
+        # 任何一次备份接手）」，一边又说没有完成过备份——同一句话自相矛盾。
+        assert db.count_sources("realtime") == 3
         assert db.count_realtime_only(100) == 3
 
         await engine.backup_group(100, Plat(history), download_media=False)
