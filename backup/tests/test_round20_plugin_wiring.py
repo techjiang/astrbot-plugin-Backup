@@ -6,6 +6,7 @@
 实例化，跑通「事件进来 → 归档 → 命令回话」的主线。
 """
 
+import asyncio
 import sys
 import types
 from datetime import datetime, timedelta
@@ -317,3 +318,38 @@ def test_plugin_ships_marketplace_logo():
     head = logo.read_bytes()[:8]
     assert head == b"\x89PNG\r\n\x1a\n"
     assert (root / "assets" / "logo.svg").is_file()
+
+
+def test_download_view_accepts_query_token(plugin, tmp_path):
+    """面板路由只能注册固定路径，token 走 query。"""
+    from backup.core.download_route import make_view
+
+    for i in range(2):
+        from .conftest import make_message
+
+        plugin.db.save_message(make_message(i), "bk1")
+    result = plugin.exports.export(100, "zip", backup_id="bk1")
+    view = make_view(plugin.exports)
+
+    class Request:
+        args = {"token": result.token}
+        path = "/api/plug/backup/download"
+        headers = {}
+
+    response = asyncio.run(view(Request()))
+    assert response.status == 200
+    assert response.headers["Content-Type"] == "application/zip"
+
+
+def test_register_download_api_is_optional(plugin):
+    """宿主没有 register_web_api 时不能抛异常——注册不上不影响备份本身。"""
+
+    class NoRegistrar:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, item):
+            return getattr(self._inner, item)
+
+    plugin.context = NoRegistrar(plugin.context)
+    assert plugin.register_download_api() is False

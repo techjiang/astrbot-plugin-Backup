@@ -603,6 +603,18 @@ zip，目录本身留着（本地翻着方便）。
 还有一处：链解析出「文本 + 引用」会归成 `REPLY`，但摊平消息自带权威的 `message_type`，
 不能再改——改了就成了「库里 `text`、包里 `reply`」，校验和必然对不上。
 
+**下载链接为什么给不到群成员**
+AstrBot 4.14 的插件自定义路由有两处硬约束（`dashboard/server.py`）：
+`srv_plug_route` 用 `route == f"/{subpath}"` **精确匹配**，注册不上路径参数
+（`/backup/download/<token>` 这种只能是固定路径）；`/api/plug/*` 又不在
+`auth_middleware` 的白名单里，一律要面板 JWT。所以「把链接发给群成员、他点开就能下」
+在 4.14 上做不到——这是接口限制，不是配置能绕过的。
+
+能做的两件事：`register_download_api()` 注册一条固定路径 + query 里的 token，供管理员在
+面板里下载；要真的发给群成员，得把 `export.base_url` 指到自己的小网关，由网关调
+`handle_download_request` 兑换 token。这段说明写在代码注释里，免得下次又当成「忘了接线」
+去查一遍。
+
 **插件市场的两个缺口**
 AstrBot 只认 `logo.png` 当插件图标（`logo_fname = "logo.png"`），只有 SVG 就是空白方块；
 配置面板靠 `_conf_schema.json` 渲染，只有 `config.yaml` 的话面板里什么都看不到。都补上了，

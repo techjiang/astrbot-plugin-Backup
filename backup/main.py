@@ -25,7 +25,7 @@ from .core.commands import (
     render_status,
 )
 from .core.database import Database
-from .core.download_route import handle_download
+from .core.download_route import handle_download, make_view
 from .core.export_manager import ExportManager
 from .exporters import SUPPORTED_FORMATS
 from .core.auto_trigger import AutoTrigger
@@ -202,6 +202,8 @@ class BackupPlugin(Star):
         # （群没了），也可能把被踢这件事再暴露给在场的人。手动 `/backup` 才回话
         self._silent_backup = False
         self.scheduler.restore_jobs()
+        # 面板里能点开下载链接（群成员直接点需要自己的网关，见 register_download_api）
+        self.register_download_api()
         if self.config.get("retention", {}).get("auto_clean"):
             self.exports.clean_exports(
                 int(self.config.get("retention", {}).get("keep_days", 90))
@@ -633,6 +635,38 @@ class BackupPlugin(Star):
     def handle_download_request(self, path: str):
         """给宿主的路由/静态服务调用：token 兑换成文件流。"""
         return handle_download(path, self.exports)
+
+    def register_download_api(self) -> bool:
+        """向宿主注册一条固定路径的下载 API。
+
+        局限（AstrBot 4.14 的接口限制，不是 bug）：
+
+        - `srv_plug_route` 按 `route == "/{subpath}"` 精确匹配，注册不上路径参数，
+          所以只能是一个固定路径 + query 里的 token；
+        - `/api/plug/*` 需要面板 JWT，所以这条链接只适合管理员在面板里点，
+          不适合直接发给群成员。
+
+        要真的把链接给群成员用，得把 `export.base_url` 指到自己的小网关，由网关
+        调 `handle_download_request` 兑换 token。这段注释留在代码里，免得下次又
+        把它当成「忘了接线」去查。
+        """
+        registrar = getattr(self.context, "register_web_api", None)
+        if not callable(registrar):
+            logger.debug("宿主没有 register_web_api，下载链接需要自己的网关来消费 token")
+            return False
+        view = make_view(self.exports)
+        try:
+            registrar(
+                "/backup/download",
+                view,
+                ["GET"],
+                "Backup 导出文件下载（需 token）",
+            )
+        except Exception as e:  # 宿主版本差异，注册不上不影响备份本身
+            logger.warning("下载路由注册失败：%s", type(e).__name__)
+            return False
+        logger.info("下载路由已注册：/api/plug/backup/download?token=<token>")
+        return True
 
     async def terminate(self):
         self.scheduler.shutdown()

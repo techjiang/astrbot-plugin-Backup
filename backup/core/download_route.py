@@ -147,3 +147,49 @@ def handle_download(path: str, exports, range_header: Optional[str] = None) -> D
 
 def expires_header(expires_at: datetime) -> dict:
     return {"X-Expires-At": expires_at.isoformat(timespec="seconds")}
+
+
+def make_view(exports, range_header_getter=None):
+    """把 `handle_download` 包成宿主能直接注册的视图函数。
+
+    AstrBot 4.14 的插件自定义路由有两处硬约束，都在 `dashboard/server.py` 里：
+
+    - `srv_plug_route` 用 `route == f"/{subpath}"` **精确匹配**，路径参数
+      （`/backup/download/<token>`）注册不上，只能是固定路径；
+    - `/api/plug/*` 不在 `auth_middleware` 白名单里，一律要 JWT。
+
+    所以「把链接发给群成员、他点开就能下」在 4.14 上做不到——除非把
+    `export.base_url` 指到一个自己做的小网关，让网关来消费 token。这条限制是
+    接口的，不是配置能绕过的，写在这里免得下次又当成 bug 去查。
+
+    给管理员在面板里下载是可行的：`register_download_api(context, exports)`
+    注册一条固定路径，token 走 query。
+    """
+    full_prefix = PREFIX
+    short_prefix = "/download/"
+
+    async def view(request=None, *args, **kwargs):
+        path = ""
+        token = ""
+        if request is not None:
+            getter = getattr(request, "args", None)
+            if getter is not None:
+                token = str(getter.get("token") or "")
+            path = str(getattr(request, "path", "") or "")
+            header = None
+            headers = getattr(request, "headers", None)
+            if headers is not None:
+                header = headers.get("Range")
+        else:
+            path = str(kwargs.get("path") or "")
+            header = kwargs.get("range_header")
+        if token:
+            # query 里的 token 优先：注册的是固定路径（`/api/plug/backup/download`），
+            # 那条 path 本身不含 token
+            path = f"{full_prefix}{token}"
+        response = handle_download(path, exports, header)
+        return response
+
+    view.full_prefix = full_prefix  # type: ignore[attr-defined]
+    view.short_prefix = short_prefix  # type: ignore[attr-defined]
+    return view
