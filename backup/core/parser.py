@@ -300,6 +300,8 @@ def parse_group_members(raw_members: Any, group_id: int) -> list:
     from .models import GroupMember
 
     members = []
+    # 消息 ID 里的群号只是兜底：成员条目常带自己的 group_id，但它可能是 0
+    fallback = _group_or({"group_id": group_id}, group_id)
     for m in raw_members or []:
         uid = _get(m, "user_id", _get(m, "uin", _get(m, "qq")))
         if uid is None:
@@ -307,7 +309,7 @@ def parse_group_members(raw_members: Any, group_id: int) -> list:
         members.append(
             GroupMember(
                 user_id=int(uid),
-                group_id=group_id,
+                group_id=fallback,
                 nickname=str(_get(m, "nickname", "") or ""),
                 card=str(_get(m, "card", _get(m, "remark", "")) or ""),
                 role=str(_get(m, "role", "member") or "member"),
@@ -325,7 +327,7 @@ def parse_group_info(raw: Any, group_id: int):
     from .models import GroupInfo
 
     return GroupInfo(
-        group_id=int(_get(raw, "group_id", group_id) or group_id),
+        group_id=_group_or(raw, group_id),
         group_name=str(_get(raw, "group_name", _get(raw, "name", "")) or ""),
         owner_id=int(_get(raw, "owner_id", _get(raw, "owner", 0)) or 0),
         created_at=_to_datetime(_get(raw, "created_at")) if _get(raw, "created_at") else None,
@@ -333,6 +335,20 @@ def parse_group_info(raw: Any, group_id: int):
         max_members=int(_get(raw, "max_members", 0) or 0),
         group_level=int(_get(raw, "group_level", _get(raw, "level", 0)) or 0),
     )
+
+
+def _group_or(raw: Any, fallback: int) -> int:
+    """群号兜底。
+
+    显式写出来的 `0` 也是「不知道」——直接 `or` 会把 `{'group_id': 0}` 原样留下，
+    于是群公告、群文件、成员这些快照全落到群 0 上：备份看起来成功了，导出包里
+    那几份清单是空的，而目标群里查不到。
+    """
+    try:
+        value = int(_get(raw, "group_id", 0) or 0)
+    except (TypeError, ValueError):
+        value = 0
+    return value or int(fallback or 0)
 
 
 def _unwrap_list(raw: Any, *keys: str) -> list:
@@ -374,6 +390,7 @@ def parse_announcements(raw: Any, group_id: int) -> list[dict]:
         published = _get(item, "publish_time") or _get(item, "time") or _get(item, "published_at")
         out.append(
             {
+                "group_id": _group_or(item, group_id),
                 "content": text,
                 "sender_id": _get(item, "sender_id") or _get(sender, "user_id") or 0,
                 "sender_name": _get(sender, "card") or _get(sender, "nickname") or "",
@@ -392,6 +409,7 @@ def parse_group_files(raw: Any, group_id: int) -> list[dict]:
         upload_time = _get(item, "upload_time") or _get(item, "time") or _get(item, "dead_time")
         out.append(
             {
+                "group_id": _group_or(item, group_id),
                 "file_id": _get(item, "file_id") or _get(item, "id") or "",
                 "name": _get(item, "file_name") or _get(item, "name") or "",
                 "size": int(_get(item, "file_size", _get(item, "size", 0)) or 0),

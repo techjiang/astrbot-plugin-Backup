@@ -1023,6 +1023,11 @@ class Database:
         只删归属是本条的，别人接手的那些一行不动。
         """
         self.execute("DELETE FROM messages WHERE backup_id = ?", (backup_id,))
+        # 来源清单跟着记录一起走。留着它，`/backup verify <已删除的 ID>` 会按清单
+        # 报出一堆「覆盖过的消息」，而记录已经不存在；恢复时也会先在清单里找到
+        # 消息、再拿一条不存在的记录去比对，报出来的是一句看不懂的话。
+        # 淘汰记录不动消息，别的备份对同一条消息的登记也不动——只删这一份的。
+        self.execute("DELETE FROM backup_sources WHERE backup_id = ?", (backup_id,))
         self.execute("DELETE FROM backup_records WHERE backup_id = ?", (backup_id,))
 
     # ---------- 群信息 / 成员 ----------
@@ -1176,15 +1181,25 @@ class Database:
         return removed
 
     def prune_media(self, keep_days: int) -> int:
-        """删掉早于保留期的媒体文件（按消息时间），连落盘文件一起清。"""
+        """删掉早于保留期的媒体文件（按消息时间），连落盘文件一起清。
+
+        同一个 message_id 在别的群可能是一条新消息，而媒体是按消息 ID 命名落盘的。
+        只看「这条旧消息的媒体」就删，会把新群还在用的那份文件一起删掉——那个群
+        从此导不出图，`media_files` 里那行还指着不存在的路径。所以只要还有一条
+        未过期的消息占着这个 ID，就不动。
+        """
         if not keep_days or keep_days <= 0:
             return 0
         cutoff = datetime.now() - timedelta(days=keep_days)
         rows = self.query(
             """SELECT m.id, m.local_path FROM media_files m
                JOIN messages msg ON msg.message_id = m.message_id AND msg.group_id = m.group_id
-               WHERE msg.timestamp < ?""",
-            (to_db(cutoff),),
+               WHERE msg.timestamp < ?
+                 AND NOT EXISTS (
+                   SELECT 1 FROM messages keep
+                   WHERE keep.message_id = m.message_id AND keep.timestamp >= ?
+                 )""",
+            (to_db(cutoff), to_db(cutoff)),
         )
         removed = 0
         for row in rows:
@@ -1240,7 +1255,13 @@ class Database:
 
     # ---------- 群公告 / 群文件 ----------
     def save_announcements(self, group_id: int, items: list[dict]) -> int:
-        """整群覆盖式写入公告快照，返回条数。"""
+        """整群覆盖式写入公告快照，返回条数。
+
+        群号统一用参数：解析器把每条公告的群号放在 `group_id` 里，直接写会影响
+        `INSERT OR IGNORE` 的去重键。写库时以整群为准，条目里的群号只在
+        「参数缺失」时才被采信——恢复时目标群可能和包里的原群不同。
+        """
+        group_id = int(group_id or 0) or int((items or [{}])[0].get("group_id") or 0)
         now = to_db(datetime.now())
         self.execute("DELETE FROM group_announcements WHERE group_id = ?", (group_id,))
         rows = [
@@ -1275,7 +1296,12 @@ class Database:
         ]
 
     def save_group_files(self, group_id: int, items: list[dict]) -> int:
-        """整群覆盖式写入群文件列表快照，返回条数。"""
+        """整群覆盖式写入群文件列表快照，返回**实际入库**的条数。
+
+        文件以 (群, file_id) 唯一。平台给了两条重复的 file_id（同名文件被重新上传
+        过、或者列表里天然有重复项）时，`INSERT OR REPLACE` 只留后一条——旧写法
+        返回的是输入条数，比库里多出来一个，调用方按它报数就会说谎。
+        """
         now = to_db(datetime.now())
         self.execute("DELETE FROM group_files WHERE group_id = ?", (group_id,))
         rows = [
@@ -1303,7 +1329,10 @@ class Database:
                 rows,
             )
             self._conn.commit()
-        return len(rows)
+        row = self.query_one(
+            "SELECT COUNT(*) AS c FROM group_files WHERE group_id = ?", (group_id,)
+        )
+        return int(row["c"]) if row else 0
 
     def get_group_files(self, group_id: int) -> list[dict]:
         return [
