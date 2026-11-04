@@ -362,8 +362,18 @@ def members_from_list(raw_members, fallback_group_id: int = 0) -> list:
     return out
 
 
-def to_db(dt: Optional[datetime]) -> Optional[str]:
-    return dt.strftime(_DT_FMT) if dt else None
+def to_db(dt: Optional[datetime | str]) -> Optional[str]:
+    """datetime → 库里的时间字符串。
+
+    已经是字符串的原样放过：从导出包恢复时，包里的时间是 JSON 里取出来的
+    ISO 串，调用方不该为了「写回库」再把它解析一遍——多一层转换就多一处
+    时区/精度丢信息的地方。None 与空串都当作「没有」。
+    """
+    if not dt:
+        return None
+    if isinstance(dt, str):
+        return dt
+    return dt.strftime(_DT_FMT)
 
 
 def from_db(value) -> Optional[datetime]:

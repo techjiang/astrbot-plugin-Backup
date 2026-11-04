@@ -11,6 +11,7 @@ from typing import Optional
 from .database import (
     REALTIME_BACKUP_ID,
     Database,
+    from_db,
     group_info_from_dict,
     members_from_list,
 )
@@ -184,6 +185,7 @@ class RestoreEngine:
         # 恢复、导出的包里没有群名和成员、按备份取数也取不到——包白恢复了。
         rebuilt = self._ensure_record(backup_id, target, messages, manifest, source_group)
         self._ensure_snapshot(backup_id, target, manifest)
+        self._ensure_extras(target, manifest)
         # `_ensure_record` 重建记录时已经把清单按源群登记过一遍；这里再按目标群登记
         # 一次只会让同一份备份挂出两套「覆盖过谁」，之后 export/diff 取数翻倍
         if not rebuilt:
@@ -403,6 +405,20 @@ class RestoreEngine:
             and self.db.message_backup_id(m.message_id, m.group_id) not in allowed
         ]
         if stray:
+            # 归属不是这条记录，不等于「这条消息不是它备的」。`messages.backup_id`
+            # 记的是「最后归档这条消息的那次备份」，只有一份；本机另一份老备份
+            # 也覆盖过同一条消息时，归属就落在老备份名下。而这份记录的包本来就该
+            # 含那条消息——于是「自己导出的包」被自己的篡改拦截拒掉。
+            #
+            # 归属之外再看一眼「时间」：这份记录开始备份之后才被别的备份接手的，
+            # 那次接手也带来了同一条消息，包里有它合情合理。记录开始之前就被别的
+            # 备份拿走的，则说明这条消息早就归别人，包里出现它就是夹带。
+            stray = [
+                mid
+                for mid in stray
+                if not self._owned_by_other_before(record, mid)
+            ]
+        if stray:
             return stray
 
         # 此外，记录里有的消息就是这条备份的全部：包里出现本机不认识、又不在记录
@@ -419,6 +435,25 @@ class RestoreEngine:
         if strangers and record_ids <= known_in_pack:
             return strangers
         return []
+
+    def _owned_by_other_before(self, record, message_id: str) -> bool:
+        """这条消息在「这份备份动手之前」就已经归别的备份了吗？
+
+        是 → 包里出现它就是夹带（那份备份早就管着它，没理由出现在这个包里）；
+        否 → 它是这份备份跑起来之后才被别的备份接手的，包里有它正常。
+        """
+        row = self.db.query_one(
+            """SELECT r.started_at AS started_at FROM messages m
+               JOIN backup_records r ON r.backup_id = m.backup_id
+               WHERE m.message_id = ? AND m.group_id = ?""",
+            (str(message_id), record.group_id),
+        )
+        if row is None or row["started_at"] is None or record.started_at is None:
+            return False
+        owner_start = from_db(row["started_at"])
+        if owner_start is None:
+            return False
+        return owner_start < record.started_at
 
     def _record_message_ids(self, record) -> set[str]:
         """这条记录名下、本机库里确实有的消息 ID。"""
@@ -510,6 +545,20 @@ class RestoreEngine:
             members = members_from_list((manifest or {}).get("members") or [], target)
             if members:
                 self.db.save_members(target, members)
+
+    def _ensure_extras(self, target: int, manifest: dict) -> None:
+        """把包里的群公告 / 群文件列表写回目标群。
+
+        这两样备份时是采了的，但导出包只带消息和成员——换台机器恢复完，
+        公告和文件清单全留在原机上，`get_announcements(target)` 是空的。
+        本机已经有这两张快照时不覆盖：那是更新的实时状态，旧包不该把它盖回去。
+        """
+        announcements = (manifest or {}).get("announcements") or []
+        if announcements and not self.db.get_announcements(target):
+            self.db.save_announcements(target, announcements)
+        files = (manifest or {}).get("group_files") or []
+        if files and not self.db.get_group_files(target):
+            self.db.save_group_files(target, files)
 
     @staticmethod
     def _parse_dt(value) -> Optional[datetime]:

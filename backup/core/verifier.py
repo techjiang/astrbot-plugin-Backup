@@ -60,7 +60,15 @@ def read_manifest(archive: str | Path) -> dict:
 
 
 # 包清单里「可被独立校验」的部分：把它们和消息一起哈希，改动清单就能被发现
-_MANIFEST_FIELDS = ("group_id", "group_name", "group_info", "members", "trusted")
+_MANIFEST_FIELDS = (
+    "group_id",
+    "group_name",
+    "group_info",
+    "members",
+    "trusted",
+    "announcements",
+    "group_files",
+)
 
 
 def compute_manifest_checksum(manifest: dict) -> str:

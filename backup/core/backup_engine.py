@@ -204,6 +204,7 @@ class BackupEngine:
             failed_media = 0
             skipped = 0
             seen_on_pages: set[str] = set()
+            stale_pages = 0
             own_ids: list[str] = []
             owned_seen: list[Message] = []
             while True:
@@ -213,16 +214,25 @@ class BackupEngine:
                 if not batch:
                     break
                 # 有些适配器根本不认 offset，每页都回同一批消息。此时库里已经有它们，
-                # 循环永远不会因为「本页无新消息」而结束——群越大越像卡死。整页都是
-                # 翻过的消息就说明分页到头了，直接收工。
+                # 循环永远不会因为「本页无新消息」而结束——群越大越像卡死。连续两页
+                # 都是翻过的消息才说明分页真的到头了（见下）。
                 fresh = [raw for raw in batch if str(_raw_id(raw)) not in seen_on_pages]
                 if not fresh:
-                    logger.info(
-                        "群 %s 第 %s 页与之前重复，平台可能不支持偏移，停止翻页",
-                        group_id,
-                        page,
-                    )
-                    break
+                    # 「这一页全翻过」不等于「后面没有了」。每次都从最新的往回翻的
+                    # 平台（很多适配器就是这样）在第二次备份时会出现这种页：库里
+                    # 早有这些消息，但后面还有更旧的一大段。原地打转的证据是
+                    # **连续两页**都翻不出新东西——只有一页时先接着往下要
+                    if stale_pages >= 1:
+                        logger.info(
+                            "群 %s 连续两页都是翻过的消息，平台可能不支持偏移，停止翻页",
+                            group_id,
+                        )
+                        break
+                    stale_pages += 1
+                    offset += len(batch)
+                    page += 1
+                    continue
+                stale_pages = 0
                 seen_on_pages.update(str(_raw_id(raw)) for raw in fresh)
                 # 偏移量按平台真正吐回来的条数推进，不能按页码 × 页大小：
                 # 平台过滤掉一部分（撤回/系统消息不计入）时，按页码算会整段跳过，

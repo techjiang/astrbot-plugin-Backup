@@ -81,7 +81,9 @@ class TestPagingGuard:
         )
         assert record.status is BackupStatus.COMPLETED
         assert record.message_count == 50
-        assert platform.history_calls == 2  # 第一页拿完，第二页整页重复即收工
+        # 连续两页重复才算「分页到头」：只看到一页重复就不收工，否则「平台每次
+        # 都从最新往回翻」这种常见形态会在第二次备份时漏掉后面所有更旧的消息
+        assert platform.history_calls == 3
 
     async def test_normal_paging_still_reads_all_pages(self, db, tmp_path):
         platform = FakePlatform(history=raw_history(120))
