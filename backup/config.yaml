@@ -32,7 +32,10 @@ backup:
   export:
     default_format: "sqlite"
     download_link_expire: "24h"
-    # 下载链接的前缀，填 https://你的域名 才能拼出可直接点的 URL
+    # 下载链接前缀，最终链接是 <base_url>/<token>。
+    # 留空时自动用面板的公网地址拼成 <面板>/api/backup/download（该前缀在
+    # AstrBot 4.14 的鉴权白名单里，群成员直接点就能下）。
+    # 自建网关就填网关上兑换 token 的地址。
     base_url: ""
 
   permission:

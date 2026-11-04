@@ -149,47 +149,230 @@ def expires_header(expires_at: datetime) -> dict:
     return {"X-Expires-At": expires_at.isoformat(timespec="seconds")}
 
 
-def make_view(exports, range_header_getter=None):
-    """把 `handle_download` 包成宿主能直接注册的视图函数。
+# ---------------------------------------------------------------------------
+# 视图层：把 handle_download 接到宿主的 Web 框架上
+# ---------------------------------------------------------------------------
+#
+# 上一版这里返回的是一个普通的 `DownloadResponse` 数据类，然后把
+# `context.register_web_api("/backup/download", view, ...)` 当成接好了。真跑起来
+# 是两处硬伤：
+#
+# 1. **视图函数的参数对不上。** AstrBot 4.14 的 `dashboard/server.py` 里，
+#    `srv_plug_route(subpath, *args, **kwargs)` 是用 `await view_handler(*args,
+#    **kwargs)` 调的，`args` 来自 Flask 的 url 变量，`/api/plug/<path:subpath>`
+#    只有一个 `subpath`，而那个已经被 srv_plug_route 自己吃掉当 route 匹配用了。
+#    所以视图函数收到的是**零个**位置参数，签名里写 `path` / `request` 都是
+#    TypeError → 面板里点下载是 500。
+# 2. **返回类型宿主不认。** Flask 只认 str / bytes / dict / Response 之类，
+#    返回一个自定义 dataclass 会在序列化那一步炸掉。
+#
+# 所以视图必须自己去找「当前请求」：Flask/Quart 走 `flask.request` 上下文，
+# aiohttp 走 `web.Request` 形参。找一个不该由调用方操心的事，放在这里做。
+#
+# 另有一处不是我们能改的：AstrBot 4.14 把 `/api/backup/download` 写进了
+# `auth_middleware` 的白名单，**按前缀**放行——`/api/backup/download/<token>`
+# 上的所有路径都不需要面板 JWT。于是群里点链接这件事其实做得成：
+# 注册一条固定前缀路由，token 走路径尾段。上一版「4.14 做不到」的结论下错了。
 
-    AstrBot 4.14 的插件自定义路由有两处硬约束，都在 `dashboard/server.py` 里：
+MISSING = object()
 
-    - `srv_plug_route` 用 `route == f"/{subpath}"` **精确匹配**，路径参数
-      （`/backup/download/<token>`）注册不上，只能是固定路径；
-    - `/api/plug/*` 不在 `auth_middleware` 白名单里，一律要 JWT。
 
-    所以「把链接发给群成员、他点开就能下」在 4.14 上做不到——除非把
-    `export.base_url` 指到一个自己做的小网关，让网关来消费 token。这条限制是
-    接口的，不是配置能绕过的，写在这里免得下次又当成 bug 去查。
+def _current_request():
+    """拿到当前框架的请求对象。拿不到返回 None（说明不在请求上下文里）。"""
+    # Flask / Quart：`ctx.request` 在应用上下文外会抛异常
+    try:  # pragma: no cover - 取决于宿主装了哪个框架
+        from flask import request as flask_request  # type: ignore
 
-    给管理员在面板里下载是可行的：`register_download_api(context, exports)`
-    注册一条固定路径，token 走 query。
+        if flask_request is not None:
+            return flask_request
+    except Exception:
+        pass
+    try:
+        from quart import request as quart_request  # type: ignore
+
+        return quart_request
+    except Exception:
+        pass
+    return None
+
+
+def _request_path(request) -> str:
+    if request is None:
+        return ""
+    for name in ("path", "full_path", "path_qs", "url"):
+        value = getattr(request, name, None)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _request_query_token(request) -> str:
+    if request is None:
+        return ""
+    args = getattr(request, "args", None)
+    if args is None:
+        return ""
+    try:
+        return str(args.get("token") or "")
+    except Exception:
+        return ""
+
+
+def _request_range(request) -> Optional[str]:
+    if request is None:
+        return None
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        return None
+    try:
+        return headers.get("Range")
+    except Exception:
+        return None
+
+
+def _read_request(request, kwargs: Optional[dict] = None) -> tuple[str, Optional[str]]:
+    """把「第几次请求、要哪一段」拼出来。返回 (用于兑换 token 的路径, Range 头)。"""
+    kwargs = kwargs or {}
+    request = request if request is not MISSING else _current_request()
+    header = kwargs.get("range_header") or _request_range(request)
+
+    token = str(kwargs.get("token") or "")
+    if not token:
+        token = _request_query_token(request)
+    if not token:
+        path = str(kwargs.get("path") or "")
+        if not path:
+            path = _request_path(request)
+        base, _, query = path.partition("?")
+        # 群里点的是 `/api/backup/download/<token>`，不是 `/backup/download/<token>`。
+        # `handle_download` 只认后一种，前面那层 `/api` 前缀得在这里削掉，否则
+        # 每一次真实的群内点击都会 404——而 404 和「链接过期」在用户眼里一样。
+        short = base
+        if short.startswith("/api/"):
+            short = short[4:]
+        return short, header
+    return f"{PREFIX}{token}", header
+
+
+def read_request(request=MISSING, **kwargs) -> tuple[str, Optional[str]]:
+    """公开版：给宿主自己写的视图用。`read_request()` 自动读当前上下文。"""
+    return _read_request(request, kwargs)
+
+
+def _wants_stream(kwargs: dict) -> bool:
+    """调用方要不要原始 `DownloadResponse`。
+
+    Quart 的 `send_file` 我们要手写，那条路径要自己拼 Response，所以给它原始
+    对象；Flask 那边能直接 `return`，走框架友好形态。
     """
-    full_prefix = PREFIX
-    short_prefix = "/download/"
+    if kwargs.get("stream") or kwargs.get("raw"):
+        return True
+    try:
+        import flask  # type: ignore # noqa: F401
 
-    async def view(request=None, *args, **kwargs):
-        path = ""
-        token = ""
-        if request is not None:
-            getter = getattr(request, "args", None)
-            if getter is not None:
-                token = str(getter.get("token") or "")
-            path = str(getattr(request, "path", "") or "")
-            header = None
-            headers = getattr(request, "headers", None)
-            if headers is not None:
-                header = headers.get("Range")
-        else:
-            path = str(kwargs.get("path") or "")
-            header = kwargs.get("range_header")
-        if token:
-            # query 里的 token 优先：注册的是固定路径（`/api/plug/backup/download`），
-            # 那条 path 本身不含 token
-            path = f"{full_prefix}{token}"
-        response = handle_download(path, exports, header)
+        return False
+    except Exception:
+        pass
+    try:
+        import quart  # type: ignore # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def _as_flask(response: DownloadResponse):
+    """Flask / 任何 WSGI 宿主能直接 `return` 的形态。
+
+    **不能**回 `(body, status, headers)` 元组：`DownloadResponse.body` 在正常
+    下载里是空的（文件躺在 `file` 上），元组会被 Flask 当成「响应体就是这 0 个
+    字节」，`Content-Length: 0`——状态 200，下载下来的 ZIP 是空文件。必须自己
+    构造一个「可迭代的响应体」，让 WSGI 一层层把块吐出去。
+    """
+    try:
+        from werkzeug.wrappers import Response as WerkzeugResponse  # Flask 的底座
+
+        return WerkzeugResponse(
+            response.iter_chunks(),
+            status=response.status,
+            headers=response.headers,
+        )
+    except Exception:
+        # 没有 Werkzeug：至少把状态和头带出去，别把状态码吞掉
         return response
 
-    view.full_prefix = full_prefix  # type: ignore[attr-defined]
-    view.short_prefix = short_prefix  # type: ignore[attr-defined]
+
+async def _send_file_aiohttp(request, response: DownloadResponse):
+    from aiohttp import web  # 宿主是 aiohttp 时 ia 一定有
+
+    if response.file is None:
+        return web.Response(
+            status=response.status, body=response.body, headers=response.headers
+        )
+    return web.FileResponse(
+        path=response.file,
+        status=response.status,
+        headers=response.headers,
+    )
+
+
+async def _send_file_quart(response: DownloadResponse):
+    """Quart 宿主：手拼一个 Response（`send_file` 要 async 且带 conditional）。
+
+    没有 Quart 也没有 aiohttp 的环境（脚本、单测）不能因此炸掉——退回原始
+    `DownloadResponse`，调用方爱怎么发怎么发。
+    """
+    try:
+        from quart import Response as QuartResponse
+    except Exception:
+        return response
+    return QuartResponse(
+        response.iter_chunks(),
+        status=response.status,
+        headers=response.headers,
+    )
+
+
+def make_view(exports, range_header_getter=None, stream: Optional[bool] = None):
+    """生成一个不依赖具体框架的视图函数，直接交给 `register_web_api`。
+
+    - 形参全是可选的：宿主少传、多传参数都能跑（`srv_plug_route` 一个都不传）
+    - 返回值按宿主框架走：Flask 回元组，Quart 回 Response，aiohttp 回 web.Response
+    - 也可以传 `path=` / `token=` / `range_header=` 手动指定，便于单测和自建网关
+    """
+
+    async def view(request=MISSING, **kwargs):
+        if range_header_getter is not None and not kwargs.get("range_header"):
+            try:
+                kwargs["range_header"] = range_header_getter()
+            except Exception:
+                pass
+        path, header = _read_request(request, kwargs)
+        response = handle_download(path, exports, header)
+        want_stream = _wants_stream(kwargs) if stream is None else stream
+        if not want_stream:
+            return _as_flask(response)
+        real_request = request if request is not MISSING else None
+        if real_request is not None and hasattr(real_request, "rel_url"):
+            return await _send_file_aiohttp(real_request, response)
+        return await _send_file_quart(response)
+
+    view.full_prefix = PREFIX  # type: ignore[attr-defined]
+    view.short_prefix = "/download/"  # type: ignore[attr-defined]
+    return view
+
+
+async def stream_view(request, exports) -> DownloadResponse:
+    """aiohttp 形状的视图：`async def handler(request)`。宿主自建网关时用它。"""
+    path, header = _read_request(request)
+    return handle_download(path, exports, header)
+
+
+def aiohttp_view(exports):
+    """包成 aiohttp 能直接注册的协程（返回 web.Response）。"""
+
+    async def view(request):
+        response = await stream_view(request, exports)
+        return await _send_file_aiohttp(request, response)
+
     return view

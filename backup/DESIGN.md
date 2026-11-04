@@ -603,17 +603,59 @@ zip，目录本身留着（本地翻着方便）。
 还有一处：链解析出「文本 + 引用」会归成 `REPLY`，但摊平消息自带权威的 `message_type`，
 不能再改——改了就成了「库里 `text`、包里 `reply`」，校验和必然对不上。
 
-**下载链接为什么给不到群成员**
-AstrBot 4.14 的插件自定义路由有两处硬约束（`dashboard/server.py`）：
-`srv_plug_route` 用 `route == f"/{subpath}"` **精确匹配**，注册不上路径参数
-（`/backup/download/<token>` 这种只能是固定路径）；`/api/plug/*` 又不在
-`auth_middleware` 的白名单里，一律要面板 JWT。所以「把链接发给群成员、他点开就能下」
-在 4.14 上做不到——这是接口限制，不是配置能绕过的。
+**下载链接：上一轮的结论是错的**
 
-能做的两件事：`register_download_api()` 注册一条固定路径 + query 里的 token，供管理员在
-面板里下载；要真的发给群成员，得把 `export.base_url` 指到自己的小网关，由网关调
-`handle_download_request` 兑换 token。这段说明写在代码注释里，免得下次又当成「忘了接线」
-去查一遍。
+上一轮我写在这里的结论是「4.14 上群里点链接做不到，因为 `/api/plug/*` 一律要 JWT」。
+再核一遍 `dashboard/server.py`，两处都读错了：
+
+- `auth_middleware` 的白名单是**按前缀**放行的，里面明明白白有一条
+  `/api/backup/download`，注释写着「备份下载使用 URL 参数传递 token」；
+- 插件登记的 `route` 在前缀匹配里就是**前缀**：`/api/plug/<path:subpath>` 命中后
+  用 `route == f"/{subpath}"` 去比，`/backup/download/<token>` 这条能匹配上
+  `backup/download/xxx` 这个 subpath。
+
+所以「把链接发给群成员、他点开就能下」本来是通的，是我上一轮下错了结论，还把错的
+理由写进了代码注释，免得「下次又当成 bug 去查」——反过来把正确判断挡住了。
+
+真正卡住的是另外两处，都是接线细节，一起修了：
+
+1. **视图函数的参数对不上**。`srv_plug_route` 是 `await view_handler(*args, **kwargs)`，
+   而 `subpath` 已经被它自己吃掉当路由匹配用，视图拿到的是**零个**位置参数。视图
+   签名里写 `request` 就是 `TypeError`。现在视图自己去找当前请求（Flask/Quart 的
+   请求上下文、aiohttp 的形参），并且所有形参可选。
+2. **回元组是空文件**。`DownloadResponse.body` 在正常下载里是空的（文件在 `file` 上），
+   回 `(body, status, headers)` 会让 Flask 认为响应体就是 0 字节：状态 200、
+   `Content-Length: 0`、下下来的 ZIP 打不开。现在回一个 WSGI 响应对象，把
+   `iter_chunks()` 接上去。这个 bug 只有跑真 Flask 才看得见，假 Request 的用例永远绿。
+
+顺带两件：`/api/backup/download/<token>` 前面那层 `/api` 要在 `handle_download` 之前
+削掉（否则每次真实点击都是 404）；`export.base_url` 空着时从面板配置里找公网地址拼成
+`<面板>/api/backup/download`——原来只给裸路径，发到群里没人点得动。
+
+三条路由都登记（宿主侧精确匹配，只能一条一条来）：`/backup/download/<token>` 是群里
+点的，`/backup/download` 是面板按钮 + query token，`/download/<token>` 兜住宿主自己
+吃掉前缀的情况。
+
+**配置从来没读过面板那份**
+
+`star_manager` 见到 `_conf_schema.json` 就建一个 `AstrBotConfig`（落在
+`data/config/<插件名>_config.json`），再以 `config=` 关键字传给插件类。插件不接这个
+参数，于是用户在面板里改的每一项都是写给自己的——包括 `retention.keep_days`、
+`export.base_url`。容器里没有 AstrBot，这个关键字从来不会被调用，`config.yaml`
+那条路看起来一直「好使」，二十轮都没人发现。
+
+现在 `BackupPlugin.__init__(context, config=None)`，优先级：宿主注入 > `config.yaml` >
+`schema` 默认值。`/backup config set` 也写回注入的那份（它会 `save_config()`），
+没有注入才退回写 `config.yaml`。
+
+**被踢为什么要单独一个冷却**
+
+AstrBot 把同一条 notice 投给 `on_message` 和 `on_notice` 两个 handler，而
+`on_message` 那条路径认不出「这是通知」也会走到触发判定。原来它跟退群聚合共用 30
+分钟冷却：第一次跑完备份，半小时后同一个事件再来一遍——机器人都已经不在群里了，
+`get_group_msg_history` 只会失败，备份列表里多一条 `failed`，看起来像备份坏了。
+被踢是一辈子一次的事，冷却放到一天；退群聚合仍然是 30 分钟（那本来就是「一批人同时
+退」）。
 
 **插件市场的两个缺口**
 AstrBot 只认 `logo.png` 当插件图标（`logo_fname = "logo.png"`），只有 SVG 就是空白方块；

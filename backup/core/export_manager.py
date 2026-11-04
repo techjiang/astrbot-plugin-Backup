@@ -89,6 +89,13 @@ class ExportManager:
         export_cfg = cfg.get("export") or {}
         self.expire_seconds = parse_expire(export_cfg.get("download_link_expire", "24h"))
         self.base_url = str(export_cfg.get("base_url") or "").rstrip("/")
+        # 群里点的链接前缀：面板自己的公网地址 + `/api/backup/download`。插件启动后
+        # 由 main.py 填进来（配置里不一定有），导出时 `link` 就用它拼
+        self.public_prefix = ""
+
+    def set_base_url(self, value: str) -> None:
+        """设置下载链接前缀（`<前缀>/<token>`）。"""
+        self.base_url = str(value or "").rstrip("/")
 
     def build_context(self, group_id: int, backup_id: Optional[str] = None) -> ExportContext:
         """取导出用的数据。

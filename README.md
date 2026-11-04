@@ -101,7 +101,7 @@ backup:
   export:
     default_format: "sqlite"  # /backup export 不带格式时用它
     download_link_expire: "24h"
-    base_url: ""              # 填 https://你的域名，导出链接才是完整 URL
+    base_url: ""              # 下载链接前缀 <base_url>/<token>；留空自动用面板地址
   permission:
     require_admin: true       # 仅群主/管理员可用
     allow_private: true       # 私聊里没有管理员概念，关掉则私聊一律拒绝
@@ -130,21 +130,31 @@ backup:
 
 ### 下载链接怎么用
 
-导出后返回 `/backup/download/<token>`。token 存在数据库里，重启后仍然有效，过期即作废，
-只认 `exports/` 目录内的文件，兑换一次即失效（链接转发出去也不会被反复领取）。接路由时
-把请求路径丢给 `handle_download`，需要支持大文件续传就把 `Range` 头一起传进去：
+导出后插件会回一条链接，形状是 `<面板地址>/api/backup/download/<token>`。
+
+- **直接发群里就行。** 这条前缀在 AstrBot 4.14 的 Web 鉴权白名单里，群成员点开即下，
+  不需要登录面板。`export.base_url` 留空时用面板自己的公网地址拼；找不到就退回裸路
+  径并提示你去配。
+- **token 一次性。** 存在数据库里，重启依然有效，过期即作废，只认 `exports/` 目录内的
+  文件。链接转发出去不会被反复领取——但浏览器的 `Range` 探测与续传算同一次下载，不会
+  因此变成「下了一半」。
+- **想换成自己的网关**，把 `export.base_url` 指过去，网关上兑换 token：
 
 ```python
-from backup.core.download_route import handle_download
+from backup.core.download_route import handle_download, aiohttp_view
 
+# 拿现成的：直接当 aiohttp 视图注册
+app.router.add_get("/dl/{token}", aiohttp_view(plugin.exports))
+
+# 或者自己拼响应
 resp = handle_download(request.path, plugin.exports, request.headers.get("Range"))
-if resp.ok:   # 200 整份 / 206 区间续传
-    for chunk in resp.iter_chunks():
-        await write(chunk)
-else:
-    # 404 路径不对 / 410 链接过期或已领取 / 416 区间越界
+# 200 整份 / 206 区间续传 / 404 路径不对 / 410 过期或已领取 / 416 区间越界
+for chunk in resp.iter_chunks():
     ...
 ```
+
+宿主若是 Flask，直接 `register_web_api` 交给插件自己注册的视图即可，它会返回一个带
+`iter_chunks()` 的 WSGI 响应，不需要额外写代码。
 
 ## 常见问题
 

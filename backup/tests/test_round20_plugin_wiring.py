@@ -321,7 +321,13 @@ def test_plugin_ships_marketplace_logo():
 
 
 def test_download_view_accepts_query_token(plugin, tmp_path):
-    """面板路由只能注册固定路径，token 走 query。"""
+    """面板按钮那条：固定路径 + query token。
+
+    视图函数**不能**要求位置参数——`srv_plug_route` 是
+    `await view_handler(*args, **kwargs)` 调的，而 `subpath` 已经被它自己吃掉
+    当路由匹配用了，视图收到的是零个参数。所以这里显式走 `stream=True` 拿原始
+    结果，另外用无参调用钉住「签名不会因为少传参数而 TypeError」。
+    """
     from backup.core.download_route import make_view
 
     for i in range(2):
@@ -329,7 +335,7 @@ def test_download_view_accepts_query_token(plugin, tmp_path):
 
         plugin.db.save_message(make_message(i), "bk1")
     result = plugin.exports.export(100, "zip", backup_id="bk1")
-    view = make_view(plugin.exports)
+    view = make_view(plugin.exports, stream=True)
 
     class Request:
         args = {"token": result.token}
@@ -339,6 +345,23 @@ def test_download_view_accepts_query_token(plugin, tmp_path):
     response = asyncio.run(view(Request()))
     assert response.status == 200
     assert response.headers["Content-Type"] == "application/zip"
+
+
+def test_download_view_runs_without_arguments(plugin, monkeypatch):
+    """宿主一个参数都不传也要能跑：没有 token 就 404，不能 TypeError。
+
+    这一条是上一版的真 bug：`make_view` 生成的视图签名是 `view(request=None)`
+    但里面又 `getattr(request, ...)` 之后直接把自定义数据类返回给 Flask——
+    前者在真实调用里拿到的是 0 个参数（`srv_plug_route` 把 subpath 吃掉了），
+    后者 Flask 序列化不了，结果就是面板里点下载 500。
+    """
+    from backup.core import download_route
+
+    # 不在任何请求上下文里：找请求对象那一步不能抛
+    monkeypatch.setattr(download_route, "_current_request", lambda: None)
+    view = download_route.make_view(plugin.exports, stream=True)
+    response = asyncio.run(view())
+    assert response.status == 404
 
 
 def test_register_download_api_is_optional(plugin):

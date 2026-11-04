@@ -205,6 +205,7 @@ class EventHooks:
         cooldown_seconds: int = 1800,
         archive_private: bool = False,
         private_group_id: int = PRIVATE_ARCHIVE_GROUP,
+        kick_cooldown_seconds: int = 86400,
     ):
         self.db = db
         self.trigger = auto_trigger
@@ -217,6 +218,13 @@ class EventHooks:
         self.on_leave = on_leave
         self.on_disband = on_disband
         self.cooldown = cooldown_seconds
+        # 被踢是一辈子一次的事。原来这里跟退群聚合共用 30 分钟冷却：AstrBot 会
+        # 把同一条 notice 投给 `on_message` 和 `on_notice` 两个 handler，而
+        # `on_message` 那条路径认不出「这是通知」也会走到触发判定——第一次跑完
+        # 备份，半小时后同一个事件再来一遍，机器人都已经不在群里了，
+        # `get_group_msg_history` 只会失败，回执写进日志，备份记录多一条 failed。
+        # 冷却窗口放到一天，等于「被踢只备一次」。
+        self.kick_cooldown = kick_cooldown_seconds
         self._last_kick_backup: dict[int, datetime] = {}
 
     # ---------- 实时归档 ----------
@@ -302,7 +310,7 @@ class EventHooks:
         if subtype in KICK_SUBTYPES and self.on_leave:
             last = self._last_kick_backup.get(group_id)
             now = datetime.now()
-            if last and (now - last).total_seconds() < self.cooldown:
+            if last and (now - last).total_seconds() < self.kick_cooldown:
                 return False
             self._last_kick_backup[group_id] = now
             return True

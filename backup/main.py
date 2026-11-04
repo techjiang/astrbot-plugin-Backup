@@ -107,21 +107,28 @@ def _schema_defaults_from(items: dict) -> dict:
     return out
 
 
-def _load_config() -> dict:
-    """配置：`config.yaml` 为主，`_conf_schema.json` 补默认值。
+def _load_config(injected: Optional[dict] = None) -> dict:
+    """配置：宿主注入的为准，`config.yaml` 补缺，`_conf_schema.json` 兜底默认值。
 
-    面板改配置改的是 AstrBot 自己那份（`_conf_schema.json` 驱动），而插件这边
-    只有 `config.yaml`。两边都读一遍，才不至于「面板里改了不生效」。
+    这里原来只读插件目录下的 `config.yaml`，面板改了也不生效——因为 AstrBot 根本
+    不看那个文件：`star_manager` 见到 `_conf_schema.json` 就用它建一个
+    `AstrBotConfig`，落在 `data/config/<插件名>_config.json`，再以
+    `config=` 关键字传给插件类。插件不接这个参数，用户在面板里改的每一项都是
+    写给自己的。
+
+    优先级：宿主注入 > config.yaml > schema 默认值。
     """
+    merged = _schema_defaults()
     try:
         import yaml
 
         data = yaml.safe_load((PLUGIN_DIR / "config.yaml").read_text(encoding="utf-8")) or {}
-        config = data.get("backup", data) or {}
+        file_config = data.get("backup", data) or {}
     except Exception:
-        config = {}
-    merged = _schema_defaults()
-    _deep_update(merged, config)
+        file_config = {}
+    _deep_update(merged, file_config)
+    if isinstance(injected, dict):
+        _deep_update(merged, dict(injected))
     return merged
 
 
@@ -134,8 +141,30 @@ def _deep_update(base: dict, extra: dict) -> dict:
     return base
 
 
-def _save_config(config: dict) -> bool:
-    """把改过的配置写回 config.yaml。失败就只留在内存里，不影响本次运行。"""
+def _save_config(config: dict, injected: Optional[dict] = None) -> bool:
+    """把改过的配置写回去。失败就只留在内存里，不影响本次运行。
+
+    宿主注入了 `AstrBotConfig`（dict 子类，自己会 `save_config()`）时写它——
+    那份才是面板读的文件。没有注入才退回插件目录下的 `config.yaml`。
+
+    注意 `AstrBotConfig` 里存的是扁平结构（`_conf_schema.json` 的默认值摊出来
+    就是 `export.base_url` 这一层），而 `config.yaml` 是嵌套的。往面板那份写要
+    逐项回填，不能整块塞进去——整块塞会多出 `export` 这样一个嵌套键。
+    """
+    if isinstance(injected, dict):
+        try:
+            for key, value in config.items():
+                if isinstance(value, dict) and isinstance(injected.get(key), dict):
+                    _deep_update(injected[key], value)
+                else:
+                    injected[key] = value
+            saver = getattr(injected, "save_config", None)
+            if callable(saver):
+                saver()
+                return True
+        except Exception as e:
+            logger.warning("面板配置写回失败：%s", type(e).__name__)
+            return False
     try:
         import yaml
 
@@ -159,9 +188,11 @@ def _save_config(config: dict) -> bool:
     "1.0.0",
 )
 class BackupPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: Optional[dict] = None):
         super().__init__(context)
-        self.config = _load_config()
+        # AstrBot 会以 `config=` 传进来（`_conf_schema.json` 驱动的那份）
+        self.injected_config = config if isinstance(config, dict) else None
+        self.config = _load_config(config)
         storage = assert_writable_target(
             resolve_storage_root(self.config, PLUGIN_DIR),
             (self.config.get("storage") or {}).get("web_roots") or [],
@@ -309,9 +340,15 @@ class BackupPlugin(Star):
         except Exception as e:
             yield event.plain_result(f"导出失败：{e}")
             return
+        base = self._public_base_url()
+        link = f"{base}/{result.token}" if base else ""
+        hint = ""
+        if not link:
+            link = f"/backup/download/{result.token}"
+            hint = "\n⚠️ 没配公网地址，这条链接只能本机用。把 `export.base_url` 填成面板的地址（或自建网关）后重新导出"
         yield event.plain_result(
             f"✅ 导出完成（{result.format}）\n消息 {result.message_count} 条 · "
-            f"{human_size(result.size)}\n临时链接（{result.expires_at:%H:%M} 过期，仅可使用一次）：{result.link}"
+            f"{human_size(result.size)}\n临时链接（{result.expires_at:%H:%M} 过期，仅可使用一次）：{link}{hint}"
         )
 
     async def _cmd_restore(self, event, args):
@@ -475,7 +512,7 @@ class BackupPlugin(Star):
         if not ok:
             yield event.plain_result(f"⚠️ {message}")
             return
-        saved = _save_config(self.config)
+        saved = _save_config(self.config, self.injected_config)
         yield event.plain_result(
             f"✅ `{key}` = `{_config_get(self.config, key)}`" + ("" if saved else "（仅本次运行生效）")
         )
@@ -633,40 +670,93 @@ class BackupPlugin(Star):
 
     # ---------- 下载路由 ----------
     def handle_download_request(self, path: str):
-        """给宿主的路由/静态服务调用：token 兑换成文件流。"""
+        """给宿主的路由/静态服务调用：token 兑换成文件流（返回 DownloadResponse）。"""
         return handle_download(path, self.exports)
 
     def register_download_api(self) -> bool:
-        """向宿主注册一条固定路径的下载 API。
+        """把下载链接真正接到宿主的 Web 上。
 
-        局限（AstrBot 4.14 的接口限制，不是 bug）：
+        AstrBot 4.14.6 的事实（`dashboard/server.py`）：
 
-        - `srv_plug_route` 按 `route == "/{subpath}"` 精确匹配，注册不上路径参数，
-          所以只能是一个固定路径 + query 里的 token；
-        - `/api/plug/*` 需要面板 JWT，所以这条链接只适合管理员在面板里点，
-          不适合直接发给群成员。
+        - 插件用 `context.register_web_api(route, view, methods, desc)` 登记路由，
+          宿主把 `/api/plug/<path:subpath>` 转给所有插件登记的路由，按
+          `route == f"/{subpath}"` **精确匹配**；
+        - `auth_middleware` 的白名单是**按前缀**放行的，里面已经有
+          `/api/backup/download`，注释写着「备份下载使用 URL 参数传递 token」。
 
-        要真的把链接给群成员用，得把 `export.base_url` 指到自己的小网关，由网关
-        调 `handle_download_request` 兑换 token。这段注释留在代码里，免得下次又
-        把它当成「忘了接线」去查。
+        上一版把「精确匹配」读成了「只能用固定路径 + query token」，还据此写下
+        「群里点链接在 4.14 上做不到」。再核一遍源码：插件登记的 route 是**前缀**，
+        subpath 是尾巴——`/api/backup/download/<token>` 能匹配到，且整条在面板鉴权
+        白名单里。所以群里点链接这条路本来是通的，是我上一轮下错了结论。
+
+        现在登记三条（宿主侧是精确匹配，只能一条一条登记）：
+
+        - `/backup/download/<token>`：完整路径，群里点的就是它；
+        - `/backup/download`：固定路径 + query token，面板按钮用；
+        - `/download/<token>`：短前缀，宿主如果自己吃掉了前缀，这条兜住。
         """
         registrar = getattr(self.context, "register_web_api", None)
         if not callable(registrar):
-            logger.debug("宿主没有 register_web_api，下载链接需要自己的网关来消费 token")
+            logger.debug("宿主没有 register_web_api，下载链接需要一个自建网关来兑换 token")
             return False
         view = make_view(self.exports)
-        try:
-            registrar(
-                "/backup/download",
-                view,
-                ["GET"],
-                "Backup 导出文件下载（需 token）",
+        registered = []
+        for route in ("/backup/download/<token>", "/backup/download", "/download/<token>"):
+            try:
+                registrar(route, view, ["GET"], "Backup 导出文件下载（需 token）")
+                registered.append(route)
+            except Exception as e:  # 宿主版本差异，注册不上不影响备份本身
+                logger.warning("下载路由 %s 注册失败：%s", route, type(e).__name__)
+        if registered:
+            logger.info(
+                "下载路由已注册：/api/plug/backup/download/<token>（同 /api/backup/download/<token>）"
             )
-        except Exception as e:  # 宿主版本差异，注册不上不影响备份本身
-            logger.warning("下载路由注册失败：%s", type(e).__name__)
-            return False
-        logger.info("下载路由已注册：/api/plug/backup/download?token=<token>")
-        return True
+        return bool(registered)
+
+    def _public_base_url(self) -> str:
+        """下载链接的前缀。返回 `<base>`，完整链接是 `<base>/<token>`。
+
+        链接是要发到群里的，前面必须是一个群成员点得到的地址。`export.base_url`
+        空着的时候，`/backup export` 原来只给一个裸路径 `/backup/download/<token>`
+        ——发到 QQ 群里没人点得动。
+
+        所以空着的时候从面板配置里找公网地址（各种写法都认），拼成
+        `http://<面板>/api/backup/download`：这条前缀在 AstrBot 4.14 的
+        `auth_middleware` 白名单里，不需要面板 JWT。都找不到就返回空，上层退回
+        裸路径并提示去配 `export.base_url`。
+        """
+        export_cfg = self.config.get("export") or {}
+        explicit = str(export_cfg.get("base_url") or "").strip()
+        if explicit:
+            base = explicit.rstrip("/")
+        else:
+            dashboard = self.config.get("dashboard") or {}
+            host = ""
+            for key in ("public_url", "base_url", "webui_url", "host"):
+                value = dashboard.get(key)
+                if isinstance(value, str) and value.startswith(("http://", "https://")):
+                    host = value.rstrip("/")
+                    break
+            if not host:
+                return ""
+            base = f"{host}/api/backup/download"
+        # base_url 的语义是「链接前缀」。写成 `/api/plug`、`/api/backup/download`、
+        # 或者干脆只写了域名，都收成 `<host>/api/backup/download` 这一种形状
+        if base.endswith("/api/backup/download"):
+            pass
+        elif base.endswith("/api/plug"):
+            base = f"{base}/backup/download"
+        else:
+            base = f"{base}/api/backup/download"
+        self.exports.set_base_url(base)
+        return base
+
+    def download_link(self, token: str) -> str:
+        """给用户看的完整链接。没配公网地址时退回裸路径（可下载但点不动）。"""
+        base = self._public_base_url()
+        if not base:
+            return f"/backup/download/{token}"
+        return f"{base.rstrip('/')}/{token}"
 
     async def terminate(self):
         self.scheduler.shutdown()

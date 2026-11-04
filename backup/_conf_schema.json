@@ -139,7 +139,7 @@
       },
       "base_url": {
         "type": "string",
-        "description": "拼下载链接用的域名，如 https://your.host",
+        "description": "下载链接前缀，最终为 <base_url>/<token>。留空则用面板公网地址自动拼成 <面板>/api/backup/download（该前缀在 AstrBot 4.14 鉴权白名单内，群成员可直接点）。",
         "default": ""
       }
     }
