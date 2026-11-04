@@ -684,6 +684,49 @@ AstrBot 只认 `logo.png` 当插件图标（`logo_fname = "logo.png"`），只�
 **「这套假设和外面那个东西对得上吗」**——而这件事不需要实机，源码就能回答，我早该去翻。
 前面几轮反复说「只能实机确认」，是把「我懒得去读依赖的源码」包装成了「环境限制」。
 
+**实时归档的归属不能被备份接手**
+
+`adopt_orphans` 原来把 `backup_id = 'realtime'` 也算成「无主」，理由是「实时归档那批
+本来就该被本次备份覆盖」。覆盖是对的，但连归属一起改成本次备份就过了：`count_realtime_only`
+的注释写的是「实时归档的归属故意不改，那是群被炸时的兜底数据」，两处口径互相打架。
+真按注释那样用（按 `backup_id='realtime'` 找最后那几条）就一条也找不到，
+`/backup status` 的「其中实时归档 N 条」也永远归零。
+
+现在：覆盖靠**来源清单**表达（登记到本次备份），归属保持不变。
+「归属的备份已经消失」的行照旧收编——那是另一件事，不能一起放过。
+
+**备份失败时，已入库的消息要补登记来源清单**
+
+备份在第 N 页超时时，前 N-1 页的消息已经 `save_message` 进库了，但 `add_sources`
+要等整轮跑完才执行。失败的记录是在 `except` 里写进 `backup_records` 的，所以这些行的
+`backup_id` 看起来完全正常，`adopt_orphans` 也不会来认领它们（它只收「归属的备份
+已消失」的行）。结果：**库里 50 条、来源清单 0 条**，`/backup list` 说覆盖 0 条，
+`/backup export` 和 `/backup restore` 都取不到——聊天记录明明就在那儿。
+
+现在失败分支里补一次 `add_sources`，并把 `collected` 提到 `try` 之前。补登记自己出错
+不能盖掉原本的失败原因。
+
+**群信息：群号不一致不采信平台那份，群名缺失不清空**
+
+`group_info` 按群号做主键，`INSERT OR REPLACE`。适配器回 `{'group_id': 999, ...}`
+而我们在备群 100 时，记录会被写到**另一个群**名下：`/backup status 100` 查不到群名，
+导出包里群号还对不上。`parse_group_info(strict_group=True)` 以请求的群号为准。
+
+另一头是群名：OneBot 的 `get_group_info` 有时只回 `group_id` / `member_count`，
+没有 `group_name`。直接存会把已有群名洗成空串，导出包的 `<title>` 和 HTML 头栏跟着
+变空。新值是空的就沿用上次的。
+
+**权限：`role == "admin"` 是「机器人主人」，不是「群管」**
+
+AstrBot 4.14 的 `AstrMessageEvent.role` 只有 `member` / `admin` 两个值，而 `admin`
+是拿 `admins_id` 配置比出来的（`pipeline/waking_check/stage.py`）。也就是说：群主在群里
+发 `/backup now`，`is_admin()` 返回 `False`——一个「仅群主或管理员可执行」的开关，
+把真正的群主挡在门外。
+
+真正的群管身份在各平台适配器的 `message_obj.group` 上：`group_owner`（群主 QQ）和
+`group_admins`（管理员 QQ 列表）。现在拿发送者 ID 去比对——比猜 `role` 字符串可靠，
+因为它不依赖适配器怎么填。`role == "admin"` 那条仍然保留（机器人主人也是人）。
+
 ## 红线对照
 
 | 红线 | 落地位置 |
@@ -698,3 +741,10 @@ AstrBot 只认 `logo.png` 当插件图标（`logo_fname = "logo.png"`），只�
 | pathlib 路径 | 全部用 `Path`；`safe_filename` 剥离目录部分 |
 | SVG 素材自产 | `assets/*.svg`、`templates/chat.html` 内联 SVG |
 | 作者信息 | `metadata.yaml`、`README.md`、HTML 导出页页脚 |
+
+**探查日志不许带值**
+
+`describe_event` / `describe_notice` 是「第一次收到真实事件时打一行字段清单」，用来
+对齐适配器字段名。`_get` 是 `getattr`，读 `message_obj` / `message` / `group` 会把整个
+消息对象捞出来——日志里出现对象 repr，就等于把正文写进了日志（红线 1）。
+现在只判断「有没有」，绝不打印值。

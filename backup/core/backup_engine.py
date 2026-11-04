@@ -366,6 +366,13 @@ class BackupEngine:
         auxiliary_errors: list[str] = []
         try:
             info = parse_group_info(await adapter.get_group_info(group_id), group_id)
+            if not info.group_name:
+                # OneBot 的 `get_group_info` 有时只回 group_id / member_count，没有
+                # group_name。直接存下去会把已有群名洗成空串，导出包的 `<title>` 和
+                # HTML 头栏跟着变空。拿不到就沿用上次的
+                previous = self.db.get_group_info(group_id)
+                if previous is not None and previous.group_name:
+                    info.group_name = previous.group_name
             self.db.save_group_info(info)
         except Exception as e:
             auxiliary_errors.append("群信息")
@@ -415,12 +422,14 @@ class BackupEngine:
                 auxiliary_errors.append("群文件")
                 logger.warning("群文件拉取失败 group=%s: %s", group_id, type(e).__name__)
 
+        # 提到 try 之前：备份中途失败时，这份列表里是「已经写进库但还没登记来源
+        # 清单」的消息，失败分支要用它补登记
+        collected: list[Message] = []
         try:
 
             # 3-5. 分页拉消息，解析、下载媒体、入库
             page = 0
             offset = 0
-            collected: list[Message] = []
             failed_media = 0
             skipped = 0
             seen_on_pages: set[str] = set()
@@ -547,6 +556,25 @@ class BackupEngine:
             record.status = BackupStatus.FAILED
             record.error = f"{type(e).__name__}: {e}"
             record.finished_at = datetime.now()
+            # 失败前已经落库的那批消息必须登记进来源清单，否则它们永远进不了任何
+            # 一次备份：唯一键 (message_id, group_id) 被占着，下一轮备份看到
+            # 「已在库里」直接跳过，而 `adopt_orphans` 只收编「归属的备份已消失」
+            # 的行——这次失败备份的记录是在失败**之后**才写进 backup_records 的，
+            # 所以归属看起来完全正常，谁也不会来认领它们。
+            # 一条都没登记的话，`/backup list` 说覆盖 0 条、恢复取出 0 条，
+            # 而聊天记录明明就在库里。
+            try:
+                self.db.add_sources(record.backup_id, collected)
+                record.new_count = len(collected)
+                record.message_count = max(
+                    record.message_count, len(collected)
+                )
+            except Exception as inner:  # 登记失败不能盖掉原本的失败原因
+                logger.warning(
+                    "备份失败后登记来源清单出错 group=%s: %s",
+                    group_id,
+                    type(inner).__name__,
+                )
         self.db.save_record(record)
         return record
 

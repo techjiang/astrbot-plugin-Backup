@@ -84,8 +84,13 @@ class TestAdoptOrphans:
         for i in range(3):
             assert db.message_backup_id(f"m{i}", 100) == first.backup_id
 
-    async def test_realtime_messages_are_taken_over(self, db, engine):
-        """实时归档的归属可以被备份接手：它们本来就该进某一份备份的来源清单。"""
+    async def test_realtime_messages_are_listed_but_keep_their_owner(self, db, engine):
+        """实时归档的消息要进本次备份的来源清单，但归属仍然是 `realtime`。
+
+        归属改成本次备份时，`/backup status` 那句「其中实时归档 N 条」永远归零，
+        而实时归档存在的理由恰恰是「群被炸时还能按 realtime 找到最后那几条」。
+        覆盖靠来源清单表达，归属不动。
+        """
         history = raw_history(2)
         for raw in history:
             db.execute(
@@ -97,8 +102,12 @@ class TestAdoptOrphans:
 
         record = await engine.backup_group(100, _platform(history), download_media=False)
 
+        # 覆盖得到承认
         assert db.count_sources(record.backup_id) == 2
-        assert db.message_backup_id("m0", 100) != REALTIME_BACKUP_ID
+        # 归属不被抢走
+        assert db.message_backup_id("m0", 100) == REALTIME_BACKUP_ID
+        # 兜底数据仍然找得到
+        assert db.count_messages(100, backup_id=REALTIME_BACKUP_ID) == 2
 
 
 class TestDeleteRecord:

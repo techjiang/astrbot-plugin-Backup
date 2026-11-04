@@ -460,12 +460,26 @@ def parse_group_members(raw_members: Any, group_id: int) -> list:
     return members
 
 
-def parse_group_info(raw: Any, group_id: int):
-    """解析群信息。"""
+def parse_group_info(raw: Any, group_id: int, strict_group: bool = True):
+    """解析群信息。
+
+    `strict_group=True`（备份路径）时，平台回的群号和我们请求的群号不一致就
+    不采信平台那个：`group_info` 是按群号做主键的表，`INSERT OR REPLACE` 会把
+    记录写到**另一个群**名下。实测适配器回 `{'group_id': 999, ...}` 而我们在备
+    群 100，结果是「群 999 的群名、群 100 的记录」——`/backup status 100` 查不到
+    群名，导出包里群号还对不上。
+    """
     from .models import GroupInfo
 
+    resolved = _group_or(raw, group_id)
+    if strict_group and group_id:
+        if resolved != int(group_id):
+            logger.debug(
+                "群信息里的群号 %s 与请求的群 %s 不一致，按请求的存", resolved, group_id
+            )
+        resolved = int(group_id)
     return GroupInfo(
-        group_id=_group_or(raw, group_id),
+        group_id=resolved,
         group_name=str(_get(raw, "group_name", _get(raw, "name", "")) or ""),
         owner_id=int(_get(raw, "owner_id", _get(raw, "owner", 0)) or 0),
         created_at=_to_datetime(_get(raw, "created_at")) if _get(raw, "created_at") else None,

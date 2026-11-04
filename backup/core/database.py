@@ -582,33 +582,44 @@ class Database:
         (message_id, group_id)，后续备份看到「已在库里」直接跳过，于是它们永远进不了
         任何一次备份的来源清单——备份显示成功，恢复却是空的。
 
-        只认两种无主：`backup_id` 在 backup_records 里找不到，或者是实时归档标记。
-        实时归档那批本来就该被本次备份覆盖。
+        只认一种无主：`backup_id` 在 backup_records 里找不到。
+
+        **实时归档的消息不在这里收编。** 原来把 `backup_id = 'realtime'` 也算成无主，
+        理由是「实时归档那批本来就该被本次备份覆盖」——覆盖是覆盖了（来源清单里会
+        登记），但归属也被一起改成了本次备份。后果是 `/backup status` 那句
+        「其中实时归档 N 条」永远归零，而 `count_realtime_only` 的注释里写的是
+        「实时归档的归属故意不改，那是群被炸时的兜底数据」。两处口径互相打架，
+        真按注释那样用（按 `backup_id='realtime'` 找兜底数据）就一条也找不到。
+        现在归属保持不变，只登记来源清单。
         """
         ids = [str(i) for i in message_ids]
         if not ids:
             return 0
         placeholders = ",".join("?" * len(ids))
         rows = self.query(
-            f"""SELECT message_id FROM messages
+            f"""SELECT message_id, backup_id FROM messages
                 WHERE group_id = ? AND message_id IN ({placeholders})
-                  AND (backup_id = ? OR backup_id NOT IN (SELECT backup_id FROM backup_records))""",
+                  AND (backup_id = ?
+                       OR backup_id NOT IN (SELECT backup_id FROM backup_records))""",
             (group_id, *ids, REALTIME_BACKUP_ID),
         )
-        adopted = [r["message_id"] for r in rows]
-        if not adopted:
+        if not rows:
             return 0
-        self._conn.executemany(
-            "UPDATE messages SET backup_id = ? WHERE group_id = ? AND message_id = ?",
-            [(backup_id, group_id, mid) for mid in adopted],
-        )
+        orphans = [r["message_id"] for r in rows if r["backup_id"] != REALTIME_BACKUP_ID]
+        realtime = [r["message_id"] for r in rows if r["backup_id"] == REALTIME_BACKUP_ID]
+        if orphans:
+            self._conn.executemany(
+                "UPDATE messages SET backup_id = ? WHERE group_id = ? AND message_id = ?",
+                [(backup_id, group_id, mid) for mid in orphans],
+            )
+        # 登记来源清单对两种行都做：这份备份确实覆盖到了它们。实时归档只是不改归属
         self._conn.executemany(
             """INSERT OR IGNORE INTO backup_sources (backup_id, group_id, message_id)
                VALUES (?,?,?)""",
-            [(backup_id, group_id, mid) for mid in adopted],
+            [(backup_id, group_id, mid) for mid in orphans + realtime],
         )
         self._conn.commit()
-        return len(adopted)
+        return len(orphans) + len(realtime)
 
     def count_realtime_only(self, group_id: int, backup_id: Optional[str] = None) -> int:
         """这个群里「只走过实时归档、还没被任何备份覆盖」的消息数。

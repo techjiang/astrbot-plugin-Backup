@@ -221,9 +221,23 @@ class PermissionChecker:
             return Permission(True)
         return Permission(False, "仅群主或管理员可执行备份操作")
 
-    @staticmethod
-    def _role_is_admin(event) -> bool:
-        """从事件里找角色字符串。字段名各适配器不同，逐个试。"""
+    #: AstrBot 4.x 的 `AstrBotMessage.group` 上带群主/管理员名单，值是字符串 ID
+    GROUP_ADMIN_FIELDS = ("group_owner", "owner_id")
+    GROUP_ADMIN_LISTS = ("group_admins", "admin_ids")
+
+    @classmethod
+    def _role_is_admin(cls, event) -> bool:
+        """从事件里找「这个人是群管吗」。字段名各适配器不同，逐个试。
+
+        AstrBot 4.14 的 `AstrMessageEvent.role` 只有两个取值：`member` / `admin`，
+        而 `admin` 是**拿 `admins_id` 配置比出来的**——也就是「机器人主人」，
+        不是「这个群的群主/管理员」。所以群主在群里发 `/backup now` 会被判成
+        没权限，而这条命令本该由群主执行（配置项写的是 require_admin）。
+
+        真正的群管身份在各平台适配器的 `message_obj.group` 上：`group_owner`（群主
+        QQ）和 `group_admins`（管理员 QQ 列表）。这里拿发送者 ID 去比对——
+        比「猜 role 字符串」可靠，因为它不依赖适配器怎么填。
+        """
         for name in ("sender_role", "role", "member_role", "user_role"):
             role = getattr(event, name, None)
             if isinstance(role, str) and role.lower() in ADMIN_ROLES:
@@ -236,6 +250,33 @@ class PermissionChecker:
                 if node is None:
                     break
             if isinstance(node, str) and node.lower() in ADMIN_ROLES:
+                return True
+        return cls._sender_in_group_admins(event)
+
+    @classmethod
+    def _sender_in_group_admins(cls, event) -> bool:
+        """发送者是不是这个群的群主/管理员（按 `message_obj.group` 里的名单比）。"""
+        sender = _call_or_value(event, "get_sender_id")
+        if sender in (None, ""):
+            sender = _call_or_value(event, "sender_id")
+        inner = getattr(event, "message_obj", None)
+        if sender in (None, "") and inner is not None:
+            member = getattr(inner, "sender", None)
+            sender = _call_or_value(member, "user_id") if member is not None else None
+        if sender in (None, ""):
+            return False
+        sender = str(sender).strip()
+        group = getattr(inner, "group", None) if inner is not None else None
+        if group is None:
+            return False
+        for name in cls.GROUP_ADMIN_FIELDS:
+            if str(_call_or_value(group, name) or "").strip() == sender:
+                return True
+        for name in cls.GROUP_ADMIN_LISTS:
+            values = _call_or_value(group, name)
+            if isinstance(values, (list, tuple, set)) and any(
+                str(v).strip() == sender for v in values
+            ):
                 return True
         return False
 

@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from .auto_trigger import AutoTrigger
+from .commands import PermissionChecker
 from .models import Message
 
 logger = logging.getLogger(__name__)
@@ -317,17 +318,31 @@ class EventHooks:
         return False
 
     # ---------- 适配器探测 ----------
+    #: 这些字段是对象/列表，`_get` 会把它们整个读出来；日志里只记存在性
+    PROBE_FIELDS = EVENT_FIELDS + ("role", "message", "type", "group_owner", "group_admins")
+
     def describe_event(self, event) -> str:
         """第一次收到真实事件时打一行字段清单（只列字段名，不含值与内容）。
 
         只能实机确认的那几处——群号从哪个字段读、退群/被踢的 sub_type 到底叫什么
         ——靠这行日志对齐，不用靠猜。
+
+        `_get` 是 `getattr`，读 `message` / `message_obj` / `group` 这类字段会把整个
+        消息对象捞出来。这里只判断「有没有」并且 `repr` 里绝不带值——红线 1 说消息
+        内容不进日志，而日志里出现对象 repr 就等于把正文写进去了。
         """
-        present = [n for n in EVENT_FIELDS if _get(event, n) not in (None, "", [], {})]
+        present = []
+        for name in self.PROBE_FIELDS:
+            value = _get(event, name)
+            if value in (None, "", [], {}):
+                continue
+            present.append(name)
         group_id = extract_group_id(event)
+        is_admin = PermissionChecker(True).check_event(event).allowed
         return (
-            f"事件字段：{'、'.join(present) or '（无）'}"
+            f"事件字段：{'、'.join(dict.fromkeys(present)) or '（无）'}"
             f" | 认出群号：{group_id if group_id is not None else '失败'}"
+            f" | 权限判定：{'通过' if is_admin else '拒绝'}"
         )
 
     def describe_notice(self, payload) -> str:
