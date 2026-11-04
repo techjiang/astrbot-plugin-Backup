@@ -48,13 +48,28 @@ class PlatformAdapter:
         self.platform = platform
 
     async def _call(self, names, *args, **kwargs):
+        """按名字顺序试，逐个真的调一次。
+
+        不能「取到第一个可调用对象就认为找到了」：适配器上常有同名但签名不同的
+        方法（或参数名不叫 `group_id` 的），一调就 TypeError，而这个 TypeError
+        会被上层当成「公告拉取失败，沿用上次快照」悄悄吞掉——功能看着在，实际
+        一次都没成功过。签名不匹配就换下一个名字，全都不行才返回 None。
+        """
+        last_error: Optional[Exception] = None
         for name in names:
             fn = getattr(self.platform, name, None)
-            if callable(fn):
+            if not callable(fn):
+                continue
+            try:
                 result = fn(*args, **kwargs)
-                if asyncio.iscoroutine(result):
-                    result = await result
-                return result
+            except TypeError as e:
+                last_error = e
+                continue
+            if asyncio.iscoroutine(result):
+                result = await result
+            return result
+        if last_error is not None:
+            logger.debug("平台接口签名不匹配 %s: %s", ",".join(names), last_error)
         return None
 
     async def get_group_info(self, group_id: int):
@@ -72,13 +87,18 @@ class PlatformAdapter:
     async def get_group_announcements(self, group_id: int) -> list:
         """群公告。适配器多半叫 _get_group_notice，取不到就返回空表。"""
         return await self._call(
-            ("get_group_notice", "get_group_announcements", "get_group_notices"),
+            (
+                "get_group_notice",
+                "get_group_notices",
+                "get_group_announcements",
+                "_get_group_notice",
+            ),
             group_id=group_id,
         ) or []
 
     async def get_group_files(self, group_id: int) -> list:
         result = await self._call(
-            ("get_group_files", "get_group_file_list", "get_files"),
+            ("get_group_files", "get_group_file_list", "get_files", "_get_group_files"),
             group_id=group_id,
         )
         return result or []
@@ -119,6 +139,10 @@ class BackupEngine:
         progress_callback=None,
     ) -> BackupRecord:
         adapter = platform if isinstance(platform, PlatformAdapter) else PlatformAdapter(platform)
+        # 每次备份都从「这次没拉到公告/文件清单」开始算，否则上一轮的条目会被
+        # 当成本轮快照写进这份备份的 bundle 里
+        self.announcements: list[dict] = []
+        self.group_files: list[dict] = []
         incremental_enabled = incremental and bool(
             (self.config.get("incremental") or {}).get("enabled", True)
         )
@@ -180,17 +204,28 @@ class BackupEngine:
 
         # 群公告 / 群文件：开关在配置里，之前没人读。同样不影响主流程成败
         scope = self.config.get("scope") or {}
+        # 拉回来的条目挂在实例上，下面写 bundle 时要一并存进「这份备份的快照」。
+        # 只进 `group_announcements`（当前状态表）是不够的：导出包读的是
+        # `get_announcements(ctx.group_id)`，而这条路径对**历史上任意一份备份**
+        # 都取当前状态——换机器恢复、或恢复一份老备份时，公告和文件清单就变成
+        # 「这个群现在有什么」，不是「那时候有什么」，备份等于没带走。
+        notices: list[dict] = []
+        files: list[dict] = []
         if scope.get("group_announcements", True):
             try:
                 raw_notices = await adapter.get_group_announcements(group_id)
-                self.db.save_announcements(group_id, parse_announcements(raw_notices, group_id))
+                notices = parse_announcements(raw_notices, group_id)
+                self.db.save_announcements(group_id, notices)
+                self.announcements = notices
             except Exception as e:
                 auxiliary_errors.append("群公告")
                 logger.warning("群公告拉取失败 group=%s: %s", group_id, type(e).__name__)
         if scope.get("group_files", True):
             try:
                 raw_files = await adapter.get_group_files(group_id)
-                self.db.save_group_files(group_id, parse_group_files(raw_files, group_id))
+                files = parse_group_files(raw_files, group_id)
+                self.db.save_group_files(group_id, files)
+                self.group_files = files
             except Exception as e:
                 auxiliary_errors.append("群文件")
                 logger.warning("群文件拉取失败 group=%s: %s", group_id, type(e).__name__)
@@ -292,7 +327,14 @@ class BackupEngine:
                 record.message_count = len(covered)
             # 群信息/成员快照每轮都存：一条新消息都没有的那轮，导出仍然需要群名
             if covered or info is not None or members:
-                self.db.save_bundle(record.backup_id, group_id, info, members)
+                self.db.save_bundle(
+                    record.backup_id,
+                    group_id,
+                    info,
+                    members,
+                    announcements=notices or None,
+                    group_files=files or None,
+                )
 
             # 7. 增量点与校验和
             # 增量点只用于「下次从哪儿开始翻」的提示，不再参与跳过判断（见上方水位

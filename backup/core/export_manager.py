@@ -58,6 +58,8 @@ class ExportResult:
     token: str
     expires_at: datetime
     base_url: str = ""
+    # 这次导出的消息有多少条属于某一份备份（对应备份记录里的 package_count）
+    package_record: str = ""
 
     @property
     def download_path(self) -> str:
@@ -237,6 +239,7 @@ class ExportManager:
             token=token,
             expires_at=expires,
             base_url=self.base_url,
+            package_record=ctx.backup_id or "",
         )
 
     def _export_zip(self, ctx: ExportContext, base: Path) -> Path:
@@ -251,8 +254,15 @@ class ExportManager:
         get_exporter("txt").export(ctx, work / "messages.txt")
         get_exporter("markdown").export(ctx, work / "markdown")
         (work / "chat.html").write_text(HtmlExporter().render(ctx), encoding="utf-8")
-        announcements = [_jsonable(a) for a in self.db.get_announcements(ctx.group_id)]
-        group_files = [_jsonable(f) for f in self.db.get_group_files(ctx.group_id)]
+        # 公告 / 文件清单优先取**这份备份自己的快照**。取当前状态表的话，导出
+        # 一份上个月的备份，带出去的却是这个群今天的公告——那不是备份，是现状。
+        bundle = self.db.get_bundle(ctx.backup_id, ctx.group_id) if ctx.backup_id else {}
+        announcements = [_jsonable(a) for a in (
+            bundle.get("announcements") or self.db.get_announcements(ctx.group_id)
+        )]
+        group_files = [_jsonable(f) for f in (
+            bundle.get("group_files") or self.db.get_group_files(ctx.group_id)
+        )]
         if announcements:
             (work / "announcements.json").write_text(
                 json.dumps(announcements, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -295,6 +305,11 @@ class ExportManager:
         # 真正拦得住篡改的是**本机库里另存的那份证据**（`export_evidence` 表）：
         # 包作者能改包，改不了导出当时写进本机库的记录。所以带 backup_id 导出时，
         # 顺手把快照和它的指纹落到本地；恢复端只认本地这份，不认包里的 `trusted`。
+        # 这份包到底装了几条消息，得写进**记录**里：导出包带的是「备份 + 只在实时
+        # 归档里的那部分」，条数天然不等于记录里的 message_count。恢复端拿记录
+        # 说「包里 1 条」，用户数得出 3 条——包没坏，是那句话在撒谎。
+        if record is not None:
+            self.db.set_package_count(record.backup_id, len(ctx.messages))
         manifest["trusted"] = ctx.trusted or self._trusted_snapshot(record, ctx.group_id)
         manifest["manifest_checksum"] = compute_manifest_checksum(manifest)
         if ctx.backup_id:
@@ -415,7 +430,12 @@ class ExportManager:
 
 
 def _jsonable(row: dict) -> dict:
-    """sqlite3.Row 里的 datetime 不能直接 json 序列化。"""
+    """sqlite3.Row 里的 datetime 不能直接 json 序列化。
+
+    快照里的条目（`backup_bundle` 存下来的那批）是原样从解析器来的，时间字段
+    可能还是 `datetime`；当前状态表读出来的则是字符串。同一条路径要能吃两种，
+    否则「公告跟着包走」这条会在 json.dumps 上直接抛 TypeError。
+    """
     return {
         k: (v.isoformat(sep=" ") if isinstance(v, datetime) else v)
         for k, v in dict(row).items()

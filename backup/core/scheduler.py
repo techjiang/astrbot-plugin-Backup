@@ -2,6 +2,7 @@
 
 import logging
 import re
+from datetime import datetime
 from typing import Awaitable, Callable, Optional
 
 from .database import Database
@@ -29,14 +30,62 @@ def _valid_field(part: str, low: int, high: int) -> bool:
     return True
 
 
+def _normalize_cron(cron: str) -> str:
+    """把周字段的 7（周日）改写成 0，其余原样。
+
+    两种写法在 cron 里等价，但 APScheduler 的 `from_crontab` 只接受 0-6：
+    校验通过了、真去挂任务时才抛，`schedule set` 先回「✅ 已设置」再炸掉。
+    """
+    parts = str(cron or "").split()
+    if len(parts) == 5 and parts[4] == "7":
+        parts[4] = "0"
+        return " ".join(parts)
+    return cron
+
+
+def _impossible(parts: list[str]) -> bool:
+    """这个表达式是不是「格式合法但永远不会触发」。
+
+    `0 0 31 2 *`（2 月 31 日）、`0 0 30 2 *` 单看每一段都在界内，APScheduler 也
+    会收下，然后建出一个永远算不出下次触发时间的任务：`/backup schedule set`
+    回一句「✅ 已设置」，之后一辈子不跑，`list` 里还明晃晃挂着它。
+    APScheduler 自己算不出来时 `get_next_fire_time` 返回 None——那正是「这个
+    任务永远不会跑」的判据，比手写日历规则可靠。
+    """
+    try:
+        from apscheduler.triggers.cron import CronTrigger
+    except ImportError:  # 缺依赖时退回手写规则
+        return _impossible_by_calendar(parts)
+    # 周字段里 7 = 周日，和 0 等价。`CronTrigger.from_crontab` 只接受 0-6，
+    # 把 `0 0 * * 7` 直接递过去会抛 ValueError——那是个完全合法的写法，
+    # 不能因为上游的死板就判成非法。
+    try:
+        trigger = CronTrigger.from_crontab(_normalize_cron(" ".join(parts)))
+        return trigger.get_next_fire_time(None, datetime.now()) is None
+    except (ValueError, TypeError):
+        # APScheduler 自己都解析不了，就是非法表达式
+        return True
+
+
+def _impossible_by_calendar(parts: list[str]) -> bool:
+    """APScheduler 不在时的兜底：只拦「固定到某月某日」这种能一眼算死的写法。"""
+    day, month = parts[2], parts[3]
+    if not (day.isdigit() and month.isdigit()):
+        return False
+    month_days = {1: 31, 2: 29, 3: 31, 4: 30, 5: 31, 6: 30, 7: 31, 8: 31, 9: 30, 10: 31, 11: 30, 12: 31}
+    return int(day) > month_days.get(int(month), 31)
+
+
 def validate_cron(cron: str) -> bool:
     """不依赖 APScheduler 的 cron 校验，缺依赖时也能判断参数是否合法。"""
     parts = str(cron or "").split()
     if len(parts) != 5:
         return False
-    return all(
+    if not all(
         _valid_field(part, low, high) for part, (low, high) in zip(parts, _CRON_BOUNDS)
-    )
+    ):
+        return False
+    return not _impossible(parts)
 
 
 class BackupScheduler:
@@ -94,7 +143,9 @@ class BackupScheduler:
 
         sched.add_job(
             self._run,
-            CronTrigger.from_crontab(cron),
+            # 周字段 7 在这里转成 0：`CronTrigger.from_crontab` 只认 0-6，
+            # 直接递 7 会在建任务时抛错，而 `0 0 * * 7` 是合法的「每周日」
+            CronTrigger.from_crontab(_normalize_cron(cron)),
             args=[group_id],
             id=self._job_id(group_id),
             replace_existing=True,

@@ -42,6 +42,9 @@ class RestoreResult:
     overwritten: int
     checksum_ok: bool
     merged: int = 0
+    # 包/库里一共有多少条可恢复的消息。回执只说「写入/跳过/覆盖」时，用户数出
+    # 3 条、回执写 1 条，只会以为包坏了
+    total: int = 0
     message: str = ""
 
 
@@ -146,6 +149,7 @@ class RestoreEngine:
                 f"备份包里的消息都不属于群 {source_group}，拒绝恢复"
             )
 
+        total = len(messages)
         inserted = skipped = overwritten = merged = 0
         for msg in messages:
             msg.group_id = target
@@ -199,6 +203,7 @@ class RestoreEngine:
             overwritten=overwritten,
             merged=merged,
             checksum_ok=True,
+            total=total,
             message="恢复完成",
         )
 

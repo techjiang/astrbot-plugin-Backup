@@ -32,11 +32,22 @@ from .core.event_hooks import EventHooks, extract_group_id
 from .core.paths import assert_writable_target, resolve_storage_root
 from .core.restore_engine import RestoreEngine, RestoreError
 from .core.scheduler import BackupScheduler
-from .core.verifier import verify_zip
+from .core.verifier import read_manifest, verify_zip
 
 logger = logging.getLogger(__name__)
 
 PLUGIN_DIR = Path(__file__).resolve().parent
+
+
+def _looks_like_archive(token: str) -> bool:
+    """这个参数像不像一个备份包路径。
+
+    备份 ID 的形状是 `bk_100_20261104052000_ab12cd`，不带扩展名；恢复命令的
+    第一个参数有可能是包路径，靠扩展名区分，不靠「文件在不在」——路径打错时
+    也得走「备份不存在」那条正常报错，而不是被当成备份 ID 报一句话。
+    """
+    text = str(token or "")
+    return text.lower().endswith(".zip") or "/" in text or "\\" in text
 
 
 def _load_config() -> dict:
@@ -233,8 +244,24 @@ class BackupPlugin(Star):
                 "用法：/backup restore <备份ID> [目标群号] [--strategy skip|overwrite|merge] --confirm"
             )
             return
-        backup_id = args[0]
-        target = parse_group_arg(args[1]) if len(args) > 1 else None
+        archive = None
+        # 手里只剩一个包的时候（换机器、原机器没了、群被炸了），命令里第一个参数
+        # 就是包路径，而不是备份 ID。README 里那句「/backup restore <备份ID> <包路径>」
+        # 也认，两种写法都走同一条路。
+        tokens = [t for t in args if not t.startswith("--")]
+        backup_id = tokens[0] if tokens else ""
+        target = parse_group_arg(tokens[1]) if len(tokens) > 1 else None
+        if not backup_id:
+            yield event.plain_result(
+                "用法：/backup restore <备份ID|备份包路径> [目标群号] [--strategy skip|overwrite|merge] --confirm"
+            )
+            return
+        if target is None and _looks_like_archive(backup_id):
+            archive = backup_id
+            manifest = read_manifest(archive)
+            backup_id = str(manifest.get("backup_id") or Path(archive).stem)
+        elif len(tokens) > 2 and _looks_like_archive(tokens[2]):
+            archive = tokens[2]
         strategy = "skip"
         if "--strategy" in args:
             idx = args.index("--strategy")
@@ -248,12 +275,13 @@ class BackupPlugin(Star):
             return
         try:
             result = await self.restore_engine.restore(
-                backup_id, target, strategy, confirm=True
+                backup_id, target, strategy, archive=archive, confirm=True
             )
         except RestoreError as e:
             yield event.plain_result(f"❌ {e}")
             return
         parts = [
+            f"共 {result.total} 条",
             f"写入 {result.inserted} 条",
             f"跳过 {result.skipped} 条",
             f"覆盖 {result.overwritten} 条",

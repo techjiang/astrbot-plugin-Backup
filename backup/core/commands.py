@@ -18,7 +18,7 @@ HELP_TEXT = """**Backup 高级备份** · 命令速查
 `/backup schedule remove <群号>` 移除定时任务
 `/backup list [群号]` 备份列表
 `/backup export [群号] <格式>` 导出（sqlite/json/csv/txt/markdown/html/zip）
-`/backup restore <备份ID> [目标群号] [--strategy skip|overwrite|merge] --confirm` 恢复
+`/backup restore <备份ID|备份包路径> [目标群号] [--strategy skip|overwrite|merge] --confirm` 恢复
 `/backup status [群号]` 当前群备份状态
 `/backup config get|set <键> [值]` 配置查看/修改
 `/backup clean [天数]` 清理旧备份

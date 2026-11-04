@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS backup_records (
   finished_at DATETIME,
   message_count INTEGER DEFAULT 0,
   new_count INTEGER DEFAULT 0,
+  package_count INTEGER DEFAULT 0,
   media_count INTEGER DEFAULT 0,
   total_size INTEGER DEFAULT 0,
   is_incremental BOOLEAN DEFAULT 0,
@@ -247,9 +248,13 @@ def _migrate_record_columns(conn) -> None:
     升级到这一版后第一次读记录就会撞 `no such column`，整个插件起不来。
     """
     cols = {row["name"] for row in conn.execute("PRAGMA table_info('backup_records')")}
-    if "new_count" not in cols:
-        conn.execute("ALTER TABLE backup_records ADD COLUMN new_count INTEGER DEFAULT 0")
-        conn.commit()
+    for name, ddl in (
+        ("new_count", "ALTER TABLE backup_records ADD COLUMN new_count INTEGER DEFAULT 0"),
+        ("package_count", "ALTER TABLE backup_records ADD COLUMN package_count INTEGER DEFAULT 0"),
+    ):
+        if name not in cols:
+            conn.execute(ddl)
+    conn.commit()
 
 
 # 老库升级：media_files 加 (message_id, original_url) 唯一键，顺带去掉重复行。
@@ -375,6 +380,17 @@ def to_db(dt: Optional[datetime | str]) -> Optional[str]:
     if isinstance(dt, str):
         return dt
     return dt.strftime(_DT_FMT)
+
+
+def _naive_dt(value):
+    """时间规整成「本地 naive」，好让 to_db 只有一种格式化路径。
+
+    库里时间统一是 naive 本地时间；tz-aware 值直接落库会连时区一起丢掉，
+    读回来凭空多几小时（增量水位因此判错「哪条更新」）。
+    """
+    if isinstance(value, datetime):
+        return value.astimezone().replace(tzinfo=None) if value.tzinfo else value
+    return value
 
 
 def from_db(value) -> Optional[datetime]:
@@ -615,11 +631,28 @@ class Database:
         ]
 
     # ---------- 每份备份的群信息 / 成员快照 ----------
-    def save_bundle(self, backup_id: str, group_id: int, group_info, members=None) -> None:
+    def save_bundle(
+        self,
+        backup_id: str,
+        group_id: int,
+        group_info,
+        members=None,
+        announcements=None,
+        group_files=None,
+    ) -> None:
+        """每份备份自己的群信息 / 成员 / 公告 / 文件清单快照。
+
+        公告和文件清单也是「当时的样子」，必须跟着这份备份走：`group_announcements`
+        那两张表是当前状态，任何一份备份导出时读到的都是「这个群现在有什么」。
+        """
         payload = {
             "group_info": _group_info_to_dict(group_info) if group_info else None,
             "members": [_member_to_dict(m) for m in (members or [])],
         }
+        if announcements is not None:
+            payload["announcements"] = list(announcements)
+        if group_files is not None:
+            payload["group_files"] = list(group_files)
         self.execute(
             """INSERT OR REPLACE INTO backup_bundle (backup_id, group_id, payload)
                VALUES (?,?,?)""",
@@ -922,9 +955,9 @@ class Database:
         self.execute(
             """INSERT OR REPLACE INTO backup_records
                (backup_id, group_id, status, started_at, finished_at, message_count,
-                new_count, media_count, total_size, is_incremental, base_backup_id,
-                checksum, error)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                new_count, package_count, media_count, total_size, is_incremental,
+                base_backup_id, checksum, error)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 record.backup_id,
                 record.group_id,
@@ -933,6 +966,7 @@ class Database:
                 to_db(record.finished_at),
                 record.message_count,
                 record.new_count,
+                record.package_count,
                 record.media_count,
                 record.total_size,
                 1 if record.is_incremental else 0,
@@ -976,6 +1010,18 @@ class Database:
             (group_id, BackupStatus.COMPLETED.value),
         )
         return self._row_to_record(row) if row else None
+
+    def set_package_count(self, backup_id: str, count: int) -> None:
+        """记下这份备份最近一次导出包里装了几条消息。
+
+        恢复端「包里有几条」不能拿 `message_count` 说：那个数回答的是「这份备份
+        覆盖保住了几条」，而导出包还含只在实时归档里的消息，两者本来就不等。
+        写一个必然对不上的数进回执，比不写更糟——用户会以为包是坏的。
+        """
+        self.execute(
+            "UPDATE backup_records SET package_count = ? WHERE backup_id = ?",
+            (int(count or 0), backup_id),
+        )
 
     def assign_message_backup(self, message_id: str, group_id: int, backup_id: str) -> None:
         """把已有消息挂到指定备份上（恢复时补齐归属）。"""
@@ -1036,6 +1082,7 @@ class Database:
             finished_at=from_db(row["finished_at"]),
             message_count=row["message_count"] or 0,
             new_count=(row["new_count"] if "new_count" in row.keys() else 0) or 0,
+            package_count=(row["package_count"] if "package_count" in row.keys() else 0) or 0,
             media_count=row["media_count"] or 0,
             total_size=row["total_size"] or 0,
             is_incremental=bool(row["is_incremental"]),
@@ -1302,6 +1349,12 @@ class Database:
         """
         group_id = int(group_id or 0) or int((items or [{}])[0].get("group_id") or 0)
         now = to_db(datetime.now())
+        # 条目里的 published_at 可能是 datetime，也可能是导出包里读回来的 ISO 串。
+        # 直接传给 sqlite3 会抛 InterfaceError——整次备份在「存公告」这一步崩掉，
+        # 而消息明明已经全部落库（备份报 failed）。
+        def _when(value):
+            return to_db(_naive_dt(value)) if value else None
+
         self.execute("DELETE FROM group_announcements WHERE group_id = ?", (group_id,))
         rows = [
             (
@@ -1309,7 +1362,7 @@ class Database:
                 str(a.get("content") or ""),
                 int(a.get("sender_id") or 0),
                 str(a.get("sender_name") or ""),
-                to_db(a.get("published_at")),
+                _when(a.get("published_at")),
                 str(a.get("raw") or ""),
                 now,
             )
@@ -1343,6 +1396,10 @@ class Database:
         """
         now = to_db(datetime.now())
         self.execute("DELETE FROM group_files WHERE group_id = ?", (group_id,))
+
+        def _when(value):
+            return to_db(_naive_dt(value)) if value else None
+
         rows = [
             (
                 group_id,
@@ -1350,7 +1407,7 @@ class Database:
                 str(f.get("name") or ""),
                 int(f.get("size") or 0),
                 int(f.get("busid") or 0),
-                to_db(f.get("upload_time")),
+                _when(f.get("upload_time")),
                 int(f.get("uploader_id") or 0),
                 str(f.get("uploader_name") or ""),
                 str(f.get("raw") or ""),

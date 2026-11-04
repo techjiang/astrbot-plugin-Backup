@@ -54,6 +54,9 @@ class BackupRecord:
     message_count: int = 0
     # 这次真正新存进库的条数；重跑一轮全是已在库的消息时它是 0，而 message_count 不是
     new_count: int = 0
+    # 这份备份打包成导出包时的消息条数。包导出的是「备份 + 实时归档那部分」，
+    # 和 message_count 天然不等；恢复端拿包自带的消息数说话才不撒谎
+    package_count: int = 0
     media_count: int = 0
     total_size: int = 0
     is_incremental: bool = False

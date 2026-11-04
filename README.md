@@ -62,7 +62,7 @@ pip install -r astrbot-plugin-Backup/backup/requirements.txt
 | `/backup schedule remove <群号>` | 移除定时任务 |
 | `/backup list [群号]` | 备份列表（不填群号列全部备份，每条带群号） |
 | `/backup export [群号] <格式>` | 导出，返回 24 小时有效的临时链接 |
-| `/backup restore <备份ID> [目标群号] --confirm` | 恢复（危险操作，需二次确认） |
+| `/backup restore <备份ID\|备份包路径> [目标群号] --confirm` | 恢复（危险操作，需二次确认） |
 | `/backup status [群号]` | 当前群备份状态 |
 | `/backup verify <备份ID> [备份包]` | 校验备份完整性 |
 | `/backup diff <备份ID1> <备份ID2>` | 对比两个备份 |
@@ -187,8 +187,9 @@ A：把 `scope.private_messages` 打开。私聊没有群号，消息统一落�
 A：能。包里的 manifest 带着备份记录、群信息和成员名单，所以不用先有本地记录：
 
 ```bash
-/backup restore <备份ID> --confirm            # 目标群取包里的群号
-/backup restore <备份ID> <新群号> --confirm    # 或另指一个群
+/backup restore /data/backups/xxx.zip --confirm            # 只给包，目标群取包里的群号
+/backup restore /data/backups/xxx.zip <新群号> --confirm    # 或另指一个群
+/backup restore <备份ID> <新群号> --confirm                  # 本机有记录时仍按 ID 恢复
 ```
 
 恢复完会按包内信息重建记录与群信息，之后 `list` / `export` 都认得它。
