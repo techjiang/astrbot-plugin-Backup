@@ -255,9 +255,15 @@ class BackupPlugin(Star):
         except RestoreError as e:
             yield event.plain_result(f"❌ {e}")
             return
+        parts = [
+            f"写入 {result.inserted} 条",
+            f"跳过 {result.skipped} 条",
+            f"覆盖 {result.overwritten} 条",
+        ]
+        if result.merged:
+            parts.append(f"补齐 {result.merged} 条")
         yield event.plain_result(
-            f"✅ {result.message}\n写入 {result.inserted} 条 · 跳过 {result.skipped} 条 · "
-            f"覆盖 {result.overwritten} 条 → 群 {result.target_group_id}"
+            f"✅ {result.message}\n" + " · ".join(parts) + f" → 群 {result.target_group_id}"
         )
 
     async def _cmd_verify(self, event, args):

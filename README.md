@@ -68,7 +68,7 @@ pip install -r astrbot-plugin-Backup/backup/requirements.txt
 | `/backup diff <备份ID1> <备份ID2>` | 对比两个备份 |
 | `/backup clean [天数]` | 清理旧备份记录与过期导出/媒体（消息本身不删） |
 
-恢复的冲突策略：`--strategy skip`（默认，跳过已存在）/ `overwrite`（覆盖）/ `merge`（补齐缺失）。
+恢复的冲突策略：`--strategy skip`（默认，跳过已存在）/ `overwrite`（整条覆盖，含内容）/ `merge`（只补库里缺的字段——内容、媒体路径、引用、发送者名字，本地已有的值不动）。
 
 ## 配置
 

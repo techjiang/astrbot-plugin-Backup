@@ -655,6 +655,63 @@ class Database:
             sql += f" LIMIT {int(limit)}"
         return [self._row_to_message(r) for r in self.query(sql, params)]
 
+    def overwrite_message(self, msg: Message, backup_id: str = "") -> None:
+        """整条覆盖写入（恢复的 overwrite 策略）。
+
+        `save_message` 的 UPDATE 分支故意只动归属和媒体路径——日常备份不该把已有
+        消息的内容改掉。要真覆盖就得显式调这里。
+        """
+        self.execute(
+            """UPDATE messages
+               SET sender_id = ?, sender_name = ?, timestamp = ?, message_type = ?,
+                   content = ?, raw_content = ?, reply_to = ?, is_forward = ?,
+                   media_paths = ?, forward_chain = ?
+               WHERE message_id = ? AND group_id = ?""",
+            (
+                msg.sender_id,
+                msg.sender_name,
+                to_db(msg.timestamp),
+                msg.message_type.value,
+                msg.content,
+                msg.raw_content,
+                msg.reply_to,
+                1 if msg.is_forward else 0,
+                json.dumps(msg.media_paths, ensure_ascii=False),
+                json.dumps(msg.forward_chain, ensure_ascii=False),
+                msg.message_id,
+                msg.group_id,
+            ),
+        )
+        if backup_id:
+            self.assign_message_backup(msg.message_id, msg.group_id, backup_id)
+
+    def apply_merge(self, msg: Message) -> None:
+        """把补齐后的字段写回去（恢复的 merge 策略）。
+
+        `save_message` 的 UPDATE 分支不动内容，所以合并不是 upsert 能表达的事，
+        单独写一条 UPDATE 更清楚。归属、媒体缓存等其它列一概不碰。
+        """
+        self.execute(
+            """UPDATE messages
+               SET content = ?, sender_name = ?, reply_to = ?, media_paths = ?
+               WHERE message_id = ? AND group_id = ?""",
+            (
+                msg.content,
+                msg.sender_name,
+                msg.reply_to,
+                json.dumps(msg.media_paths, ensure_ascii=False),
+                msg.message_id,
+                msg.group_id,
+            ),
+        )
+
+    def get_message(self, message_id: str, group_id: int) -> Optional[Message]:
+        row = self.query_one(
+            "SELECT * FROM messages WHERE message_id = ? AND group_id = ?",
+            (str(message_id), group_id),
+        )
+        return self._row_to_message(row) if row else None
+
     @staticmethod
     def _row_to_message(row: sqlite3.Row) -> Message:
         try:
@@ -797,6 +854,25 @@ class Database:
 
     def get_media_for_message(self, message_id: str) -> list[sqlite3.Row]:
         return self.query("SELECT * FROM media_files WHERE message_id = ?", (message_id,))
+
+    def find_media_by_url(self, group_id: int, message_id: str, url: str) -> Optional[str]:
+        """这条消息的这个 URL 已经落过盘吗？返回落盘路径。
+
+        媒体去重原来只有一层「进程内 URL → 路径」的字典，重启即空。重启之后
+        同一条消息的同一张图会被判定成「没下过」再下一遍、落成新文件，旧文件
+        留在盘上没人认领——`/backup clean` 只删得掉库里登记过的那些，剩下的就是
+        纯泄漏。库里这一行才是「下过没有」的真凭据。
+        """
+        row = self.query_one(
+            """SELECT local_path FROM media_files
+               WHERE message_id = ? AND original_url = ? AND group_id = ?
+               ORDER BY id DESC LIMIT 1""",
+            (message_id, url, group_id),
+        )
+        if not row:
+            return None
+        local = str(row["local_path"] or "")
+        return local if local and Path(local).is_file() else None
 
     # ---------- 备份记录 ----------
     def save_record(self, record: BackupRecord) -> None:

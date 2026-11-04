@@ -319,6 +319,14 @@ class BackupEngine:
         for i, url in enumerate(list(msg.media_paths)):
             if not isinstance(url, str) or not url.startswith("http"):
                 continue
+            # 先问库：这条消息的这个 URL 是不是已经下过了。内存里那份 URL 索引
+            # 重启就空，只靠它会让同一张图每重启一次就多落一份文件。
+            known = self.db.find_media_by_url(msg.group_id, msg.message_id, url)
+            if known:
+                msg.media_paths[i] = known
+                ok += 1
+                self._ensure_media_row(msg, url, known)
+                continue
             try:
                 local = await self.media.download(url, msg.message_id, msg.timestamp)
                 msg.media_paths[i] = local
@@ -341,6 +349,24 @@ class BackupEngine:
                 )
                 msg.media_paths[i] = f"[下载失败] {url}"
         return ok, failed
+
+    def _ensure_media_row(self, msg: Message, url: str, local: str) -> None:
+        """文件已在盘上、库里那行却没了：补登记，别让它成为没人认领的孤儿。"""
+        p = Path(local)
+        try:
+            size = p.stat().st_size
+        except OSError:
+            return
+        self.db.save_media(
+            message_id=msg.message_id,
+            group_id=msg.group_id,
+            original_url=url,
+            local_path=local,
+            filename=p.name,
+            file_size=size,
+            mime_type=mimetypes.guess_type(p.name)[0] or "",
+            sha256=self.media.sha256_of(p),
+        )
 
     def watermark(self, group_id: int) -> tuple[datetime, str]:
         """上次备份停在哪 —— 增量点与库里最新一条消息取更靠后的那个。

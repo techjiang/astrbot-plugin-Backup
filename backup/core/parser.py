@@ -5,11 +5,14 @@
 """
 
 import json
+import logging
 import time
 from datetime import datetime
 from typing import Any, Optional
 
 from .models import Message, MessageType
+
+logger = logging.getLogger(__name__)
 
 _TYPE_KEYS = {
     "text": MessageType.TEXT,
@@ -68,10 +71,17 @@ def _naive(dt: datetime) -> datetime:
 
 
 def _raw_json(obj: Any) -> str:
+    """原始消息留档。
+
+    `default=str` 在这条路径上是错的：平台对象变成 `"<astrbot... object at
+    0x7f...>"`，看着存下来了，其实什么也没存到。退化成 `repr()` 更糟——对象
+    repr 里常带大段正文，红线 1 说了消息内容不进日志/落盘。取不到就存空串。
+    """
     try:
-        return json.dumps(obj, ensure_ascii=False, default=str)
+        return json.dumps(obj, ensure_ascii=False)
     except (TypeError, ValueError):
-        return str(obj)
+        logger.debug("原始消息无法序列化，raw_content 留空：%s", type(obj).__name__)
+        return ""
 
 
 def _segments(raw: Any) -> list:
@@ -173,7 +183,16 @@ def parse_message(raw: Any, group_id: Optional[int] = None) -> Message:
             texts.append(raw)
             types.append(MessageType.TEXT)
         else:
-            types.append(MessageType.UNKNOWN)
+            # 消息链里可能有嵌套段：`{'type':'text','data':[{'text':...}]}`、合并转发
+            # 的节点、平台自带的富文本。取不到就记 UNKNOWN，但**内容不能丢**——
+            # 备份插件最不该做的就是「备份了条消息，内容是空的」。
+            # 从「消息链」往下抠，而不是从 raw 整体：raw 的键里混着 message_id、
+            # sender 这类元数据，整份钻下去只会把 ID 和昵称当正文捡回来。
+            nested: list[str] = []
+            for seg in _segments(raw):
+                nested.extend(_nested_texts(seg))
+            texts.extend(nested)
+            types.append(MessageType.TEXT if texts else MessageType.UNKNOWN)
 
     if is_forward:
         message_type = MessageType.FORWARD
@@ -198,6 +217,43 @@ def parse_message(raw: Any, group_id: Optional[int] = None) -> Message:
         is_forward=is_forward,
         forward_chain=forward_chain,
     )
+
+
+def _nested_texts(raw: Any, depth: int = 0, in_data: bool = False) -> list[str]:
+    """尽力把认不出的结构里的文字抠出来。
+
+    只做两件事：认得的键（text/content/name）取值，值是 list/dict 就往下钻。
+    深度有上限，避免平台给个自引用结构就把备份卡死在这里。
+
+    进了 `data` 就只认 text/content——那是消息段自己的数据袋，`name` 和
+    `message` 在那里是「文件名」「消息 ID」一类的元数据，捡回来就是给消息内容
+    掺假。
+    """
+    if depth > 4 or raw is None:
+        return []
+    if isinstance(raw, str):
+        if in_data:
+            # data 袋里的裸字符串没有语义，多半是文件 ID 或 URL，不当正文
+            return []
+        return [raw] if raw.strip() else []
+    if isinstance(raw, (list, tuple)):
+        out: list[str] = []
+        for item in raw:
+            out.extend(_nested_texts(item, depth + 1, in_data))
+        return out
+    if not isinstance(raw, dict) and not hasattr(raw, "__dict__"):
+        return []
+    out = []
+    for key in ("text", "content", "message", "data", "name"):
+        if in_data and key in ("message", "name", "data"):
+            continue
+        value = _get(raw, key)
+        if isinstance(value, str):
+            if value.strip():
+                out.append(value)
+        elif isinstance(value, (list, tuple, dict)):
+            out.extend(_nested_texts(value, depth + 1, in_data or key == "data"))
+    return out
 
 
 def _join_texts(texts: list[str]) -> str:

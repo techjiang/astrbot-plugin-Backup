@@ -3,7 +3,7 @@
 import json
 import logging
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -40,6 +40,7 @@ class RestoreResult:
     skipped: int
     overwritten: int
     checksum_ok: bool
+    merged: int = 0
     message: str = ""
 
 
@@ -144,7 +145,7 @@ class RestoreEngine:
                 f"备份包里的消息都不属于群 {source_group}，拒绝恢复"
             )
 
-        inserted = skipped = overwritten = 0
+        inserted = skipped = overwritten = merged = 0
         for msg in messages:
             msg.group_id = target
             existed = self.db.message_exists(msg.message_id, target)
@@ -153,14 +154,25 @@ class RestoreEngine:
                     skipped += 1
                     continue
                 if strategy == "overwrite":
-                    # 删完要连来源清单一起清。`save_message` 是 upsert，行还在库里时
-                    # 它会走 UPDATE 分支、返回 False，于是下面那句 `assign_message_backup`
-                    # 不会执行——消息内容换成了备份里的，来源清单却还挂着「这条属于别的
-                    # 备份」的记录，之后按来源导出/恢复取出来的仍是旧内容。
-                    self.db.delete_messages(target, [msg.message_id])
+                    # 内容换掉、来源登记也换掉：老备份不能再说「这条我覆盖过」，
+                    # 否则按来源导出/恢复取出来的还是覆盖前的旧内容。
+                    #
+                    # 不能只靠 `save_message` 的 upsert——UPDATE 分支不会改内容
+                    # （那是 merge 的活），得显式写。
+                    self.db.overwrite_message(msg, backup_id)
                     self.db.delete_sources(target, [msg.message_id])
+                    self.db.add_sources(backup_id, [msg])
                     overwritten += 1
-                # merge：保留原有，仅补齐缺失字段（这里等同跳过，但不计数为 skip）
+                    continue
+                elif strategy == "merge":
+                    # merge 原来只是「不计数地跳过」——文档写着三种策略，实际只有两种
+                    # 行为。现在只补缺的那几格：内容、媒体路径、引用、发送者名字。
+                    # 不删行、不换归属，本地已有的值一概不覆盖。
+                    if self._merge_missing(target, msg):
+                        merged += 1
+                    else:
+                        skipped += 1
+                    continue
             if self.db.save_message(msg, backup_id):
                 inserted += 1
             elif not existed:
@@ -170,9 +182,12 @@ class RestoreEngine:
 
         # 换台机器恢复时本地没有记录也没有快照。缺了它们：`/backup list` 看不到这次
         # 恢复、导出的包里没有群名和成员、按备份取数也取不到——包白恢复了。
-        self._ensure_record(backup_id, target, messages, manifest)
+        rebuilt = self._ensure_record(backup_id, target, messages, manifest, source_group)
         self._ensure_snapshot(backup_id, target, manifest)
-        self.db.add_sources(backup_id, [m for m in messages if m.group_id == target])
+        # `_ensure_record` 重建记录时已经把清单按源群登记过一遍；这里再按目标群登记
+        # 一次只会让同一份备份挂出两套「覆盖过谁」，之后 export/diff 取数翻倍
+        if not rebuilt:
+            self.db.add_sources(backup_id, [m for m in messages if m.group_id == target])
 
         return RestoreResult(
             backup_id=backup_id,
@@ -180,9 +195,38 @@ class RestoreEngine:
             inserted=inserted,
             skipped=skipped,
             overwritten=overwritten,
+            merged=merged,
             checksum_ok=True,
             message="恢复完成",
         )
+
+    def _merge_missing(self, group_id: int, incoming: Message) -> bool:
+        """把库里这条消息缺的字段补上，返回是否真的改过。已有的值一个不动。"""
+        current = self.db.get_message(incoming.message_id, group_id)
+        if current is None:
+            return False
+        filled = {
+            "content": incoming.content if not current.content else current.content,
+            "media_paths": current.media_paths or incoming.media_paths,
+            "reply_to": current.reply_to or incoming.reply_to,
+            "sender_name": current.sender_name or incoming.sender_name,
+        }
+        if (
+            filled["content"] == current.content
+            and list(filled["media_paths"]) == list(current.media_paths)
+            and filled["reply_to"] == current.reply_to
+            and filled["sender_name"] == current.sender_name
+        ):
+            return False
+        merged_msg = replace(
+            current,
+            content=filled["content"],
+            media_paths=filled["media_paths"],
+            reply_to=filled["reply_to"],
+            sender_name=filled["sender_name"],
+        )
+        self.db.apply_merge(merged_msg)
+        return True
 
     def _trusted_checksum(self, backup_id: str) -> Optional[str]:
         """记录里那份校验和，是本地库里唯一没被包作者碰过的指纹。"""
@@ -346,10 +390,16 @@ class RestoreEngine:
         allowed = {record.backup_id}
         if realtime and realtime["c"] > 0:
             allowed.add(REALTIME_BACKUP_ID)
+        # 来源清单里登记过的不算夹带：同一个包恢复第二次时，第一次已经把消息
+        # 落进目标群、登记成本次恢复的来源，而它们的归属是记录里的原群号——
+        # 只看归属会把第二个一模一样的恢复命令判成「包里有别人的消息」，
+        # 拦下的却正是同一个包。
+        registered = self.db.source_message_ids(record.backup_id)
         stray = [
             m.message_id
             for m in messages
             if self.db.message_exists(m.message_id, m.group_id)
+            and str(m.message_id) not in registered
             and self.db.message_backup_id(m.message_id, m.group_id) not in allowed
         ]
         if stray:
@@ -391,18 +441,34 @@ class RestoreEngine:
                 pass
         return record.group_id if record is not None else None
 
-    def _ensure_record(self, backup_id: str, target: int, messages: list, manifest: dict) -> None:
-        """本地没有这条记录就按包清单补一条，让后面的 list/export/diff 认得它。"""
+    def _ensure_record(
+        self,
+        backup_id: str,
+        target: int,
+        messages: list,
+        manifest: dict,
+        source_group: Optional[int] = None,
+    ) -> bool:
+        """本地没有这条记录就按包清单补一条，让后面的 list/export/diff 认得它。
+
+        来源清单也一起补：记录有了、清单却是空的，第二次恢复同一个包时 `_check_content`
+        会按「记录名下一条消息都不在包里」判定这批陌生消息是夹带（换机恢复的判据），
+        于是第二个一模一样的恢复命令被拒。清单写的是「这份备份覆盖过谁」，恢复完
+        就该有。
+        """
         if self.db.get_record(backup_id) is not None:
-            return
+            return False
         from .models import BackupRecord, BackupStatus
 
+        # 记录归属「源群」：来源清单和归属都是按 (源群, 消息) 认的，写到目标群上
+        # 就等于宣布「这条备份属于目标群」，之后按源群取数一条都取不到
+        owner_group = source_group or target
         raw = (manifest or {}).get("record") or {}
         started = self._parse_dt(raw.get("started_at")) or datetime.now()
         self.db.save_record(
             BackupRecord(
                 backup_id=backup_id,
-                group_id=target,
+                group_id=owner_group,
                 status=BackupStatus.COMPLETED,
                 started_at=started,
                 finished_at=self._parse_dt(raw.get("finished_at")) or datetime.now(),
@@ -412,7 +478,11 @@ class RestoreEngine:
                 error="由备份包恢复时重建的记录",
             )
         )
-        logger.info("按备份包重建记录 %s → 群 %s", backup_id, target)
+        # 清单按「源群 + 消息」登记。用 replace 而不是原地改 msg.group_id：消息
+        # 还要按目标群写库，改坏了会把整批消息搬回源群
+        self.db.add_sources(backup_id, [replace(m, group_id=owner_group) for m in messages])
+        logger.info("按备份包重建记录 %s（源群 %s）", backup_id, owner_group)
+        return True
 
     def _ensure_snapshot(self, backup_id: str, target: int, manifest: dict) -> None:
         """用包清单里的群信息/成员补一份快照。
