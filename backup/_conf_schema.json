@@ -144,6 +144,17 @@
       }
     }
   },
+  "dashboard": {
+    "type": "object",
+    "description": "面板公网地址（只读参考；链接前缀优先用 export.base_url，留空时从这里取）",
+    "items": {
+      "public_url": {
+        "type": "string",
+        "description": "面板的公网地址，如 https://bot.example.com .留空时自动读 AstrBot 面板配置里的 dashboard 地址",
+        "default": ""
+      }
+    }
+  },
   "permission": {
     "type": "object",
     "description": "权限",

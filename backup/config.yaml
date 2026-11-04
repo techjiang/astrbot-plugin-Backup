@@ -38,6 +38,12 @@ backup:
     # 自建网关就填网关上兑换 token 的地址。
     base_url: ""
 
+  # 面板公网地址。下载链接要发到群里，前缀必须是群成员点得到的地址：
+  # 优先 export.base_url，留空时用这里的 public_url（再留空则读 AstrBot 面板
+  # 配置里的 dashboard 地址），都没有就退回裸路径并提示去配。
+  dashboard:
+    public_url: ""
+
   permission:
     require_admin: true
     allow_private: true

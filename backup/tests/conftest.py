@@ -1,4 +1,5 @@
 import sys
+import types
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -72,3 +73,62 @@ def raw_history(n: int, group_id: int = 100) -> list[dict]:
             }
         )
     return out
+
+
+# ---- AstrBot 替身：让 main.py 在容器里也能 import（没有真 AstrBot）----
+
+
+def install_fake_astrbot(monkeypatch):
+    class AstrMessageEvent:  # noqa: N801
+        pass
+
+    class Context:
+        def __init__(self):
+            self.registered = []
+
+        def register_web_api(self, route, view, methods, desc):  # noqa: ARG002
+            self.registered.append(route)
+
+    class Star:
+        def __init__(self, context):
+            self.context = context
+
+    def register(*_a, **_k):
+        def deco(cls):
+            return cls
+
+        return deco
+
+    class Filter:
+        class EventMessageType:
+            ALL = "ALL"
+
+        @staticmethod
+        def command(_name):
+            return lambda fn: fn
+
+        @staticmethod
+        def event_message_type(_kind):
+            return lambda fn: fn
+
+    api_event = types.ModuleType("astrbot.api.event")
+    api_event.AstrMessageEvent = AstrMessageEvent
+    api_event.filter = Filter
+    api_star = types.ModuleType("astrbot.api.star")
+    api_star.Context = Context
+    api_star.Star = Star
+    api_star.register = register
+    pkg = types.ModuleType("astrbot")
+    pkg.__path__ = []
+    api = types.ModuleType("astrbot.api")
+    api.__path__ = []
+    api.event = api_event
+    api.star = api_star
+    for name, mod in (
+        ("astrbot", pkg),
+        ("astrbot.api", api),
+        ("astrbot.api.event", api_event),
+        ("astrbot.api.star", api_star),
+    ):
+        monkeypatch.setitem(sys.modules, name, mod)
+    return Context

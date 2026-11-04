@@ -101,7 +101,9 @@ backup:
   export:
     default_format: "sqlite"  # /backup export 不带格式时用它
     download_link_expire: "24h"
-    base_url: ""              # 下载链接前缀 <base_url>/<token>；留空自动用面板地址
+    base_url: ""              # 下载链接前缀 <base_url>/<token>；留空自动推断（见下）
+  dashboard:
+    public_url: ""            # 面板公网地址，如 https://bot.example.com
   permission:
     require_admin: true       # 仅群主/管理员可用
     allow_private: true       # 私聊里没有管理员概念，关掉则私聊一律拒绝
@@ -133,8 +135,12 @@ backup:
 导出后插件会回一条链接，形状是 `<面板地址>/api/backup/download/<token>`。
 
 - **直接发群里就行。** 这条前缀在 AstrBot 4.14 的 Web 鉴权白名单里，群成员点开即下，
-  不需要登录面板。`export.base_url` 留空时用面板自己的公网地址拼；找不到就退回裸路
-  径并提示你去配。
+  不需要登录面板。
+- **域名从哪来？** 依次找：`export.base_url` → `dashboard.public_url`（以及 AstrBot
+  宿主配置里的面板地址）→ **这条 `/backup export` 消息是从哪个域名进来的**（读 `Host`
+  与 `X-Forwarded-Host`，反代/内网穿透部署下通常只有这一条可用）。三条都落空才退回裸
+  路径并提示你去配。内网地址（`localhost`、`127.x`、`192.168.x`、`10.x`、`172.16-31.x`）
+  一律不认——拼出来发到群里没人点得动。
 - **token 一次性。** 存在数据库里，重启依然有效，过期即作废，只认 `exports/` 目录内的
   文件。链接转发出去不会被反复领取——但浏览器的 `Range` 探测与续传算同一次下载，不会
   因此变成「下了一半」。

@@ -56,6 +56,80 @@ def _looks_like_archive(token: str) -> bool:
     return text.lower().endswith(".zip") or "/" in text or "\\" in text
 
 
+#: 拼下载链接时一律不认的本机/内网地址：拼出来发到群里没人点得动
+_PRIVATE_HOST_HINTS = (
+    "localhost",
+    "127.",
+    "0.0.0.0",
+    "10.",
+    "192.168.",
+    "169.254.",
+    "[::1]",
+)
+
+
+def _header(headers, name: str) -> str:
+    """大小写不敏感地取一个请求头。dict / Werkzeug Headers / aiohttp 都吃。"""
+    try:
+        value = headers.get(name)
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    try:
+        for key, value in headers.items():  # type: ignore[union-attr]
+            if str(key).lower() == name.lower():
+                return str(value)
+    except Exception:
+        pass
+    return ""
+
+
+def _is_public_host(host: str) -> bool:
+    bare = host.split("/")[0].strip().lower()
+    if not bare:
+        return False
+    hostname = bare.rsplit(":", 1)[0] if bare.count(":") == 1 else bare
+    if any(hostname.startswith(hint) for hint in _PRIVATE_HOST_HINTS):
+        return False
+    for prefix in ("172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.30.", "172.31."):
+        if hostname.startswith(prefix):
+            return False
+    return True
+
+
+def _dashboard_host(config: dict) -> str:
+    """面板自己的配置里有没有记着公网地址。
+
+    AstrBot 的面板地址存在**宿主**配置里（`data/cmd_config.json` 的 `dashboard`），
+    插件注入的配置里通常没有这一项。所以顺带翻一次宿主的：拿到就是赚到，拿不到
+    不报错——这条只影响"链接里有没有域名"，不该让导出本身失败。
+    """
+    candidates = []
+    try:
+        from astrbot.core import astrbot_config  # type: ignore
+
+        getter = getattr(astrbot_config, "get_config", None)
+        if callable(getter):
+            candidates.append(getter())
+        for name in ("ASTRBOT_CONFIG", "astrbot_config"):
+            value = getattr(astrbot_config, name, None)
+            if isinstance(value, dict):
+                candidates.append(value)
+    except Exception:
+        pass
+    for data in candidates:
+        try:
+            dashboard = (data or {}).get("dashboard") or {}
+        except Exception:
+            continue
+        for key in ("public_url", "base_url", "webui_url", "host"):
+            value = dashboard.get(key)
+            if isinstance(value, str) and value.startswith(("http://", "https://")):
+                return value.rstrip("/")
+    return ""
+
+
 def _event_self_id(event):
     """机器人自己的 QQ/用户 id，用来把「我说的话」放在气泡右侧。"""
     for name in ("get_self_id", "self_id", "bot_id"):
@@ -340,7 +414,7 @@ class BackupPlugin(Star):
         except Exception as e:
             yield event.plain_result(f"导出失败：{e}")
             return
-        base = self._public_base_url()
+        base = self._public_base_url(event)
         link = f"{base}/{result.token}" if base else ""
         hint = ""
         if not link:
@@ -713,17 +787,23 @@ class BackupPlugin(Star):
             )
         return bool(registered)
 
-    def _public_base_url(self) -> str:
+    def _public_base_url(self, request=None) -> str:
         """下载链接的前缀。返回 `<base>`，完整链接是 `<base>/<token>`。
 
         链接是要发到群里的，前面必须是一个群成员点得到的地址。`export.base_url`
         空着的时候，`/backup export` 原来只给一个裸路径 `/backup/download/<token>`
         ——发到 QQ 群里没人点得动。
 
-        所以空着的时候从面板配置里找公网地址（各种写法都认），拼成
-        `http://<面板>/api/backup/download`：这条前缀在 AstrBot 4.14 的
-        `auth_middleware` 白名单里，不需要面板 JWT。都找不到就返回空，上层退回
-        裸路径并提示去配 `export.base_url`。
+        找地址的顺序（前面能定就不再往后找）：
+
+        1. `export.base_url`：你明确指定的；
+        2. 面板配置里的公网地址（`dashboard.public_url` 等几种写法都认）；
+        3. **当前这条消息来自哪个地址**——反代/内网穿透部署下，配置里往往没有
+           任何公网地址，但消息本身是从一个群成员点得到的域名进来的。取 `Host`
+           头 + 转发协议拼出 `http(s)://<host>/api/backup/download`，这条前缀在
+           AstrBot 4.14 的 `auth_middleware` 白名单里，点开不需要面板 JWT。
+
+        三条都落空就返回空串，上层退回裸路径并提示去配 `export.base_url`。
         """
         export_cfg = self.config.get("export") or {}
         explicit = str(export_cfg.get("base_url") or "").strip()
@@ -738,6 +818,8 @@ class BackupPlugin(Star):
                     host = value.rstrip("/")
                     break
             if not host:
+                host = self._host_from_request(request) or _dashboard_host(self.config)
+            if not host:
                 return ""
             base = f"{host}/api/backup/download"
         # base_url 的语义是「链接前缀」。写成 `/api/plug`、`/api/backup/download`、
@@ -751,9 +833,29 @@ class BackupPlugin(Star):
         self.exports.set_base_url(base)
         return base
 
-    def download_link(self, token: str) -> str:
+    @staticmethod
+    def _host_from_request(request) -> str:
+        """从"这条消息是从哪个地址进来的"反推公网源。拿不到返回空串。
+
+        反代后面 `Host` 头是内网地址、真实域名在 `X-Forwarded-Host` 里；协议同理
+        看 `X-Forwarded-Proto`。内网/本机地址一律不认——`192.168.x.x` 拼出来的
+        链接发到群里没人点得动，不如老实说"没配公网地址"。
+        """
+        if request is None:
+            return ""
+        headers = getattr(request, "headers", None) or {}
+        host = _header(headers, "X-Forwarded-Host") or _header(headers, "Host")
+        host = str(host or "").split(",")[0].strip()
+        if not host or not _is_public_host(host):
+            return ""
+        proto = str(_header(headers, "X-Forwarded-Proto") or "").split(",")[0].strip()
+        if proto not in ("http", "https"):
+            proto = "https" if str(getattr(request, "scheme", "") or "") == "https" else "http"
+        return f"{proto}://{host}"
+
+    def download_link(self, token: str, request=None) -> str:
         """给用户看的完整链接。没配公网地址时退回裸路径（可下载但点不动）。"""
-        base = self._public_base_url()
+        base = self._public_base_url(request)
         if not base:
             return f"/backup/download/{token}"
         return f"{base.rstrip('/')}/{token}"

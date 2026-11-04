@@ -20,68 +20,12 @@ from pathlib import Path
 
 import pytest
 
-from .conftest import make_message
-
-
-def _install_fake_astrbot(monkeypatch):
-    class AstrMessageEvent:  # noqa: N801
-        pass
-
-    class Context:
-        def __init__(self):
-            self.registered = []
-
-        def register_web_api(self, route, view, methods, desc):  # noqa: ARG002
-            self.registered.append(route)
-
-    class Star:
-        def __init__(self, context):
-            self.context = context
-
-    def register(*_a, **_k):
-        def deco(cls):
-            return cls
-
-        return deco
-
-    class Filter:
-        class EventMessageType:
-            ALL = "ALL"
-
-        @staticmethod
-        def command(_name):
-            return lambda fn: fn
-
-        @staticmethod
-        def event_message_type(_kind):
-            return lambda fn: fn
-
-    api_event = types.ModuleType("astrbot.api.event")
-    api_event.AstrMessageEvent = AstrMessageEvent
-    api_event.filter = Filter
-    api_star = types.ModuleType("astrbot.api.star")
-    api_star.Context = Context
-    api_star.Star = Star
-    api_star.register = register
-    pkg = types.ModuleType("astrbot")
-    pkg.__path__ = []
-    api = types.ModuleType("astrbot.api")
-    api.__path__ = []
-    api.event = api_event
-    api.star = api_star
-    for name, mod in (
-        ("astrbot", pkg),
-        ("astrbot.api", api),
-        ("astrbot.api.event", api_event),
-        ("astrbot.api.star", api_star),
-    ):
-        monkeypatch.setitem(sys.modules, name, mod)
-    return Context
+from .conftest import install_fake_astrbot, make_message
 
 
 @pytest.fixture
 def main_mod(tmp_path, monkeypatch):
-    _install_fake_astrbot(monkeypatch)
+    install_fake_astrbot(monkeypatch)
     sys.modules.pop("backup.main", None)
     import backup.main as mod
 
@@ -169,7 +113,13 @@ class _FakeFlaskRequest:
 
 
 def test_view_returns_flask_friendly_tuple(plugin, monkeypatch):
-    """Flask 只认 str/bytes/dict/Response 之类。返回自定义 dataclass 会 500。"""
+    """Flask 只认 str/bytes/dict/Response 之类。返回自定义 dataclass 会 500。
+
+    兜底不算数：原来这里靠 `_as_flask` 里 `from werkzeug...` 的 try/except 混过去，
+    没有 Werkzeug 的环境（`requirements.txt` 漏了它）就把自定义 dataclass 原样丢给
+    Flask，真机上是 500。所以这条断言必须是「有 Werkzeug」的前提下的断言。
+    """
+    pytest.importorskip("werkzeug")
     from backup.core import download_route
 
     plugin.db.save_message(make_message(0), "bk1")
@@ -197,8 +147,29 @@ def test_view_without_any_argument_is_not_a_typeerror(plugin, monkeypatch):
     assert response.status == 404
 
 
+def test_view_returns_410_when_werkzeug_absent(plugin, monkeypatch):
+    """没装 Werkzeug 时下载视图会退化成自定义对象（Filter 那边压根不理），宿主侧
+    一律 500。这里把退化后的形状钉住：`status` 与 `file` 都在，接入层照抄即可发。
+    """
+    from backup.core import download_route
+
+    def no_werkzeug(*_a, **_k):
+        raise ImportError("no werkzeug")
+
+    plugin.db.save_message(make_message(0), "bk1")
+    result = plugin.exports.export(100, "zip", backup_id="bk1")
+    fake = _FakeFlaskRequest(f"/api/backup/download/{result.token}")
+    monkeypatch.setattr(download_route, "_current_request", lambda: fake)
+    monkeypatch.setitem(sys.modules, "werkzeug", no_werkzeug)
+    monkeypatch.setitem(sys.modules, "werkzeug.wrappers", no_werkzeug)
+    response = asyncio.run(download_route.make_view(plugin.exports, stream=False)())
+    assert response.status == 200
+    assert response.file == result.path
+
+
 def test_view_reads_token_from_path_tail(plugin, monkeypatch):
     """群里点的是 `/api/backup/download/<token>`，token 在路径尾段。"""
+    pytest.importorskip("werkzeug")
     from backup.core import download_route
 
     plugin.db.save_message(make_message(0), "bk1")

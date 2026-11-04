@@ -1,3 +1,7 @@
 apscheduler>=3.10,<4
 aiohttp>=3.9
 pyyaml>=6.0
+# 下载链路要给 Flask 回一个 Werkzeug Response：`DownloadResponse` 不是 Flask 认的
+# 类型，直接 return 是 500。而 `_as_flask` 里对 Werkzeug 的导入是 try/except 兜底，
+# 缺了它不报错——只是所有下载悄悄退化成「200 + 空 body」。所以必须显式依赖。
+werkzeug>=2.2

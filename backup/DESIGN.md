@@ -636,6 +636,22 @@ zip，目录本身留着（本地翻着方便）。
 点的，`/backup/download` 是面板按钮 + query token，`/download/<token>` 兜住宿主自己
 吃掉前缀的情况。
 
+**域名只有一个来源是不够的**
+
+`_public_base_url` 原来只认 `export.base_url` 和 `config["dashboard"]`，而后者在
+`_conf_schema.json` 和 `config.yaml` 里**根本没有**——面板上填不了，文案却写着「留空
+则用面板公网地址自动拼」。结果默认配置下永远拼不出链接，用户看到的是裸路径。
+现在多了第三条也是最后一条路：**这条消息是从哪个域名进来的**，读 `Host` /
+`X-Forwarded-Host`（逗号列表取第一跳）+ `X-Forwarded-Proto`。反代和内网穿透部署下，
+配置里往往一个公网地址都没有，但请求本身就是从群成员点得到的域名过来的——这是唯一
+现成的真相。内网与本机地址（`localhost` / `127.` / `192.168.` / `10.` / `172.16-31.`）
+不认，宁可让用户看见「没配公网地址」，也不要给一条点不动的链接。
+
+顺带补上依赖：`_as_flask` 里对 `werkzeug` 的导入是 try/except 兜底，而
+`requirements.txt` 没写它。缺了不报错，只是每次下载都退化成自定义对象——假 Request 的
+用例把 `body` 当字节读，永远看不见这一层；只有真 Werkzeug 会说话。现在它进了依赖，
+并且用例里用 `importorskip` 钉住「装了就必须是 Werkzeug Response」。
+
 **配置从来没读过面板那份**
 
 `star_manager` 见到 `_conf_schema.json` 就建一个 `AstrBotConfig`（落在
