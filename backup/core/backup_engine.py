@@ -92,8 +92,34 @@ def _unwrap_messages(result) -> Optional[list]:
     return None
 
 
+def _seq_of(raw) -> str:
+    """这条消息在平台侧的**翻页序号**（OneBot 的 `message_seq`）。
+
+    和 `_raw_id` 是两个东西：`message_id` 是全局唯一串（OneBot 里常是
+    `-1234567890` 这种负数或带前缀的串），`message_seq` 才是能当锚点回传的
+    序号。`_oldest_id` 原先把 `_raw_id` 的结果当锚点，而 `_raw_id` 优先取
+    `message_id`——于是把 `m99` 喂回平台的 `message_seq` 参数，平台侧
+    `int('m99')` 直接抛 `ValueError`，异常一路冒出引擎，整次备份判 failed：
+    消息一条没拉到，日志里只有一句看不懂的 `ValueError`。
+
+    取不到序号时退回 `message_id`：有些不走 OneBot 的适配器只有这一个 ID，
+    而它确实能当锚点用（测试替身、部分私有实现）。真正要防的是**混用**——
+    消息上同时有两个字段时，必须取 `message_seq`；只有 `message_id` 时才用它。
+    """
+    def pick(obj, key):
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    for key in ("message_seq", "message_id", "id"):
+        value = pick(raw, key)
+        if value is not None and value != "":
+            return str(value)
+    return ""
+
+
 def _oldest_id(batch: list, newest_first: bool = False) -> str:
-    """一页消息里最旧那条的 ID，用来当下一页的翻页锚点。
+    """一页消息里最旧那条的**翻页序号**，用来当下一页的锚点。
 
     原来默认「第一个元素就是最旧的」，可 OneBot 的 `get_group_msg_history`
     返回的是**新→旧**（`message_seq` 是「从这条往回数 count 条」）。于是锚点
@@ -109,8 +135,8 @@ def _oldest_id(batch: list, newest_first: bool = False) -> str:
     keyed = [(raw, _raw_key(raw)) for raw in batch]
     keyed = [(raw, key) for raw, key in keyed if key is not None]
     if not keyed:
-        return _raw_id(batch[-1] if newest_first else first)
-    return _raw_id(min(keyed, key=lambda item: item[1])[0])
+        return _seq_of(batch[-1] if newest_first else first)
+    return _seq_of(min(keyed, key=lambda item: item[1])[0])
 
 
 #: 平台接口的常见参数别名。引擎统一用 `group_id`，但适配器上可能是 `gid`、
@@ -140,9 +166,16 @@ def _adapt_kwargs(fn, kwargs: dict) -> Optional[dict]:
     except (TypeError, ValueError):
         return None
     params = sig.parameters
-    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        # 收 **kwargs 的实现（适配器自己的包装层）按原样送，它自己会挑
-        return dict(kwargs)
+    # 收 `**kwargs` 不等于「什么都收」：很常见的写法是
+    # `async def get_group_history(self, gid, count=50, offset=0, **kw)` —— 显式
+    # 参数叫 `gid`，尾部再挂一个 `**kw` 兜底。原来见到 `**kwargs` 就原样透传，
+    # 于是 `group_id=` 落进 `**kw`、`gid` 永远缺参，每次调用都 TypeError，
+    # 整条历史消息拉取路径静默失败（备份报成功、0 条）。
+    # 所以别名映射必须照做，`**kwargs` 只负责兜住「映射不到、但对方也不明着拒绝」
+    # 的额外参数（比如 `message_seq`）。
+    accepts_extra = any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
     mapped: dict = {}
     for key, value in kwargs.items():
         if key in params:
@@ -153,6 +186,11 @@ def _adapt_kwargs(fn, kwargs: dict) -> Optional[dict]:
                 mapped[alias] = value
                 break
         else:
+            if accepts_extra:
+                # 对方收 **kwargs：别名映射不上也送进去，它自己会挑。但只限
+                # 「我们确实要传」的参数，不能凭这个把任意关键字都当合法
+                mapped[key] = value
+                continue
             # 这个参数它根本不收。硬送进去就是 TypeError，换名字才有意义
             return None
     required = [

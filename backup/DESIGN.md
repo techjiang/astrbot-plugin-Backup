@@ -1085,3 +1085,107 @@ count 也不认 offset 时靠它停下来。
 
 一条方法论上的事：这轮的三处都不在「我写的逻辑」里，而在「我以为平台会怎么回」
 里。假客户端替我省掉的从来不是网络，是**平台实际怎么说话**。
+
+---
+
+## 第 32 轮：装上真 AstrBot，用真 pipeline 跑一遍
+
+前 31 轮的宿主全是假的：假 `Context`、假注册器、假事件、假请求。这一轮把
+`astrbot==4.14.6` 装进来，在 `data/plugins/backup` 布局下用**真的**
+`PluginManager.load()` 加载，再用**真的** `WakingCheckStage` +
+`StarRequestSubStage` 发命令、fire 事件。
+
+四条，全部是「功能写着、用户永远走不到」。
+
+### 1. `download_link` 收了 `request`，一次都没用过
+
+```python
+def download_link(self, token: str, request=None) -> str:   # request 在函数体里出现 1 次
+    ...
+    if self.gateway.running:
+        return self.gateway.url_for(token, explicit)         # 回环地址
+```
+
+`_public_base_url` 里那套「反代后面真实域名在 `X-Forwarded-Host` 里」的推断写得
+很完整，**却没有任何调用点**（全仓 grep 只命中它自己的定义和它自己的用例）。
+
+于是反代 / 内网穿透部署下（配置里通常没有任何公网地址），发进群的永远是
+`http://127.0.0.1:<端口>/...`——群成员点的是**他自己电脑**的 127.0.0.1，一辈子
+点不开，而回执上看起来像条正常链接。
+
+现在顺序是：`export.base_url` → **这条命令从哪个域名进来** → 网关回环地址。
+请求头从两个地方取：真请求的 `.headers`，以及事件上的
+`request_headers` / `message_obj.raw_message["headers"]`（`/backup export` 手里
+是事件，不是 request）。内网与本机地址（`localhost` / `127.` / `192.168.` /
+`10.` / `172.16-31.`）一律不认。
+
+`test_round22` 里原有那条断言把错的行为钉死了——它要求带 `Host: bot.example.com`
+时链接必须是 `http://127.0.0.1:<端口>`。改成按新语义验证，并补了反代头、多跳
+列表、内网地址、显式 `base_url` 优先级四条。
+
+### 2. `_adapt_kwargs` 见 `**kwargs` 就原样透传
+
+真适配器最常见的写法是：
+
+```python
+async def get_group_history(self, gid, count=50, offset=0, **kw): ...
+```
+
+`group_id=` 落进 `**kw`，显式参数 `gid` 永远缺参 → 每次调用 `TypeError` →
+`_call` 换下一个名字 → 下一个名字根本不存在 → 返回 `None` → 备份报
+`failed`、0 条。
+
+现在别名映射照做，`**kwargs` 只负责兜「映射不到、但对方也不明着拒绝」的额外
+参数（比如 `message_seq`）。不收 `**kwargs` 的实现仍然拒绝多余参数。
+
+### 3. 锚点把 `message_id` 当 `message_seq` 回传
+
+`_raw_id` 优先取 `message_id`（OneBot 里常是 `-1234567890` 或带前缀的串），
+`_oldest_id` 直接把它当锚点喂回平台的 `message_seq` 参数——平台侧
+`int('m99')` 抛 `ValueError`，异常一路冒出引擎，整次备份判 `failed`：
+
+```
+❌ 备份 增量结束 | 消息 0 条 ... 备注：ValueError: invalid literal for int() with base 10: 'm81'
+```
+
+现在 `_seq_of` 依次取 `message_seq` → `message_id` → `id`：消息上同时有两个
+字段时必须取 `message_seq`；只有 `message_id` 时才用它（部分私有实现只有这一个
+ID，而它确实能当锚点）。
+
+### 4. `/backup restore <包> <群号>` 报「备份不存在」
+
+```python
+if target is None and _looks_like_archive(backup_id):   # ← 两头落空
+```
+
+- `target` 有值（`987654`），第一个条件不成立；
+- `len(tokens) > 2` 也不成立（只有两个参数）。
+
+于是 `archive` 留在 `None`，**包路径被当成备份 ID 去查库**，报
+「备份 …zip 不存在（本机没有这条记录，也没有给备份包）」——而那个包就躺在
+回执给的那个路径上。这是换机器恢复时**最常写的那条**命令。
+
+现在只看第一个参数的形状。
+
+### 验证
+
+- `test_round32_kwargs_alias.py`（5 条）：`gid` + `**kwargs` 的签名映射，
+  以及端到端「备份真的拉到消息而不是报 failed」
+- `test_round32_host_pipeline.py`（13 条）：真 AstrBot 实例、真网关
+
+两文件 18 条里，**旧代码上 8 条失败**。
+
+外加一个不写成用例的端到端：真 `PluginManager` 加载 → 真 pipeline 发
+`/backup now`（10 条）→ `/backup export 100 zip`（回执链接是 `https://bot.example.com/...`）
+→ 真 HTTP 200 下到 13499 字节、与盘上文件 SHA-256 一致 → 同一链接再点 410 →
+`/backup restore <包> 987654 --confirm` 写入 100 条。
+
+### 一条方法论
+
+前 31 轮我反复说「只能实机确认」。这一轮证明那句话是借口的一半：**依赖是
+开源的，装一下就有**。`pip install astrbot` 之后，`PluginManager` / `WakingCheckStage`
+/ `StarRequestSubStage` 全是可执行的真相，比读源码强、比想象强。
+
+但这轮四条里，**三条不在「字段名对不对」上，而在「谁调用谁」上**：
+`request` 传了没用、`archive` 赋值条件写错、`_public_base_url` 没有调用点。
+这些读源码看不出来——源码每一段都对自己的，缝在拼接处。

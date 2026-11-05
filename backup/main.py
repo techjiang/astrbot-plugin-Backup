@@ -514,7 +514,17 @@ class BackupPlugin(Star):
                 "用法：/backup restore <备份ID|备份包路径> [目标群号] [--strategy skip|overwrite|merge] --confirm"
             )
             return
-        if target is None and _looks_like_archive(backup_id):
+        # 「第一个参数是包」这件事只看形状，不看 `target` 有没有解析出来。
+        # 原来写的是 `if target is None and _looks_like_archive(backup_id)`，于是
+        # `/backup restore <包> <群号>` —— 换机器恢复时**最常写的那条**——两头落空：
+        # target 有值（不是 None），第一个条件不成立；`len(tokens) > 2` 也不成立
+        # （只有两个参数）。结果 `archive` 留在 None，包路径被当成备份 ID 去查库，
+        # 报一句「备份 …zip 不存在（本机没有这条记录，也没有给备份包）」——
+        # 而那个包就躺在回执给的那个路径上。
+        if _looks_like_archive(backup_id):
+            # 第一个参数是包：`<包>` 或 `<包> <群号>`，两种都从包里取备份 ID。
+            # 唯一不能取的情况是包里的 manifest 也读不出来——那时 `read_manifest`
+            # 会给一份空 dict，落到文件名当 ID，恢复时按「包不完整」拦下
             archive = backup_id
             manifest = read_manifest(archive)
             backup_id = str(manifest.get("backup_id") or Path(archive).stem)
@@ -1018,16 +1028,43 @@ class BackupPlugin(Star):
         return prefix or f"{LEGACY_PREFIX}/backup/download"
 
     @staticmethod
-    def _host_from_request(request) -> str:
+    def _headers_of(source) -> dict:
+        """从一个「可能是 request、也可能是事件」的对象上取请求头。
+
+        `/backup export` 拿得到的是 `AstrMessageEvent`，不是 HTTP 请求：事件上
+        没有 `request`，请求头藏在平台的原始事件里（`message_obj.raw_message`
+        的 `headers`，或者某些适配器直接挂在事件上）。取不到就返回空字典，
+        调用方按「不知道这条命令从哪来」处理。
+        """
+        if source is None:
+            return {}
+        for getter in (
+            lambda o: o.headers,                      # 真请求
+            lambda o: o.request.headers,              # 包了一层的
+            lambda o: o.message_obj.raw_message.get("headers")
+            if isinstance(getattr(o.message_obj, "raw_message", None), dict)
+            else None,                                # OneBot 原始事件
+            lambda o: getattr(o, "request_headers", None),
+        ):
+            try:
+                headers = getter(source)
+            except Exception:
+                continue
+            if headers:
+                return headers
+        return {}
+
+    @classmethod
+    def _host_from_request(cls, request) -> str:
         """从"这条消息是从哪个地址进来的"反推公网源。拿不到返回空串。
 
         反代后面 `Host` 头是内网地址、真实域名在 `X-Forwarded-Host` 里；协议同理
         看 `X-Forwarded-Proto`。内网/本机地址一律不认——`192.168.x.x` 拼出来的
         链接发到群里没人点得动，不如老实说"没配公网地址"。
         """
-        if request is None:
+        headers = cls._headers_of(request)
+        if not headers:
             return ""
-        headers = getattr(request, "headers", None) or {}
         host = _header(headers, "X-Forwarded-Host") or _header(headers, "Host")
         host = str(host or "").split(",")[0].strip()
         if not host or not _is_public_host(host):
@@ -1048,18 +1085,33 @@ class BackupPlugin(Star):
     def download_link(self, token: str, request=None) -> str:
         """给用户看的完整链接。
 
-        网关在跑就以网关为根：它能真正兑换 token。宿主面板那条路在 4.14 上不通
-        （注释见 `core/gateway.py`），所以面板地址只作为「配置了 export.base_url
-        且网关没开」时的退回选项。
+        顺序（前面能定就不再往后找）：
+
+        1. `export.base_url`——你明确指定的对外地址；
+        2. **这条命令是从哪个地址进来的**：`Host` / `X-Forwarded-Host`，
+           内网与本机地址一律不认（见 `_host_from_request`）；
+        3. 网关照旧给本机回环地址。
+
+        第 2 条是这一轮的修复重点。原来 `request` 收进来后**一次都没用**：
+        `_public_base_url` 里那套「反代后面真实域名在 X-Forwarded-Host 里」的
+        推断逻辑写得很完整，却没有任何调用点——它自己的用例直接调它，全绿。
+        于是反代/内网穿透部署下（配置里通常没有任何公网地址），发进群的永远是
+        `http://127.0.0.1:<端口>/...`：群成员点的是**他自己电脑**的 127.0.0.1，
+        一辈子点不开，而回执上看起来像条正常链接。
 
         全都没有时退回裸路径——明确是「点不动」，不是假装能用。
         """
         export_cfg = self.config.get("export") or {}
         explicit = str(export_cfg.get("base_url") or "").strip()
-        if getattr(self, "gateway", None) is not None and self.gateway.running:
-            return self.gateway.url_for(token, explicit)
         if explicit:
             return f"{explicit.rstrip('/')}/backup/download/{token}"
+        public = self._host_from_request(request)
+        if public:
+            # 网关只监听回环，对外那层是反代。请求本身是从群成员点得到的域名
+            # 进来的，那个域名就是唯一现成的真相
+            return f"{public}/backup/download/{token}"
+        if getattr(self, "gateway", None) is not None and self.gateway.running:
+            return self.gateway.url_for(token, "")
         # 没有网关也没有对外地址：给裸路径，让上层打「点不动」的提示。
         # 这里刻意不用 `_route_path()`——它拼出来的是宿主的挂载前缀
         # （`/api/plug/backup/download`），而那条路在 4.14 上既比不中带 token 的

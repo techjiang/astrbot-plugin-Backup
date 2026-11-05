@@ -105,22 +105,41 @@ def test_export_receipt_is_a_complete_usable_url(main_mod, monkeypatch):
     前提有两处不成立（见 `core/gateway.py` 顶部）：白名单里那条属于宿主自己的
     `BackupRoute`，而插件能挂的 `/api/plug/*` 既要过 JWT、路径又比不中带参数的形状。
 
-    所以「点得动」的唯一来源是内置网关。断言改成验证这件事：有网关时链接指向网关
-    的真实端口，没网关但有 `export.base_url` 时用它，两者都没有才退化成裸路径。
+    所以「点得动」的来源有三层：`export.base_url` → 这条命令进来的域名 → 网关
+    回环地址。这一条**原先把第一、第二层写反了**：断言「带 `Host: bot.example.com`
+    时链接必须是 `http://127.0.0.1:<端口>`」——那正是 32 轮修掉的 bug（`download_link`
+    收了 `request` 却从没用过），把「群成员点自己电脑的 127.0.0.1」当成了正确答案。
     """
     Context = sys.modules["astrbot.api.star"].Context
     monkeypatch.setattr(main_mod, "_dashboard_host", lambda _cfg: "")
     instance = main_mod.BackupPlugin(Context())
     try:
         assert instance.gateway.running, "内置网关默认应已启动"
-        link = instance.download_link("tok", _Req(headers={"Host": "bot.example.com"}))
-        assert link.startswith("http://127.0.0.1:"), link
-        assert link.endswith("/backup/download/tok"), link
-        assert str(instance.gateway.bound_port) in link
 
-        # 配了对外地址就跟着它走：反代后面群成员点的就是那个域名
+        # 请求是从哪个域名进来的，链接就用哪个域名——反代后面这是唯一现成的真相
+        link = instance.download_link("tok", _Req(headers={"Host": "bot.example.com"}))
+        assert link == "http://bot.example.com/backup/download/tok", link
+
+        # 反代/穿透：真实域名在 X-Forwarded-Host，协议在 X-Forwarded-Proto
+        link = instance.download_link(
+            "tok",
+            _Req(headers={"X-Forwarded-Host": "bak.example.com", "X-Forwarded-Proto": "https"}),
+        )
+        assert link == "https://bak.example.com/backup/download/tok", link
+
+        # 内网/本机地址不认：链路发到群里没人点得动，不如退回回环 + 让上层提示
+        link = instance.download_link("tok", _Req(headers={"Host": "192.168.1.5:8080"}))
+        assert link.startswith("http://127.0.0.1:"), link
+        assert str(instance.gateway.bound_port) in link
+        assert link.endswith("/backup/download/tok"), link
+
+        # 配了对外地址就跟着它走（优先级最高，压过请求域名）
         instance.config["export"]["base_url"] = "https://bak.example.com"
         assert instance.download_link("tok") == "https://bak.example.com/backup/download/tok"
+        assert (
+            instance.download_link("tok", _Req(headers={"Host": "other.example.com"}))
+            == "https://bak.example.com/backup/download/tok"
+        )
     finally:
         instance.gateway.stop()
         instance.db.close()
