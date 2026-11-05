@@ -177,29 +177,66 @@ def expires_header(expires_at: datetime) -> dict:
 MISSING = object()
 
 
-#: 宿主会把插件路由挂在一层自己的前缀下面，这层前缀不属于我们的路由
+#: 宿主会把插件路由挂在一层自己的前缀下面，这层前缀不属于我们的路由。按长度
+#: 从长到短匹配，削掉命中的那一层：
 #:
-#: - AstrBot 4.14 的 `srv_plug_route`：`app.add_url_rule("/api/plug/<path:subpath>")`，
-#:   所以 `request.path` 是 `/api/plug/backup/download/<token>`，多出来的**不是** `/api`
-#:   而是 `/api/plug`。
+#: - AstrBot 旧版面板（Quart）：`app.add_url_rule("/api/plug/<path:subpath>")`，
+#:   `request.path` 是 `/api/plug/backup/download/<token>`；
+#: - AstrBot 新版面板（FastAPI）：注册的 route 带插件名前缀，面板把它挂在
+#:   `/api/v1/plugins/extensions/<插件名>/` 下，`request.path` 是
+#:   `/api/v1/plugins/extensions/astrbot-plugin-Backup/backup/download/<token>`。
+#:   漏了这条，群里点的链接一律 404——而 404 和「链接已失效」在用户眼里是同一句话；
 #: - 自建网关可能挂在 `/api`、`/plug`、`/web` 下面。
-#:
-#: 原来写死只削 `"/api/"` 四个字符，于是 `request.path` 被削成
-#: `/plug/backup/download/<token>`——既不等于 `/api/backup/download/...`，也不以
-#: `/backup/download/` 开头，`handle_download` 直接回 404。而 404 和「链接已失效」
-#: 在用户眼里是同一句话：下不了。
-HOST_PREFIXES = ("/api/plug", "/plug", "/api", "/web")
+HOST_PREFIXES = (
+    "/api/v1/plugins/extensions",
+    "/api/plugins/extensions",
+    "/api/plug",
+    "/plug",
+    "/api",
+    "/web",
+)
+
+#: 旧版面板给插件路由的统一挂载点。按它算出来的链接**不带插件名**，在新版面板上
+#: 必然 404（新版挂在 `/api/v1/plugins/extensions/<插件名>/`），所以 `active_prefix`
+#: 记着这次真正注册成功的那一个前缀，拼链接时用它。
+LEGACY_PREFIX = "/api/plug"
+
+
+def _astrbot_plugin_request():
+    """AstrBot 新版面板（FastAPI）给插件 Web API 绑定的请求代理。
+
+    新版面板不在 Quart 请求上下文里调插件视图，`from quart import request` 拿到的是
+    「没有活动请求」，读一次就抛——视图 500。它自己的入口是 `astrbot.api.web.request`
+    这个上下文代理，只在 handler 执行期间可用，取不到会抛 `RuntimeError`。
+
+    这里只认它的**存在性**：拿得到就交给上层按「它和 Flask/Quart 的 request 长得
+    一样」去读（`path` / `query_string` / `headers` 都在，`query` 是带 `get` 的
+    字典形状）。
+    """
+    try:  # pragma: no cover - 取决于宿主版本
+        from astrbot.api.web import request as plugin_request
+
+        plugin_request.method  # noqa: B018 - 探一下上下文有没有绑上
+        return plugin_request
+    except Exception:
+        return None
 
 
 def _current_request():
     """拿到当前框架的请求对象。拿不到返回 None（说明不在请求上下文里）。
 
-    这里**必须**先判 Quart，不能先判 Flask：AstrBot 面板跑在 Quart（ASGI）上，
-    而 `astrbot/dashboard/server.py` 为了序列化 `import flask` 了东西（Werkzeug 也在
-    依赖树里）。先试 Flask 的话，`from flask import request` 会成功，拿到的是一个
-    「当前没有活动请求」的代理对象——`request.path` 一读就抛
-    `RuntimeError: Working outside of request context`，视图 500。
+    顺序：AstrBot 插件请求代理 → Quart → Flask。
+
+    - **必须**先判 AstrBot：新版面板（FastAPI）根本不在 Quart 上下文里调视图；
+    - **必须**先判 Quart、后判 Flask：旧面板跑在 Quart 上，而
+      `astrbot/dashboard/server.py` 为了序列化 `import flask` 了东西（Werkzeug 也在
+      依赖树里）。先试 Flask 的话，`from flask import request` 会成功，拿到的是一个
+      「当前没有活动请求」的代理对象——`request.path` 一读就抛
+      `RuntimeError: Working outside of request context`，视图 500。
     """
+    current = _astrbot_plugin_request()
+    if current is not None:
+        return current
     try:  # pragma: no cover - 取决于宿主装了哪个框架
         from quart import request as quart_request, has_request_context
 
@@ -244,16 +281,29 @@ def _strip_host_prefix(path: str) -> str:
 
 
 def _request_query_token(request) -> str:
+    """`?token=`。两套宿主的取法不同：
+
+    - Flask / Quart：`request.args`；
+    - AstrBot 新版面板：`request.query`（`PluginMultiDict`，有 `get()`，没有 `args`）。
+
+    原来只认 `args`，新版面板上 query 取不到，只有「路径里带 token」那条能活。
+    """
     if request is None:
         return ""
-    try:
-        args = getattr(request, "args", None)
-        if args is None:
-            return ""
-        return str(args.get("token") or "")
-    except Exception:
-        # 同上：上下文外的代理对象，读出去的每一步都可能抛
-        return ""
+    for name in ("args", "query"):
+        try:
+            bag = getattr(request, name, None)
+        except Exception:
+            continue
+        if bag is None:
+            continue
+        try:
+            token = bag.get("token")
+        except Exception:
+            continue
+        if token:
+            return str(token)
+    return ""
 
 
 def _request_range(request) -> Optional[str]:
@@ -268,6 +318,20 @@ def _request_range(request) -> Optional[str]:
         return None
 
 
+def _request_path_with_query(request) -> str:
+    """请求路径 + query 串。新版面板的 `request.path` 只到 path，token 在 query 里。"""
+    path = _request_path(request)
+    try:
+        query = getattr(request, "query_string", None)
+    except Exception:
+        query = None
+    if isinstance(query, bytes) and query:
+        return f"{path}?{query.decode('utf-8', 'ignore')}"
+    if isinstance(query, str) and query:
+        return f"{path}?{query}"
+    return path
+
+
 def _read_request(request, kwargs: Optional[dict] = None) -> tuple[str, Optional[str]]:
     """把「第几次请求、要哪一段」拼出来。返回 (用于兑换 token 的路径, Range 头)。"""
     kwargs = kwargs or {}
@@ -280,7 +344,9 @@ def _read_request(request, kwargs: Optional[dict] = None) -> tuple[str, Optional
     if not token:
         path = str(kwargs.get("path") or "")
         if not path:
-            path = _request_path(request)
+            # 带 query 一起取：宿主只挂了固定前缀 `/backup/download` 时，token 只能
+            # 从 `?token=` 里拿（新版面板的 `/api/v1/plugins/extensions/...` 就是这种）。
+            path = _request_path_with_query(request)
         base, _, _query = path.partition("?")
         # 群里点的是 `/api/backup/download/<token>`，宿主实际挂载在
         # `/api/plug/backup/download/<token>`，`handle_download` 只认
@@ -295,14 +361,23 @@ def read_request(request=MISSING, **kwargs) -> tuple[str, Optional[str]]:
     return _read_request(request, kwargs)
 
 
-def _wants_stream(kwargs: dict) -> bool:
-    """调用方要不要原始 `DownloadResponse`。
+def _wants_stream(kwargs: dict):
+    """视图该回哪种响应形态。
 
-    Quart 的 `send_file` 我们要手写，那条路径要自己拼 Response，所以给它原始
-    对象；Flask 那边能直接 `return`，走框架友好形态。
+    - `False`：Flask / Werkzeug 能认的 `Response`（旧版面板走这条）；
+    - `True`：原始 `DownloadResponse`，调用方自己发（自建网关）；
+    - `"starlette"`：FastAPI / Starlette 的 `StreamingResponse`。
+
+    判断顺序：先看**当前请求是谁给的**（AstrBot 新版面板绑的代理 → Starlette），
+    再按装了哪个框架猜。上一版只认「装了 Flask 就用 Flask 形态、装了 Quart 就用
+    Quart 形态」，而新版面板是 FastAPI——两边都不命中就落到 `False`，把 Werkzeug
+    的 `Response` 交给了 Starlette，于是 `_coerce_view_result` 再包一层 JSON，
+    下载下来的是 `{}`。
     """
     if kwargs.get("stream") or kwargs.get("raw"):
         return True
+    if _astrbot_plugin_request() is not None:
+        return "starlette"
     try:
         import flask  # type: ignore # noqa: F401
 
@@ -313,6 +388,12 @@ def _wants_stream(kwargs: dict) -> bool:
         import quart  # type: ignore # noqa: F401
 
         return True
+    except Exception:
+        pass
+    try:  # pragma: no cover - 取决于宿主装了哪个框架
+        from starlette.responses import StreamingResponse  # type: ignore # noqa: F401
+
+        return "starlette"
     except Exception:
         return False
 
@@ -369,6 +450,40 @@ async def _send_file_quart(response: DownloadResponse):
     )
 
 
+def _as_starlette(response: DownloadResponse):
+    """FastAPI / Starlette 宿主（AstrBot 新版面板）能直接 `return` 的形态。
+
+    **不能**回 `DownloadResponse` 数据类，也不能回 `(body, status, headers)`：
+    `astrbot/dashboard/api/plugins.py::_coerce_view_result` 对自定义对象原样往下
+    传，FastAPI 那一层再把它当响应体序列化——结果是 200 + JSON 化的一个 dict，
+    文件一个字节都下不来。错误页同理：404/410 光写在自定义对象的 `status` 上，
+    到了 HTTP 层全变 200。
+
+    所以这里自己构造 `StreamingResponse`：状态码、`Content-Type`、
+    `Content-Range` / `Content-Length` 都照搬，body 走 `iter_chunks()` 流式读，
+    大 ZIP 不进内存。
+    """
+    try:
+        from starlette.responses import StreamingResponse
+    except Exception:  # pragma: no cover - 没有 Starlette 的老宿主
+        return _as_flask(response)
+
+    headers = dict(response.headers or {})
+    headers.pop("Content-Length", None)  # 交给流式响应自己算，切片时按 length
+    return StreamingResponse(
+        response.iter_chunks(),
+        status_code=response.status,
+        headers=headers,
+    )
+
+
+def _as_response(response: DownloadResponse, starlette: bool = False):
+    """按宿主框架挑返回形态。`starlette=True` 表示当前在 FastAPI 面板里。"""
+    if starlette:
+        return _as_starlette(response)
+    return _as_flask(response)
+
+
 def make_view(exports, range_header_getter=None, stream: Optional[bool] = None):
     """生成一个不依赖具体框架的视图函数，直接交给 `register_web_api`。
 
@@ -392,10 +507,12 @@ def make_view(exports, range_header_getter=None, stream: Optional[bool] = None):
         response = handle_download(path, exports, header)
         want_stream = _wants_stream(kwargs) if stream is None else stream
         if not want_stream:
-            return _as_flask(response)
+            return _as_response(response)
         real_request = request if request is not MISSING else None
         if real_request is not None and hasattr(real_request, "rel_url"):
             return await _send_file_aiohttp(real_request, response)
+        if want_stream == "starlette":
+            return _as_starlette(response)
         return await _send_file_quart(response)
 
     view.full_prefix = PREFIX  # type: ignore[attr-defined]

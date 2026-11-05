@@ -132,10 +132,18 @@ backup:
 
 ### 下载链接怎么用
 
-导出后插件会回一条链接，形状是 `<面板地址>/api/backup/download/<token>`。
+导出后插件会回一条链接，形状跟着**面板怎么挂插件路由**走：
 
-- **直接发群里就行。** 这条前缀在 AstrBot 4.14 的 Web 鉴权白名单里，群成员点开即下，
-  不需要登录面板。
+- 新版面板（FastAPI）：`<面板地址>/api/v1/plugins/extensions/backup/backup/download/<token>`
+- 旧版面板（Quart）：`<面板地址>/api/plug/backup/download/<token>`
+
+插件启动时按宿主实际挂载点选，不用你配。写死其中一种，另一种面板上点开就是 404。
+
+- **两个版本的鉴权不一样，这点要说清。** 旧面板把 `<面板地址>/api/backup/download`
+  写进了 Web 鉴权白名单，群成员点开即下、无需登录。新版面板没有这条白名单，
+  `/api/v1/plugins/extensions/*` 走的是面板 JWT / API Key（scope: `plugin`）。
+  也就是说：**新版面板上，链接能发出去，但收链接的人得有面板凭证**。
+  要让群成员直接可下，把 `export.base_url` 指到自己的小网关去兑换 token。
 - **域名从哪来？** 依次找：`export.base_url` → `dashboard.public_url`（以及 AstrBot
   宿主配置里的面板地址）→ **这条 `/backup export` 消息是从哪个域名进来的**（读 `Host`
   与 `X-Forwarded-Host`，反代/内网穿透部署下通常只有这一条可用）。三条都落空才退回裸

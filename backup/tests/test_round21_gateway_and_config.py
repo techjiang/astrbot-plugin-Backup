@@ -84,6 +84,11 @@ def test_registers_prefix_routes_on_the_host(plugin):
     assert "/backup/download/<token>" in routes
     assert "/backup/download" in routes
     assert "/download/<token>" in routes
+    # 新版面板（FastAPI）按插件名挂载：`/api/v1/plugins/extensions/<插件名>/<尾巴>`，
+    # 拿尾巴去比 route，所以 route 必须以插件名开头，否则群里点下载一律
+    # 「未找到该路由」——HTTP 200、JSON 报错，比 404 还难查。
+    assert "/backup/backup/download" in routes
+    assert "/backup/backup/download/<token>" in routes
 
 
 def test_download_link_is_clickable_when_dashboard_url_is_set(main_mod, tmp_path):
@@ -108,7 +113,13 @@ def test_download_link_is_clickable_when_dashboard_url_is_set(main_mod, tmp_path
     instance = main_mod.BackupPlugin(Context())
     try:
         base = instance._public_base_url()
-        assert base == "https://bot.example.com/api/backup/download"
+        # 路径那一段由宿主的挂载点决定：旧面板是 `/api/plug/backup/download`，
+        # 新版面板是 `/api/v1/plugins/extensions/<插件名>/backup/download`。
+        assert base == (
+            "https://bot.example.com" + instance._route_path()
+        )
+        assert base.endswith("/backup/download")
+        assert base.startswith("https://bot.example.com/api/")
     finally:
         instance.db.close()
 

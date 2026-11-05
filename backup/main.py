@@ -26,7 +26,7 @@ from .core.commands import (
     render_status,
 )
 from .core.database import Database
-from .core.download_route import handle_download, make_view
+from .core.download_route import LEGACY_PREFIX, handle_download, make_view
 from .core.export_manager import ExportManager
 from .exporters import SUPPORTED_FORMATS
 from .core.auto_trigger import AutoTrigger
@@ -98,6 +98,27 @@ def _is_public_host(host: str) -> bool:
         if hostname.startswith(prefix):
             return False
     return True
+
+
+def _astrbot_extensions_mount() -> bool:
+    """宿主的插件路由是不是挂在 `/api/v1/plugins/extensions/<插件名>/` 下。
+
+    新版面板（FastAPI）是这样；旧版（Quart）是 `/api/plug/<尾巴>`，没有插件名那层。
+    判断依据只能是宿主自己有没有那条路由——两边都写着「插件路由」，形状却不同，
+    猜错一边，群里点下载就是 404。
+
+    读不到（没有宿主、版本更老）就当旧版，那是更早的既定行为。
+    """
+    try:
+        from astrbot.dashboard.api import plugins as plugins_api  # type: ignore
+    except Exception:
+        return False
+    router = getattr(plugins_api, "router", None)
+    for route in getattr(router, "routes", None) or []:
+        path = str(getattr(route, "path", "") or "")
+        if "plugins/extensions" in path:
+            return True
+    return False
 
 
 def _dashboard_host(config: dict) -> str:
@@ -750,8 +771,27 @@ class BackupPlugin(Star):
         # 定时任务没有事件：库里/配置里只有一个平台时就它了
         return self._platform_by(None, by_id=False)
 
+    #: 插件名。新版面板要求注册的路由**以插件名开头**，否则匹配不上：
+    #: `_match_registered_web_api` 拿 `/api/v1/plugins/extensions/<插件名>/<尾巴>`
+    #: 里的尾巴去比 `/<插件名>/...`，只写 `/backup/download` 的永远命中不了。
+    PLUGIN_NAME = "backup"
+
     #: 要登记的下载路由，顺序即优先级（宿主按顺序精确匹配）
-    DOWNLOAD_ROUTES = ("/backup/download", "/backup/download/<token>", "/download/<token>")
+    #:
+    #: 两条形态各来一份：
+    #: - `/<插件名>/backup/download`：新版面板（FastAPI）按插件名挂在
+    #:   `/api/v1/plugins/extensions/<插件名>/` 下，只有这个前缀能命中；
+    #: - `/backup/download`：旧版面板（Quart）按 `route == f"/{subpath}"` 精确比，
+    #:   没有任何插件名前缀。
+    #:
+    #: 尖括号那条（`<token>`）两条形态都留着——旧面板比不中它，新面板能，无害。
+    DOWNLOAD_ROUTES = (
+        "/backup/download",
+        "/backup/download/<token>",
+        "/download/<token>",
+        f"/{PLUGIN_NAME}/backup/download",
+        f"/{PLUGIN_NAME}/backup/download/<token>",
+    )
 
     #: 能拉取群历史消息的平台类型。备份的全部数据都从这几个平台来
     HISTORY_CAPABLE = ("aiocqhttp", "telegram", "discord", "slack", "wecom")
@@ -889,10 +929,30 @@ class BackupPlugin(Star):
             except Exception as e:  # 宿主版本差异，注册不上不影响备份本身
                 logger.warning("下载路由 %s 注册失败：%s", route, type(e).__name__)
         if registered:
-            logger.info(
-                "下载路由已注册：/api/plug/backup/download/<token>（同 /api/backup/download/<token>）"
-            )
+            logger.info("下载路由已注册：%s", "、".join(registered))
+        # 链接前缀跟着「宿主的插件路由挂在哪」走，不跟着「哪条先注册成功」走：
+        # 新版面板挂在 `/api/v1/plugins/extensions/<插件名>/`，旧版挂在 `/api/plug/`。
+        # 写死旧版那个，群里点开就是 404；写死新版那个，旧面板同样 404。
+        # 判断依据是宿主的挂载点声明，不是我们自己的注册顺序。
+        self.exports.set_route_prefix(*self._host_mount())
         return bool(registered)
+
+    def _host_mount(self) -> tuple:
+        """宿主把插件路由挂在哪个前缀下。返回 (前缀, route 尾段)。
+
+        - 新版面板：`/api/v1/plugins/extensions/<插件名>/` + `/backup/download`；
+        - 旧版面板：`/api/plug/` + `/backup/download`。
+
+        前缀和尾段都**不带 token**——`/backup/download` 这条固定路径是两种挂载都
+        认的形状（路由匹配时 token 从路径或 query 里取，见 `download_route`）。
+        """
+        if _astrbot_extensions_mount():
+            return (
+                f"/api/v1/plugins/extensions/{self.PLUGIN_NAME}",
+                "/backup/download",
+            )
+        return LEGACY_PREFIX, "/backup/download"
+
 
     def _public_base_url(self, request=None) -> str:
         """下载链接的前缀。返回 `<base>`，完整链接是 `<base>/<token>`。
@@ -907,8 +967,9 @@ class BackupPlugin(Star):
         2. 面板配置里的公网地址（`dashboard.public_url` 等几种写法都认）；
         3. **当前这条消息来自哪个地址**——反代/内网穿透部署下，配置里往往没有
            任何公网地址，但消息本身是从一个群成员点得到的域名进来的。取 `Host`
-           头 + 转发协议拼出 `http(s)://<host>/api/backup/download`，这条前缀在
-           AstrBot 4.14 的 `auth_middleware` 白名单里，点开不需要面板 JWT。
+           头 + 转发协议拼出 `<proto>://<host><挂载前缀><route 尾段>`。挂载前缀
+           来自「哪条路由注册成功了」——旧版面板 `/api/plug`，新版
+           `/api/v1/plugins/extensions/<插件名>`。
 
         三条都落空就返回空串，上层退回裸路径并提示去配 `export.base_url`。
         """
@@ -928,17 +989,31 @@ class BackupPlugin(Star):
                 host = self._host_from_request(request) or _dashboard_host(self.config)
             if not host:
                 return ""
-            base = f"{host}/api/backup/download"
-        # base_url 的语义是「链接前缀」。写成 `/api/plug`、`/api/backup/download`、
-        # 或者干脆只写了域名，都收成 `<host>/api/backup/download` 这一种形状
-        if base.endswith("/api/backup/download"):
+            base = f"{host}{self._route_path()}"
+        # base_url 的语义是「链接前缀」。写成挂载前缀（`/api/plug`、
+        # `/api/v1/plugins/extensions/backup`）、写成完整前缀（`.../backup/download`）、
+        # 或者干脆只写了域名，都收成 `<host><挂载前缀><route 尾段>` 这一种形状
+        route_path = self._route_path()
+        if base.endswith(route_path):
             pass
-        elif base.endswith("/api/plug"):
-            base = f"{base}/backup/download"
+        elif base.endswith("/backup/download"):
+            base = base[: -len("/backup/download")] + route_path
+        elif base.endswith(f"/{self.PLUGIN_NAME}/backup/download"):
+            pass  # 用户把新版面板的完整前缀抄进来了
         else:
-            base = f"{base}/api/backup/download"
+            base = f"{base.rstrip('/')}{route_path}"
         self.exports.set_base_url(base)
         return base
+
+    def _route_path(self) -> str:
+        """链接里路径那一段：`<挂载前缀><route 尾段>`。
+
+        新版面板是 `/api/v1/plugins/extensions/backup/backup/download`，旧版是
+        `/api/plug/backup/download`。写死旧版那条，新版面板上图裂成 404——所以这个
+        值来自注册路由时记下的 `exports.download_prefix`，没注册成功才退回旧版。
+        """
+        prefix = getattr(self.exports, "download_prefix", "")
+        return prefix or f"{LEGACY_PREFIX}/backup/download"
 
     @staticmethod
     def _host_from_request(request) -> str:
@@ -964,7 +1039,7 @@ class BackupPlugin(Star):
         """给用户看的完整链接。没配公网地址时退回裸路径（可下载但点不动）。"""
         base = self._public_base_url(request)
         if not base:
-            return f"/backup/download/{token}"
+            return f"{self._route_path()}/{token}"
         return f"{base.rstrip('/')}/{token}"
 
     async def terminate(self):

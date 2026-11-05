@@ -968,3 +968,50 @@ Quart，结论都对；但「`filter.command` 到底会不会注册 handler」�
 
 所以 `test_round28_real_astrbot_loader.py` 是这批用例里唯一不打桩的那个文件，
 没装 AstrBot 时整组 skip——不是「不用验」，是「这个环境验不了」。
+
+---
+
+## 面板路由：新旧两套形状，都不能写死
+
+AstrBot 换过一次面板框架，插件路由的挂载方式和请求对象的来源全变了。这段记下
+差异，免得下次又拿一套假设去验代码。
+
+**旧面板（Quart）**
+
+- 挂载：`app.add_url_rule("/api/plug/<path:subpath>")`，匹配时 `route == f"/{subpath}"`，
+  所以 route 里**不能**有插件名；
+- 请求对象：Flask/Quart 的 `request` 代理，`request.args` 取 query；
+- 返回：Flask 认 `Response`（`werkzeug.wrappers.Response`）；
+- 鉴权：`auth_middleware` 有一批前缀白名单，`/api/backup/download` 在里头，群里点开
+  不需要登录。
+
+**新面板（FastAPI）**
+
+- 挂载：`/api/v1/plugins/extensions/{plugin_path:path}`，`_match_registered_web_api`
+  把 `<插件名>/` 那层**剥掉**再拿尾巴比 route——所以 route **必须**以插件名开头；
+- 请求对象：不在 Quart/Flask 上下文里，自己绑一个 `astrbot.api.web.request` 的
+  contextvar 代理（`PluginRequest`），query 在 `request.query` 而不是 `.args`；
+- 返回：`_coerce_view_result` 只认 `Response` / tuple / dict。**自定义对象原样往下
+  传**，FastAPI 再把它当响应体序列化——状态码、`Content-Type` 全丢。
+- 鉴权：没有那条白名单，`/api/v1/plugins/extensions/*` 要面板 JWT 或 API Key。
+
+**踩过的三个坑**（都是「HTTP 200，但下不到东西」这种最难查的形状）
+
+1. route 只写 `/backup/download`：新面板上 `_match_registered_web_api` 永远命中不了，
+   回 `{"status":"error","message":"未找到该路由"}` —— 状态码 200。
+2. 视图返回 Werkzeug `Response`：`_coerce_view_result` 不认，包成 JSON，下载下来的
+   文件内容是 `{"headers":{...},"_status":"200 OK",...}`。
+3. `request.args` 取 token：新面板只有 `.query`，只有「路径里带 token」那条能活，
+   固定前缀 + query token 那条每次都 404。
+
+**所以现在怎么接**
+
+- 两套形状**都登记**（`DOWNLOAD_ROUTES`），宿主各自取认得的那条；
+- 视图按「当前请求是谁给的」挑返回形态：AstrBot 代理 → `StreamingResponse`；
+  否则 Flask `Response`；再否则 Quart `Response`；
+- 链接前缀**不猜**，问宿主：`_astrbot_extensions_mount()` 看它有没有
+  `plugins/extensions` 那条路由。猜错一边，另一边点开就是 404。
+
+验证方式也换了：`test_round29_fastapi_dashboard.py` 装真 FastAPI，用面板自己的
+`_call_plugin_extension` + `PluginRequest` 上下文跑真请求（`httpx.ASGITransport`），
+断言的是 content-type 和字节数。修之前同一组请求全部是 `200 application/json`。

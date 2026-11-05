@@ -104,9 +104,12 @@ def test_host_falls_back_to_request_for_the_export_receipt(main_mod, monkeypatch
     instance = main_mod.BackupPlugin(Context())
     try:
         base = instance._public_base_url(_Req(headers={"Host": "bot.example.com"}))
-        assert base == "http://bot.example.com/api/backup/download"
+        # 路径那一段跟着宿主的挂载点走（新版面板带插件名，旧版不带，见 round29）
+        route_path = instance._route_path()
+        assert base == f"http://bot.example.com{route_path}"
+        assert base.endswith("/backup/download")
         assert instance.download_link("tok", _Req(headers={"Host": "bot.example.com"})) == (
-            "http://bot.example.com/api/backup/download/tok"
+            f"http://bot.example.com{route_path}/tok"
         )
     finally:
         instance.db.close()

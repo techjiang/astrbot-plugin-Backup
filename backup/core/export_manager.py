@@ -69,7 +69,7 @@ class ExportResult:
     def link(self) -> str:
         """直接可用的下载地址。没配 base_url 时只给路径。"""
         if self.base_url:
-            return f"{self.base_url.rstrip('/')}{self.download_path}"
+            return f"{self.base_url.rstrip('/')}/{self.token}"
         return self.download_path
 
 
@@ -92,10 +92,37 @@ class ExportManager:
         # 群里点的链接前缀：面板自己的公网地址 + `/api/backup/download`。插件启动后
         # 由 main.py 填进来（配置里不一定有），导出时 `link` 就用它拼
         self.public_prefix = ""
+        # 插件路由在面板上的挂载前缀与尾段，注册路由时由 main.py 写进来
+        self.route_prefix = ""
+        self.route_suffix = "/backup/download"
 
     def set_base_url(self, value: str) -> None:
         """设置下载链接前缀（`<前缀>/<token>`）。"""
         self.base_url = str(value or "").rstrip("/")
+
+    def set_route_prefix(self, value: str, suffix: str = "/backup/download") -> None:
+        """插件路由在面板上的实际挂载前缀 + 尾段。
+
+        新版面板把插件路由挂在 `/api/v1/plugins/extensions/<插件名>/` 下，旧版挂在
+        `/api/plug/`。拼链接时前缀写死成旧版那个，群里点开就是 404——所以这个值由
+        注册路由的那一步告诉我，而不是让我猜。
+        """
+        self.route_prefix = str(value or "").rstrip("/")
+        self.route_suffix = str(suffix or "/backup/download")
+
+    @property
+    def download_prefix(self) -> str:
+        """`<挂载前缀><route 的尾段>`：链接里路径的那一段。
+
+        - 旧版面板：`/api/plug` + `/backup/download`；
+        - 新版面板：`/api/v1/plugins/extensions/backup` + `/backup/download`
+          （route 本身是 `/backup/backup/download`，插件名那层已经被挂载前缀吃掉）。
+
+        插件名那层不能重复：`_match_registered_web_api` 是把它剥掉之后再去比
+        route 的，所以同一个 route 在两种面板下形状不同。
+        """
+        prefix = str(self.route_prefix or LEGACY_PREFIX).rstrip("/")
+        return f"{prefix}{self.route_suffix}"
 
     def build_context(self, group_id: int, backup_id: Optional[str] = None) -> ExportContext:
         """取导出用的数据。

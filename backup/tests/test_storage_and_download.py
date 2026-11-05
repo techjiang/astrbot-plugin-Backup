@@ -136,7 +136,8 @@ def test_link_includes_base_url(exports, db, tmp_path):
     _save(db)
     exports.base_url = "https://example.com"
     result = exports.export(100, "txt")
-    assert result.link == f"https://example.com/backup/download/{result.token}"
+    # base_url 就是链接前缀，拼 token 时不能再补一层 `/backup/download`
+    assert result.link == f"https://example.com/{result.token}"
     assert result.download_path == f"/backup/download/{result.token}"
 
 
