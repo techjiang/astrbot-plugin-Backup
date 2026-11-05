@@ -49,6 +49,11 @@ def parse_expire(value) -> int:
     return seconds if seconds > 0 else 24 * 3600
 
 
+#: 同一次下载内允许的间隔。浏览器「探测 + 续传」、用户连点两下都在这个窗口内；
+#: 超出就是第二个人拿着转发来的链接来领。
+GRACE_SECONDS = 900
+
+
 @dataclass
 class ExportResult:
     format: str
@@ -424,6 +429,12 @@ class ExportManager:
         `shared=True` 用于分享给群成员的链接：带宽跑满时浏览器会发 Range 请求续
         传，那是第二次访问同一个 token。默认（下载路由）仍然一次性，链接转发出去
         就不能再被别人重复领走。
+
+        「一次性」的判据是 `opened_at`（第一次兑换的时刻），不是「这个请求是
+        整份还是片段」。原来按后者删 token，和续传天然打架：浏览器先发
+        `Range: bytes=0-` 探测、再发真正的续传，两次都是片段，两次都不删 token
+        ——于是链接转发出去第二个人也能整份下载，「仅可使用一次」是一句空话。
+        片段这条路的理由（「探测后真正要数据那次拿到 410」）是对的，但解法错了。
         """
         if not token:
             return None
@@ -439,6 +450,19 @@ class ExportManager:
         if not shared:
             self.db.delete_token(token)
         return path
+
+    def open_token(self, token: str, now: Optional[float] = None) -> bool:
+        """给「第一次兑换」打时间戳。返回 False 表示这条 token 已经被别人领过头。
+
+        `GRACE_SECONDS` 之内算同一次下载的开头（浏览器探测 + 立刻续传、用户
+        连点两下）。超出这个窗口的第二个请求就是第二个人。
+        """
+        if not token or self.db.get_token(token) is None:
+            return False
+        if self.db.has_been_opened(token, now, GRACE_SECONDS):
+            return False
+        self.db.open_token(token, now)
+        return True
 
     def take_token(self, token: str) -> Optional[Path]:
         """兑换并作废。一次性下载用。"""

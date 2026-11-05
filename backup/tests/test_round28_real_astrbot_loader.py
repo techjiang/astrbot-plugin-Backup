@@ -12,14 +12,20 @@
 import asyncio
 import uuid
 
-import astrbot.api.event  # noqa: F401  先把 `astrbot.api.event` 拉起来再碰 platform
 import pytest
 
 from .conftest import load_plugin_for_real, real_astrbot_available
 
 pytestmark = pytest.mark.skipif(
-    not real_astrbot_available(), reason="需要真 AstrBot（pip install -e astrbot）"
+    not real_astrbot_available(), reason="需要真 AstrBot（pip install astrbot==4.14.6）"
 )
+
+if real_astrbot_available():
+    import astrbot.api.event  # noqa: F401  先把 `astrbot.api.event` 拉起来再碰 platform
+# 注意：别在这里 `unload_astrbot_modules()`。真货装着的时候，前面那些用替身的
+# 用例（round20–25）会往 `sys.modules` 里塞一份假 `astrbot`；`load_plugin_for_real`
+# 负责在真加载前把假货摘掉（见 conftest 的 `install_real_astrbot`）。凭「此刻
+# sys.modules 里是假的」就整组卸载，会把真货也一起扔掉。
 
 
 # --------------------------------------------------------------------------

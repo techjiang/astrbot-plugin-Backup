@@ -26,7 +26,7 @@ from backup.core.download_route import (
     make_view,
 )
 from backup.core.event_hooks import EventHooks
-from backup.tests.conftest import install_fake_astrbot
+from backup.tests.conftest import install_fake_astrbot, preload_host_for_lineage, real_astrbot_available
 
 
 # ---------------------------------------------------------------- 1 & 2. 下载路由
@@ -54,7 +54,7 @@ def test_host_prefix_is_stripped_down_to_our_route(path):
 
 @pytest.fixture
 def main_mod(tmp_path, monkeypatch):
-    install_fake_astrbot(monkeypatch)
+    preload_host_for_lineage()
     sys.modules.pop("backup.main", None)
     import backup.main as mod
 

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from .conftest import install_fake_astrbot, make_message
+from .conftest import install_fake_astrbot, make_message, preload_host_for_lineage, real_astrbot_available
 
 
 def _status_of(response) -> int:
@@ -43,7 +43,7 @@ def _status_of(response) -> int:
 
 @pytest.fixture
 def main_mod(tmp_path, monkeypatch):
-    install_fake_astrbot(monkeypatch)
+    preload_host_for_lineage()
     sys.modules.pop("backup.main", None)
     import backup.main as mod
 

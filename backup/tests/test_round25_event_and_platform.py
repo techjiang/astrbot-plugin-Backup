@@ -25,7 +25,7 @@ import pytest
 from backup.core.auto_trigger import AutoTrigger
 from backup.core.event_hooks import EventHooks
 from backup.core.parser import is_event_payload, parse_message
-from backup.tests.conftest import install_fake_astrbot
+from backup.tests.conftest import install_fake_astrbot, preload_host_for_lineage
 
 GROUP = 100
 
@@ -175,7 +175,8 @@ class _StubPlatform:
 
 
 def _build_plugin(monkeypatch, tmp_path, platforms):
-    install_fake_astrbot(monkeypatch)  # 让 main.py 在没有 AstrBot 的机器上也能 import
+    # 有真 AstrBot 就用真的；没有（或装了但依赖不全）才装替身，别让收集阶段炸掉
+    preload_host_for_lineage()
     from backup.main import BackupPlugin
 
     context = types.SimpleNamespace(

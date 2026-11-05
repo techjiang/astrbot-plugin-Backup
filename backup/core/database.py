@@ -133,7 +133,10 @@ CREATE TABLE IF NOT EXISTS download_tokens (
   token TEXT PRIMARY KEY,
   path TEXT NOT NULL,
   expires REAL NOT NULL,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  -- 首次兑换的时刻（NULL = 还没人领过）。`Range` 续传靠它区分
+  -- 「同一次下载的后续片段」和「链接被转发后第二个人来领」
+  opened_at REAL
 );
 
 CREATE TABLE IF NOT EXISTS schedules (
@@ -255,6 +258,19 @@ def _migrate_record_columns(conn) -> None:
         if name not in cols:
             conn.execute(ddl)
     conn.commit()
+
+
+def _migrate_token_columns(conn) -> None:
+    """老库的 download_tokens 没有 opened_at 列。
+
+    这张表的 token 有效期 24 小时、重启后仍然有效，所以升级那一刻库里一定还有
+    活着的 token。新代码按 `opened_at` 判断「领过没有」，列不存在就是
+    `no such column` —— 每次下载都 500，而备份本身看不出问题。
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info('download_tokens')")}
+    if cols and "opened_at" not in cols:
+        conn.execute("ALTER TABLE download_tokens ADD COLUMN opened_at REAL")
+        conn.commit()
 
 
 # 老库升级：media_files 加 (message_id, original_url) 唯一键，顺带去掉重复行。
@@ -435,6 +451,7 @@ class Database:
         _migrate_messages_unique(self._conn)
         _migrate_media_unique(self._conn)
         _migrate_record_columns(self._conn)
+        _migrate_token_columns(self._conn)
 
     def close(self) -> None:
         self._conn.close()
@@ -1495,14 +1512,41 @@ class Database:
     # ---------- 下载 token ----------
     def save_token(self, token: str, path: str, expires: float) -> None:
         self.execute(
-            "INSERT OR REPLACE INTO download_tokens (token, path, expires) VALUES (?, ?, ?)",
+            "INSERT OR REPLACE INTO download_tokens (token, path, expires, opened_at)"
+            " VALUES (?, ?, ?, NULL)",
             (token, str(path), float(expires)),
         )
 
     def get_token(self, token: str) -> Optional[sqlite3.Row]:
         return self.query_one(
-            "SELECT token, path, expires FROM download_tokens WHERE token = ?", (token,)
+            "SELECT token, path, expires, opened_at FROM download_tokens WHERE token = ?",
+            (token,),
         )
+
+    def open_token(self, token: str, now: Optional[float] = None) -> None:
+        """记下「第一次兑换」的时刻。已经有值就不动——后续片段不算新的开头。"""
+        self.execute(
+            "UPDATE download_tokens SET opened_at = COALESCE(opened_at, ?) WHERE token = ?",
+            (time.time() if now is None else now, token),
+        )
+
+    def has_been_opened(self, token: str, now: Optional[float] = None, grace: float = 0.0) -> bool:
+        """这条 token 有没有**别人**先领过（`grace` 秒内算同一次下载的开头）。
+
+        原来是「整份取走就删 token」，于是拿不到任何「领过」的痕迹：_Range_
+        片段请求必须在整份取走之前到达（浏览器先探测再续传），而续传请求同样
+        过 `open_token` 这一关——两件事互斥，只能二选一：
+
+        - 片段不删 token（为了让续传过得去）→ 链接被转发后第二个人照样能整份下载；
+        - 片段删 token（为了「仅一次」）→ 探测之后真正的续传全是 410。
+
+        守住的必须是「仅可使用一次」这句承诺，所以改成记 `opened_at`。
+        """
+        row = self.get_token(token)
+        opened = row["opened_at"] if row is not None else None
+        if opened is None:
+            return False
+        return (time.time() if now is None else now) - float(opened) > grace
 
     def delete_token(self, token: str) -> None:
         self.execute("DELETE FROM download_tokens WHERE token = ?", (token,))

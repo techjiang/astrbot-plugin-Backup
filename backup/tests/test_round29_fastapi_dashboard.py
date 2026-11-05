@@ -25,18 +25,36 @@ import pytest
 
 from .conftest import real_astrbot_available
 
-fastapi = pytest.importorskip("fastapi", reason="需要真 fastapi")
+def _fastapi_dashboard() -> bool:
+    """这个环境有没有**新版 FastAPI 面板**。
+
+    只判 `astrbot` 装没装不够：AstrBot 4.14.6 装着，面板还是 Quart，
+    `astrbot.api.web` / `astrbot.dashboard.api` 这两个 import 直接
+    ModuleNotFoundError——收集阶段就炸，整轮 pytest 一条用例都不跑。
+
+    而且 `find_spec` 也会被绊倒：父包 `astrbot.dashboard.api` import 失败时它会
+    把子模块的 ModuleNotFoundError 抛出来（spec 的 __init__ 里先 import 父包）。
+    所以这里直接 import 并吞掉异常——判据是「能不能用」，不是「包在不在」。
+    """
+    import importlib
+
+    if importlib.util.find_spec("fastapi") is None:
+        return False
+    for name in ("astrbot.api.web", "astrbot.dashboard.api"):
+        try:
+            importlib.import_module(name)
+        except Exception:
+            return False
+    return True
+
+
+pytest.importorskip("fastapi", reason="需要真 fastapi")
 pytest.importorskip("httpx", reason="需要 httpx 的 ASGITransport")
 if not real_astrbot_available():
-    pytest.skip("需要真 AstrBot", allow_module_level=True)
-
-# `astrbot.api.web` / `astrbot.dashboard.api` 是**新版面板（FastAPI）**才有的模块。
-# 只判 `astrbot` 装没装不够：AstrBot 4.14.6 装着，面板还是 Quart，这两个 import
-# 直接 ModuleNotFoundError——收集阶段就炸，整轮 pytest 中断。环境验不了就 skip，
-# 不是「不用验」。
-if importlib.util.find_spec("astrbot.api.web") is None:
+    pytest.skip("需要真 AstrBot（pip install astrbot）", allow_module_level=True)
+if not _fastapi_dashboard():
     pytest.skip(
-        "这个 AstrBot 版本没有 FastAPI 面板（astrbot.api.web 不存在）",
+        "这个 AstrBot 版本没有 FastAPI 面板（astrbot.api.web 拉不起来）",
         allow_module_level=True,
     )
 

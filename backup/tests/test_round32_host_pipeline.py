@@ -91,11 +91,15 @@ def test_forwarded_host_list_takes_first_hop(plugin):
 
 
 @pytest.mark.parametrize("host", ["127.0.0.1:8080", "localhost:3000", "192.168.1.5", "10.0.0.2"])
-def test_private_hosts_fall_back_to_loopback(plugin, host):
-    """内网/本机地址不拿来拼链接：发进群里没人点得动。"""
+def test_private_hosts_fall_back_to_a_bare_path(plugin, host):
+    """内网/本机地址不拿来拼链接：发进群里没人点得动。
+
+    内网地址不认之后，原来退回的是网关自己的回环地址。可那条链接发进群，群成员
+    点的是**他自己电脑**的 127.0.0.1——和「不认内网地址」要防的是同一件事。
+    现在退回裸路径，回执里明说「只有本机能用」。
+    """
     link = plugin.download_link("tok", _Req(headers={"Host": host}))
-    assert link.startswith("http://127.0.0.1:"), link
-    assert str(plugin.gateway.bound_port) in link
+    assert link == "/backup/download/tok", link
 
 
 def test_explicit_base_url_wins(plugin):

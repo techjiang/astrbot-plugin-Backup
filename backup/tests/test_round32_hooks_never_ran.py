@@ -9,18 +9,28 @@
 import asyncio
 import types
 
-import astrbot.api.event  # noqa: F401  先把 astrbot.api.event 拉起来再碰 platform
 import pytest
 
 from backup.core.parser import parse_message
 from backup.core.event_hooks import parse_event_message, extract_group_id
 
 from .conftest import load_plugin_for_real, real_astrbot_available
-from .test_round28_real_astrbot_loader import FakeOneBot, _platform_meta, make_event, make_notice
 
 pytestmark = pytest.mark.skipif(
-    not real_astrbot_available(), reason="需要真 AstrBot（pip install -e astrbot）"
+    not real_astrbot_available(), reason="需要真 AstrBot（pip install astrbot==4.14.6）"
 )
+
+if real_astrbot_available():
+    # 顶层 import 会让「装了 astrbot 但版本/依赖不对」的环境在**收集阶段**炸掉，
+    # 整轮 pytest 一条用例都不跑。真要用到时再拉。
+    import astrbot.api.event  # noqa: F401
+
+    from .test_round28_real_astrbot_loader import (
+        FakeOneBot,
+        _platform_meta,
+        make_event,
+        make_notice,
+    )
 
 
 def _pipeline_ctx():

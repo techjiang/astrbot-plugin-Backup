@@ -14,7 +14,7 @@ import sys
 
 import pytest
 
-from .conftest import install_fake_astrbot
+from .conftest import install_fake_astrbot, preload_host_for_lineage, real_astrbot_available
 
 
 class _Req:
@@ -34,7 +34,7 @@ class _Req:
 @pytest.fixture
 def main_mod(monkeypatch):
     """只为能 `import backup.main`：这些用例不构造插件实例。"""
-    install_fake_astrbot(monkeypatch)
+    preload_host_for_lineage()
     import backup.main as mod
 
     return mod
@@ -127,11 +127,13 @@ def test_export_receipt_is_a_complete_usable_url(main_mod, monkeypatch):
         )
         assert link == "https://bak.example.com/backup/download/tok", link
 
-        # 内网/本机地址不认：链路发到群里没人点得动，不如退回回环 + 让上层提示
+        # 内网/本机地址不认：链接发到群里没人点得动。
+        # 原来这里断言「退回网关回环地址」——那等于把「群里那条链接是 127.0.0.1」
+        # 锁成了正确答案（第 33 轮修掉）。回环地址只对**本机**有意义，用户拿到
+        # 手里点的是他自己电脑的 127.0.0.1，一辈子点不开。所以退回裸路径，
+        # 让上层把「点不动」说出来。
         link = instance.download_link("tok", _Req(headers={"Host": "192.168.1.5:8080"}))
-        assert link.startswith("http://127.0.0.1:"), link
-        assert str(instance.gateway.bound_port) in link
-        assert link.endswith("/backup/download/tok"), link
+        assert link == "/backup/download/tok", link
 
         # 配了对外地址就跟着它走（优先级最高，压过请求域名）
         instance.config["export"]["base_url"] = "https://bak.example.com"

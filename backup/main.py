@@ -28,7 +28,7 @@ from .core.commands import (
 )
 from .core.database import Database
 from .core.download_route import LEGACY_PREFIX, handle_download, make_view
-from .core.gateway import DownloadGateway
+from .core.gateway import GATEWAY_PREFIX, DownloadGateway
 from .core.export_manager import ExportManager
 from .exporters import SUPPORTED_FORMATS
 from .core.auto_trigger import AutoTrigger
@@ -573,12 +573,20 @@ class BackupPlugin(Star):
             return
         link = self.download_link(result.token, event)
         hint = ""
-        if "/backup/download/" in link and link.startswith("/"):
-            hint = (
-                "\n⚠️ 没有可用的下载入口：内置网关没起来，也没配 `export.base_url`。"
-                "把 `gateway.enabled` 打开、或把 `export.base_url` 填成网关的对外地址"
-                "（反代/内网穿透）后重新导出"
-            )
+        if link.startswith("/"):
+            # 裸路径 = 发进群里没人点得动。两种原因分开说，别让人去查错的那一项
+            if getattr(self, "gateway", None) is not None and self.gateway.running:
+                hint = (
+                    f"\n⚠️ 这条链接只有本机能用（网关监听在 {self.gateway.host}），"
+                    "发到群里点不动。把 `export.base_url` 填成网关的**对外地址**"
+                    "（反代/内网穿透的域名），或让宿主面板这一层反代到网关端口，再重新导出"
+                )
+            else:
+                hint = (
+                    "\n⚠️ 没有可用的下载入口：内置网关没起来，也没配 `export.base_url`。"
+                    "把 `gateway.enabled` 打开、或把 `export.base_url` 填成网关的对外地址"
+                    "（反代/内网穿透）后重新导出"
+                )
         yield event.plain_result(
             f"✅ 导出完成（{result.format}）\n消息 {result.message_count} 条 · "
             f"{human_size(result.size)}\n临时链接（{result.expires_at:%H:%M} 过期，仅可使用一次）：{link}{hint}"
@@ -1203,14 +1211,21 @@ class BackupPlugin(Star):
         export_cfg = self.config.get("export") or {}
         explicit = str(export_cfg.get("base_url") or "").strip()
         if explicit:
-            return f"{explicit.rstrip('/')}/backup/download/{token}"
+            # `base_url` 是**对外域名**：网关只监听回环，后面那层反代/穿透负责
+            # 把它接出去，链接的路径就是网关自己的 `/backup/download/<token>`。
+            return f"{explicit.rstrip('/')}{GATEWAY_PREFIX}{token}"
         public = self._host_from_request(request)
         if public:
             # 网关只监听回环，对外那层是反代。请求本身是从群成员点得到的域名
             # 进来的，那个域名就是唯一现成的真相
-            return f"{public}/backup/download/{token}"
+            return f"{public}{GATEWAY_PREFIX}{token}"
         if getattr(self, "gateway", None) is not None and self.gateway.running:
-            return self.gateway.url_for(token, "")
+            # 网关起来了但只有回环地址：`http://127.0.0.1:<端口>/...` 发进群，
+            # 群成员点的是**他自己电脑**的 127.0.0.1，一辈子点不开，而回执上
+            # 看起来像条正常链接。这就是第 30 轮「装真 AstrBot 才看见」的那个
+            # bug 的原形，上一版在「没有网关」时修了，有网关时又原样漏着。
+            # 链子只回裸路径，让上层明说「点不动」。
+            return f"/backup/download/{token}"
         # 没有网关也没有对外地址：给裸路径，让上层打「点不动」的提示。
         # 这里刻意不用 `_route_path()`——它拼出来的是宿主的挂载前缀
         # （`/api/plug/backup/download`），而那条路在 4.14 上既比不中带 token 的

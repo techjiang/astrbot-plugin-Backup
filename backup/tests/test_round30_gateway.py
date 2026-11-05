@@ -15,6 +15,7 @@
 
 import socket
 import threading
+import types
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -223,8 +224,17 @@ def test_gateway_start_failure_is_not_fatal(tmp_path):
 # ---------------------------------------------------------------- 接进插件
 
 
-def test_export_receipt_points_at_the_gateway(tmp_path, monkeypatch):
-    """`/backup export` 给出的链接，域名+端口必须是网关真的在听的那个。"""
+def test_export_receipt_never_hands_out_a_loopback_link(tmp_path, monkeypatch):
+    """没配 `export.base_url` 时，回执里**不能**出现 `127.0.0.1`。
+
+    第 30 轮这里的断言写的是 `link.startswith("http://127.0.0.1:<端口>/")`——
+    也就是说，用例亲手把「发进群的链接是回环地址」这件事锁成了正确结果。
+    群成员点的是他自己电脑的 127.0.0.1，一辈子点不开，而回执看起来像条正常
+    链接。第 32 轮修过一次（`_public_base_url` 没有调用点），但只修了
+    「没有网关」那条分支，网关一起来又原样漏着。
+
+    现在：没有对外地址就只给裸路径 + 一句说明，宁可承认点不动。
+    """
     from .conftest import load_plugin_for_real
 
     if not real_astrbot_available():
@@ -235,14 +245,24 @@ def test_export_receipt_points_at_the_gateway(tmp_path, monkeypatch):
     try:
         assert plugin.gateway.running
         link = plugin.download_link("tok")
-        assert link.startswith(f"http://127.0.0.1:{plugin.gateway.bound_port}/")
-        assert link.endswith("/backup/download/tok")
+        assert "127.0.0.1" not in link and "localhost" not in link
+        assert link == "/backup/download/tok"
 
-        # 网关真的在那个端口上听：随便发一条，至少不是 connection refused
-        try:
-            urllib.request.urlopen(link, timeout=5)
-        except urllib.error.HTTPError as e:
-            assert e.code == 410  # token 是假的，但服务在
+        # 配了对外地址之后才是一条真链接
+        plugin.config.setdefault("export", {})["base_url"] = "https://bot.example.com"
+        link2 = plugin.download_link("tok")
+        assert link2 == "https://bot.example.com/backup/download/tok"
+
+        # 这条消息是从哪个域名进来的，就用哪个域名（反代/穿透下唯一现成的真相）
+        plugin.config["export"]["base_url"] = ""
+        event = types.SimpleNamespace(
+            request_headers={"Host": "bot.example.com", "X-Forwarded-Proto": "https"}
+        )
+        assert plugin.download_link("tok", event) == "https://bot.example.com/backup/download/tok"
+
+        # 内网地址一律不认：拼出来发进群里也是没人点得动
+        lan = types.SimpleNamespace(request_headers={"Host": "192.168.1.9:6185"})
+        assert plugin.download_link("tok", lan) == "/backup/download/tok"
     finally:
         plugin.gateway.stop()
         plugin.db.close()
@@ -312,23 +332,26 @@ def test_end_to_end_export_then_download_over_http(tmp_path, monkeypatch):
 
         result = plugin.exports.export_latest(100, "zip")
         link = plugin.download_link(result.token)
-        assert link.startswith(f"http://127.0.0.1:{plugin.gateway.bound_port}/")
 
-        with urllib.request.urlopen(link, timeout=10) as resp:
+        # 拿网关自己的回环地址去发请求——这是**测试**在做的事（和用户在同一台机器
+        # 上），不代表这条链接能直接发进群。回执给的是裸路径，见上一条用例。
+        assert link == f"/backup/download/{result.token}"
+        local = plugin.gateway.url_for(result.token)
+        with urllib.request.urlopen(local, timeout=10) as resp:
             assert resp.status == 200
             downloaded = resp.read()
         assert downloaded == result.path.read_bytes(), "下下来的 ZIP 和导出文件不一致"
 
         # 整份取走之后 token 作废：链接是一次性的，转发出去不能被反复领
         with pytest.raises(urllib.error.HTTPError) as exc:
-            urllib.request.urlopen(link, timeout=10)
+            urllib.request.urlopen(local, timeout=10)
         assert exc.value.code == 410
 
         # 换一条新 token：浏览器的 Range 探测 + 续传都该是 206。
         # 注意按**这一次**导出的长度算——两次导出中间隔了一段时间戳，ZIP 字节数
         # 未必相同，拿前一份的长度去比会假失败。
         again = plugin.exports.export_latest(100, "zip")
-        link2 = plugin.download_link(again.token)
+        link2 = plugin.gateway.url_for(again.token)
         total2 = again.path.stat().st_size
         for rng, expect_len in (("bytes=0-", total2), ("bytes=100-199", 100)):
             req = urllib.request.Request(link2, headers={"Range": rng})

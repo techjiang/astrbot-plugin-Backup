@@ -1299,3 +1299,111 @@ AstrBot 的 `message_obj` 是 `AstrBotMessage`，`raw_message` 属性是 **OneBo
 恰恰是钩子的死刑判决书。
 
 所以现在钩子上只有 `event_message_type` + 认领过滤器，不带任何命令语义。
+
+## 第 34 轮：一条没人点得动的链接，和一句不成立的承诺
+
+这轮的起点不是读代码，是**在干净环境里跑一遍 `pytest`**：先装 `pytest` 再跑，
+发现整轮在**收集阶段**就中断了——一条用例都没执行。顺着往下，又撞出两处
+「回执上写着、代码里不成立」的东西。
+
+### 1. 没有 AstrBot 的环境里，`pytest` 直接退出
+
+```
+ERROR backup/tests/test_round28_real_astrbot_loader.py
+ERROR backup/tests/test_round32_hooks_never_ran.py
+!!! Interrupted: 2 errors during collection !!!
+```
+
+两个文件在**模块顶层** `import astrbot.api.event`，而模块级 `skipif` 是在那之后
+才生效的——import 先炸，skip 没机会说话。
+
+这件事真正难看的不是这两个文件，是**判据本身**：`real_astrbot_available()` 当时
+只判 `find_spec("astrbot") is not None`，那是「包在不在」，不是「能不能用」。
+
+- 装了 astrbot 但它的依赖不全 → `find_spec` 为真、import 抛；
+- 前面跑过 `install_fake_astrbot`（往 `sys.modules` 塞替身）→ `find_spec` 又为真。
+
+三种不一致叠在一起，就有三种炸法：
+
+```
+没有 astrbot              → 收集阶段 ModuleNotFoundError，整轮中断
+装了但依赖不全            → 同样中断
+替身先装、真货后来        → astrbot 是真的、astrbot.core 是替身，
+                            `cannot import name 'astrbot_config'`
+```
+
+现在：
+
+- 判据改成「**import 得动吗**」：`astrbot.api.event` + `astrbot.core.star.star_handler`
+  都能拉起来，且模块上没打替身标记，才算这个环境验得了；
+- 两个文件把那句顶层 import 挪进 `if real_astrbot_available():` 里；
+- FastAPI 面板那份（`test_round29`）的判据也从 `find_spec("astrbot.api.web")`
+  改成真 import——父包 import 失败时 `find_spec` 会把子模块的异常抛出来；
+- `conftest` 里补 `preload_host_for_lineage()`：走「替身契约」的那几个文件
+  （round20–25）现在统一走它，有真货用真货、没有才装替身；装之前先把
+  `sys.modules` 里的替身拆干净。替身里也补了 `astrbot.core.star.filter.custom_filter`
+  ——`main.py` 那句 `from astrbot.core...` 原本在「装了 astrbot 但依赖不全」的
+  机器上必炸，因为替身只铺了 `astrbot.api` 那一层。
+
+### 2. 回执里的链接永远是 `127.0.0.1`
+
+```python
+if gateway.running:
+    return gateway.url_for(token, "")     # → http://127.0.0.1:<端口>/...
+```
+
+第 32 轮修过一次「`request` 收了没用」，但只修了**没有网关**那条分支。网关一起
+（默认就起），链接又变回回环地址。而回执文案写的是「临时链接（24:00 过期，仅可
+使用一次）」，读的人以为能直接转进群。
+
+群成员点开的是什么？**他自己电脑的 127.0.0.1**。一辈子点不开，而回执看起来一切正常。
+
+更难看的是：第 30 轮那两条用例**亲手把这个 bug 锁成了正确答案**——
+`assert link.startswith("http://127.0.0.1:{gateway.bound_port}/")`。用例和代码共用
+一个错误假设，于是全绿。
+
+现在：`export.base_url` → 这条命令进来的域名（`Host` / `X-Forwarded-Host`）→
+**裸路径 + 明说点不动**。回环地址只留在 `gateway.url_for()`（本机自检用），不再
+进回执。用例改成「回执里不许出现 `http://127.0.0.1`」。
+
+### 3. 「仅可使用一次」是一次空话
+
+token 的作废判定原来是「整份取走就删」：
+
+```python
+partial = bool(range_header)
+target = exports.resolve_token(token, shared=partial)   # 片段请求 → 不删
+```
+
+浏览器下载大文件一定先发 `Range: bytes=0-` 探测、再发续传，**两次都是片段请求，
+两次都不删 token**。于是链接转发进另一个群，第二个人照样能整份下载。上一版注释
+把这件事写成「只有整份取走才作废」，读起来像设计，实际是「谁都没删」。
+
+「片段请求不能删 token」这个理由是**对的**（删了探测就成了唯一一次，用户看到
+「下了一半断了」），但解法错了：判据不该是「这个请求是整份还是片段」，而该是
+「**是不是第一个人在开头**」。
+
+现在 `download_tokens` 多一列 `opened_at`：第一次兑换打时间戳，之后的请求必须在
+`GRACE_SECONDS`（15 分钟）窗口内才算同一次下载的后续片段，超窗即是第二个人，410。
+老库有 `_migrate_token_columns` 补列——这张表的 token 有效期 24 小时，升级那一刻
+必然还有活的，没这列就是每次下载 500。
+
+### 4. 验证方式
+
+`test_round33_link_and_once.py`（8 条）：
+
+- Range 探测不烧 token、续传 206、整份一次就 410；
+- **第二个人拿着转发链接来领 → 410**（旧代码上这条是红的）；
+- 慢链接：探测 + 续传同窗共享，跨窗即第二个人；
+- 老库 `download_tokens` 无 `opened_at` 列时自动迁移；
+- 真 HTTP 端到端：探测 → 续传 → 整份 → 再点 410；
+- 回执里不出现回环地址、且点不动时说出来。
+
+三处旧断言按新语义改写（`round22` / `round30` / `round32`），每条都写了「原来那条
+断言本身才是 bug」的理由，不是为了让用例变绿而改。
+
+### 一句总结
+
+这轮三处都不是「逻辑写错」，是**承诺与实现相反**：README 说「点得动」，回执说
+「仅一次」，代码两样都没做到。而且两处都有一条用例把错误答案写成断言——**用例绿
+不等于承诺成立，它只等于「代码和用例的假设一致」**。

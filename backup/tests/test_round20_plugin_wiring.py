@@ -107,18 +107,40 @@ def _install_fake_astrbot(monkeypatch):
     api_star.Star = Star
     api_star.register = register
 
+    class CustomFilter:
+        """`main.py` 里 `import` 了它。替身缺这一块时，装了 astrbot 但依赖不全的
+        机器上 `import backup.main` 会炸在 `astrbot.core`——整轮 pytest 中断。"""
+
+        def __init__(self, kind=""):
+            self.kind = kind
+
+        def filter(self, event, cfg):  # noqa: ARG002
+            return True
+
     pkg = types.ModuleType("astrbot")
     pkg.__path__ = []
     api = types.ModuleType("astrbot.api")
     api.__path__ = []
     api.event = api_event
     api.star = api_star
+    core = types.ModuleType("astrbot.core")
+    core.__path__ = []
+    core_star = types.ModuleType("astrbot.core.star")
+    core_star.__path__ = []
+    core_filter = types.ModuleType("astrbot.core.star.filter")
+    core_filter.__path__ = []
+    custom_filter = types.ModuleType("astrbot.core.star.filter.custom_filter")
+    custom_filter.CustomFilter = CustomFilter
 
     for name, mod in (
         ("astrbot", pkg),
         ("astrbot.api", api),
         ("astrbot.api.event", api_event),
         ("astrbot.api.star", api_star),
+        ("astrbot.core", core),
+        ("astrbot.core.star", core_star),
+        ("astrbot.core.star.filter", core_filter),
+        ("astrbot.core.star.filter.custom_filter", custom_filter),
     ):
         monkeypatch.setitem(sys.modules, name, mod)
 
@@ -126,6 +148,7 @@ def _install_fake_astrbot(monkeypatch):
 @pytest.fixture
 def plugin(tmp_path, monkeypatch):
     _install_fake_astrbot(monkeypatch)
+    sys.modules.pop("backup.main", None)
     Context = sys.modules["astrbot.api.star"].Context
     sys.modules.pop("backup.main", None)
     import backup.main as main_mod
