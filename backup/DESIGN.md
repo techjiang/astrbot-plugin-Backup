@@ -823,6 +823,38 @@ payload 塞在里头），`url` 就只在段上、`data` 里没有——`_media_
 `"/backup/download"` 那条（视图自己从 request 里取 token）。所以登记顺序改成
 固定前缀在前——顺序错了不影响功能，但会影响「哪条先被找到」的直觉。
 
+## 第二十六轮：时间戳不许凭空造，overwrite 的判据
+
+**缺时间戳不能拿「现在」顶上**
+
+`_to_datetime` 原来在「值为 None / 解析失败」时回落 `datetime.now()`，`timestamp: 0`
+则落成 1970-01-01。三件事叠在一起：
+
+- 同一批消息两次解析出两个时间戳。校验和按 `(timestamp, message_id)` 排序算，
+  同一份数据就有两个指纹——数据一个字节没坏，比对却假阳性；
+- `/backup export` 按日期分片，半年前的消息被归进今天那个文件；
+- `timestamp: 0` 让消息排到整库最前，日期分组里多出一个 1970-01-01 的分区。
+
+现在缺失、空串、0、负数一律返回 `None`，`parse_message` 落到 `datetime.min`，
+意思是「这一条不知道什么时候发的」。`datetime.min` 上 `timestamp()` 会抛
+「year 0 is out of range」，生成兜底 message_id 时单独兜了 0。
+
+成员 `join_time`、公告 `published_at`、文件 `upload_time` 同一条路径，都是可空列，
+传 `None` 没问题——只是不再有「这个人今天入群」这种假事实。
+
+**overwrite 的判据用「归谁」，不是「在不在」**
+
+`message_exists` 按唯一键 (message_id, group_id) 查，而 `overwrite_message` 的 WHERE
+也是这两个字段——两者口径本来就一致，`existed` 换成 `message_backup_id` 是为了让
+下面的 `elif` 能看见「行在、但 `backup_id` 是空串」的情况（老库升级、
+`assign_message_backup` 摘过归属）。那种行按存在性算是「有」，按归属算是「没有」，
+分支走错就会既不覆盖也不补归属。
+
+写这两条时我一度以为旧代码「先写后校验」「覆盖不换归属」，去改了 `restore()` 的
+顺序和 overwrite 分支——实测都不是：`_check_content` 早就在第一次写入之前，
+`overwrite_message` 带 `backup_id` 时也会连归属一起改。这两处改动回滚了，
+只留下用例把语义钉住（`test_round26_restore_order_and_timestamp.py`）。
+
 ## 红线对照
 
 | 红线 | 落地位置 |

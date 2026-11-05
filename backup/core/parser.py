@@ -84,28 +84,45 @@ def _segment_type(seg: Any) -> str:
     return text.split(":", 1)[0]
 
 
-def _to_datetime(value) -> datetime:
-    """统一成 naive 本地时间。
+#: 平台没给时间戳时落库的时间。用「最小值」而不是「现在」：前者可以被识别成
+#: 「这一条不知道什么时候发的」，后者会被当成事实写进库、进校验和、进日期分组。
+_EPOCH_FLOOR = datetime.min
+
+
+def _to_datetime(value, missing: Optional[datetime] = None) -> Optional[datetime]:
+    """统一成 naive 本地时间。**解析不出来返回 None，绝不用 `datetime.now()` 顶上。**
 
     时间戳在库里是 `%Y-%m-%d %H:%M:%S.%f` 字符串，tz-aware 值落库时会连带丢掉
     时区，再读回来就凭空多了几小时——增量水位是 (timestamp, message_id) 比较的，
     脏点一旦写下，那段时间的正常消息全被判成「更旧」而跳过。
+
+    原来缺失/为 0 时回落到「现在」，后果比报错糟得多：消息的时间是备份时产生的
+    时间，不是它被发出来的时间。同一批消息重跑一次，时间就变一次——校验和按
+    `(timestamp, message_id)` 算，同一份数据两次解析出两个指纹，跨来源比对全是
+    假阳性；`/backup export` 按日期分片也会把半年前的消息归到今天。
+
+    `missing` 给调用方一个显式兜底（导出包里的平铺消息自带时间，解析不到时用它），
+    不给就返回 None，由上层决定是跳过还是保留。
     """
     if isinstance(value, datetime):
         return _naive(value)
-    if value is None:
-        return datetime.now()
+    if value is None or value == "":
+        return missing
     try:
         ts = float(value)
+        if ts <= 0:
+            # 0 / 负数不是「1970 年」，是「平台没给」。1970 年的消息排在整库最前，
+            # 既污染校验和排序，也会让「按日期分组」多出一个 1970-01-01 的分区
+            return missing
         if ts > 1e11:  # 毫秒
             ts /= 1000
         return datetime.fromtimestamp(ts)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OSError, OverflowError):
         pass
     try:
         return _naive(datetime.fromisoformat(str(value)))
     except ValueError:
-        return datetime.now()
+        return missing
 
 
 def _naive(dt: datetime) -> datetime:
@@ -179,12 +196,21 @@ def parse_message(raw: Any, group_id: Optional[int] = None) -> Message:
     # 两次 content
     if isinstance(flat_content, (list, dict)):
         flat_content = ""
+    # 平台不给时间戳就认「不知道」。退回 `datetime.now()` 会让同一批消息每解析
+    # 一次换一个时间，校验和跟着变——这是「数据没坏、却被判成损坏」的来源之一。
     timestamp = _to_datetime(
         _get(raw, "timestamp", _get(raw, "time", _get(raw, "created_at")))
     )
+    if timestamp is None:
+        # 平铺的导出包（`messages.json` 里那条 dict）自带时间；解析不出来还能
+        # 用文件名/清单时刻兜。真的一点线索都没有时留 `datetime.min`：排在最前，
+        # 至少不冒充「刚刚发的」
+        timestamp = _EPOCH_FLOOR
     message_id = str(_get(raw, "message_id", _get(raw, "id", "")) or "")
     if not message_id:
-        message_id = f"local_{sender_id}_{int(timestamp.timestamp() * 1000)}_{int(time.time() * 1000) % 100000}"
+        # `timestamp()` 在 datetime.min 上会抛「year 0 is out of range」，兜成 0
+        stamp = int(timestamp.timestamp() * 1000) if timestamp > _EPOCH_FLOOR else 0
+        message_id = f"local_{sender_id}_{stamp}_{int(time.time() * 1000) % 100000}"
 
     texts: list[str] = []
     media_paths: list[str] = []
