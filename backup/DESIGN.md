@@ -876,3 +876,31 @@ payload 塞在里头），`url` 就只在段上、`data` 里没有——`_media_
 对齐适配器字段名。`_get` 是 `getattr`，读 `message_obj` / `message` / `group` 会把整个
 消息对象捞出来——日志里出现对象 repr，就等于把正文写进了日志（红线 1）。
 现在只判断「有没有」，绝不打印值。
+
+## round27：`_call` 只认一种参数名，整条拉取路径静默失败
+
+`PlatformAdapter._call` 原来的策略是「按名字逐个调，TypeError 就换下一个名字」。
+它默认适配器的参数名也叫 `group_id`——而 OneBot 那套（以及本仓库测试替身之外的
+绝大多数写法）叫 `gid`。于是：
+
+```
+引擎送:  get_group_history(group_id=100, count=50, offset=0)
+适配器:  async def get_group_history(self, gid, count=50, offset=0)
+         → TypeError: unexpected keyword argument 'group_id'
+         → 换下一个名字 → 名字根本不存在 → return None
+         → 引擎当作「空页」→ 备份报 completed、0 条
+```
+
+**为什么用例一直是绿的**：替身的签名和引擎对齐，测的是「平台返回什么」，
+从来没验证过「参数怎么送进去」。这是本仓库第七次撞到同一类问题——
+**用一套自己的假设去验证自己的代码**。
+
+修法分三层：
+
+1. `_adapt_kwargs` 先按签名重映射参数名（`group_id` ↔ `gid` / `group` / `chat_id`），
+   对不上就不硬送。这条让「参数名不同」不再等于「调不通」。
+2. `_fetch_page` 在「两条路都拿不到东西」时置 `adapter.history_broken`，
+   引擎收尾时把状态从 `completed` 降成 `failed` 并写清原因。
+   **空群和「接口根本用不了」在返回值上都是空列表**，不区分就是骗人。
+3. 参数名对不上的调用会建出一个永不 await 的 coroutine（`coroutine was never
+   awaited`）。探测失败要 `close()` 掉，别把半成品协程堆在事件循环上。

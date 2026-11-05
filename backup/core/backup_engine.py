@@ -63,6 +63,76 @@ def _oldest_id(batch: list) -> str:
     return _raw_id(oldest)
 
 
+#: 平台接口的常见参数别名。引擎统一用 `group_id`，但适配器上可能是 `gid`、
+#: `group`、`chat_id`——签名不匹配就换名字这个策略挡不住「名字只有一个、
+#: 参数名却不同」的情况：一个个试过去全是 TypeError，最后返回 None，
+#: 上层看到的是「拉取失败，沿用上次快照」。
+#:
+#: 这个 bug 藏了很久：假替身的 `get_group_history(gid, ...)` 与真适配器写法一致，
+#: 而 `_call` 只传 `group_id=`，于是**每一次**翻页都静默失败——备份报成功、
+#: 消息 0 条。用例一直是绿的，因为它测的是「平台返回什么」，不是「参数怎么送进去」。
+_PARAM_ALIASES = {
+    "group_id": ("group_id", "gid", "group", "chat_id"),
+    "user_id": ("user_id", "uid", "uin"),
+    "count": ("count", "limit", "page_size"),
+}
+
+
+def _adapt_kwargs(fn, kwargs: dict) -> Optional[dict]:
+    """按目标函数的签名重映射参数名。对不上返回 None（这个函数不用试了）。
+
+    只看**显式声明**的参数，`**kwargs` 不算——OneBot 客户端靠 `__getattr__`
+    造方法，签名恒为 `(*args, **kwargs)`，把它当成「什么都收」会让真正的别名
+    映射失效（也可能把一个本该失败的调用蒙对）。
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return None
+    params = sig.parameters
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        # 收 **kwargs 的实现（适配器自己的包装层）按原样送，它自己会挑
+        return dict(kwargs)
+    mapped: dict = {}
+    for key, value in kwargs.items():
+        if key in params:
+            mapped[key] = value
+            continue
+        for alias in _PARAM_ALIASES.get(key, ()):
+            if alias in params:
+                mapped[alias] = value
+                break
+        else:
+            # 这个参数它根本不收。硬送进去就是 TypeError，换名字才有意义
+            return None
+    required = [
+        name
+        for name, p in params.items()
+        if p.default is inspect.Parameter.empty
+        and p.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        and name not in mapped
+    ]
+    if required:
+        return None
+    return mapped
+
+
+def _close_unawaited(value) -> None:
+    """关掉一个「调了但没 await」的 coroutine。
+
+    参数名对不上的调用在 Python 里有个阴险的地方：**函数体根本没执行**，但
+    协程对象已经建出来了，只是永远不会被 await——它既不报错也不干活，
+    只留一条 `coroutine was never awaited` 的 RuntimeWarning。多次探测下来，
+    这种半成品协程会堆在事件循环上。探测失败就得把它关掉，别留给下一个人。
+    """
+    if asyncio.iscoroutine(value):
+        try:
+            value.close()
+        except Exception:  # pragma: no cover - 关不掉也不该影响主流程
+            pass
+
+
 class PlatformAdapter:
     """把 AstrBot 平台对象适配成备份引擎要的几个方法。
 
@@ -91,6 +161,14 @@ class PlatformAdapter:
     def __init__(self, platform):
         self.platform = platform
         self._anchor: dict[int, str] = {}
+        #: 历史消息接口有没有真的调通过一次。
+        #:
+        #: 「适配器上每个候选名字都对不上签名」和「这个群确实一条消息都没有」
+        #: 在返回值上是同一个东西（空列表），但后果天差地别：前者是插件根本备份
+        #: 不了这个平台，后者是正常的空群。原来两者都报 `completed`、`0 条`——
+        #: 用户以为备份好了，其实一条都没拉到。第一次调用失败就置位，由引擎在
+        #: 收尾时把状态降成 failed 并说清原因。
+        self.history_broken = False
 
     def _client(self):
         """真正的 OneBot/aiohttp 客户端对象，取不到就退回平台对象本身。
@@ -134,20 +212,31 @@ class PlatformAdapter:
         会被上层当成「公告拉取失败，沿用上次快照」悄悄吞掉——功能看着在，实际
         一次都没成功过。签名不匹配就换下一个名字，全都不行才返回 None。
         """
-        last_error: Optional[Exception] = None
         client = self._client()
         targets = [self.platform]
         if client is not None and client is not self.platform:
             targets.append(client)
+        unsuitable: list[str] = []
         for target in targets:
             for name in names:
                 fn = getattr(target, name, None)
                 if not callable(fn):
                     continue
+                # 先按签名重映射参数名，再决定要不要调。原来只有「调下去抛
+                # TypeError 就换下一个名字」这一条路：适配器的 `get_group_history`
+                # 参数叫 gid，引擎送的是 group_id，每一次都 TypeError，而下一个
+                # 名字根本不存在——整条拉取路径静默返回 None，备份报成功、0 条。
+                mapped = _adapt_kwargs(fn, kwargs)
+                if mapped is None:
+                    unsuitable.append(name)
+                    continue
                 try:
-                    result = fn(*args, **kwargs)
+                    result = fn(*args, **mapped)
                 except TypeError as e:
-                    last_error = e
+                    # 签名对了却还是 TypeError：多半是函数体里的类型问题（比如
+                    # group_id 该是字符串却给了 int）。换名字没用，但也不该把
+                    # 上层炸掉，记下来交给下一个候选
+                    unsuitable.append(f"{name}({e})")
                     continue
                 except Exception as e:
                     # ActionFailed / 网络错误：这不是「签名不对」，是平台真的拒绝
@@ -157,8 +246,8 @@ class PlatformAdapter:
                 if asyncio.iscoroutine(result):
                     result = await result
                 return result
-        if last_error is not None:
-            logger.debug("平台接口签名不匹配 %s: %s", ",".join(names), last_error)
+        if unsuitable:
+            logger.debug("平台接口无匹配签名 %s: %s", ",".join(names), "; ".join(unsuitable))
         return None
 
     async def _action(self, action: str, **params):
@@ -297,6 +386,12 @@ class PlatformAdapter:
         )
         if result is None:
             result = await self._action("get_group_msg_history", **params)
+        if result is None:
+            # 两条路都没拿到东西：不是「空页」，是「这个接口根本调不通」。
+            # 两者在返回值上都是 None，但后果完全不同——不区分的话，接一个
+            # 参数名对不上的适配器，备份会一路报 completed、0 条
+            self.history_broken = True
+            return []
         if isinstance(result, dict):
             result = result.get("messages") or result.get("data") or []
         return list(result or [])
@@ -549,6 +644,17 @@ class BackupEngine:
                 notes.append(f"{failed_media} 个媒体文件下载失败")
             if auxiliary_errors:
                 notes.append("；".join(auxiliary_errors) + "拉取失败，沿用上次快照")
+            # 历史消息接口一次都没调通：这条不能报 completed。空群和「接口根本
+            # 用不了」在返回值上都是空列表，混为一谈等于告诉用户「备份好了」而
+            # 实际一条都没拉到。降成 failed 并把原因写清，用户才知道该看什么
+            broken_history = getattr(adapter, "history_broken", False)
+            if broken_history and not covered:
+                record.status = BackupStatus.FAILED
+                notes.insert(
+                    0,
+                    "历史消息接口调用失败（平台适配器的接口名或参数名与本插件不匹配），"
+                    "本次未拉取到任何消息",
+                )
             record.error = " · ".join(notes) if notes else None
             record.finished_at = datetime.now()
         except Exception as e:

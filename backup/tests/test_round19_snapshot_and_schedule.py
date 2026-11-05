@@ -112,14 +112,33 @@ async def test_adapter_skips_methods_with_wrong_signature():
     """
 
     class Platform:
-        async def get_group_notice(self, group):  # 参数名不叫 group_id
+        async def get_group_notice(self, group):  # 参数名不叫 group_id（别名之一）
             return [{"content": "x"}]
 
         async def get_group_notices(self, group_id):
             return [{"content": "y"}]
 
     adapter = PlatformAdapter(Platform())
-    assert await adapter.get_group_announcements(1) == [{"content": "y"}]
+    # `group` 是 group_id 的别名，能映射上就直接用第一个：它本来就是最匹配的名字
+    assert await adapter.get_group_announcements(1) == [{"content": "x"}]
+
+
+@pytest.mark.asyncio
+async def test_adapter_matches_realistic_gid_signature():
+    """真适配器的历史消息接口参数叫 gid（OneBot 那套），引擎送的是 group_id。
+
+    这条是 round27 抓到的真 bug：原来「签名不匹配就换下一个名字」，而
+    `get_group_history(gid, ...)` 只有一个名字——每一次翻页都 TypeError，
+    `_call` 返回 None，备份报 completed、消息 0 条。整条拉取路径静默失败，
+    而用例一直是绿的（替身写法和引擎对齐，从没验证过参数名对不对）。
+    """
+
+    class Platform:
+        async def get_group_history(self, gid, count=50, offset=0):
+            return [{"message_id": f"m{offset}"}] if offset == 0 else []
+
+    adapter = PlatformAdapter(Platform())
+    assert await adapter.get_group_history(100) == [{"message_id": "m0"}]
 
 
 def test_cron_that_never_fires_is_rejected():
