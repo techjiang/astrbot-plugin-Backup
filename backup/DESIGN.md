@@ -1028,3 +1028,60 @@ AstrBot 换过一次面板框架，插件路由的挂载方式和请求对象的
 验证方式也换了：`test_round29_fastapi_dashboard.py` 装真 FastAPI，用面板自己的
 `_call_plugin_extension` + `PluginRequest` 上下文跑真请求（`httpx.ASGITransport`），
 断言的是 content-type 和字节数。修之前同一组请求全部是 `200 application/json`。
+
+---
+
+## 第 31 轮：翻页链路只有真 HTTP 才算数
+
+前面所有的分页用例，喂进去的都是我自己写的假客户端：签名、返回形状、消息朝向、
+分页语义，全是我按「应该长这样」定的。这一轮起了个真 aiohttp 服务，
+客户端走真 HTTP + 真 JSON，只把平台当黑盒。三处叠在一起，表现是同一个：
+**备份报 `completed`，120 条的群只存了几十条。**
+
+### 1. `{"messages": [...]}` 这层外壳没拆开
+
+`_fetch_page` 里写着「`result` 是 dict 就取 `.get("messages")`」——可那条分支
+**永远走不到**：`_call` 在 return 之前只判 `asyncio.iscoroutine`，dict 不是协程，
+直接原样交回。调用方 `list(result or [])` 于是拿到**键名** `["messages"]`：
+一个 dict 被当成「一页 1 条消息」。
+
+后果比「少一条」严重得多。`_raw_id("messages")` 退化成同一个指纹，翻页判定的
+「这一页是不是又全是翻过的」永远为真——引擎两次调用之后就认为到底了。
+
+现在 `_unwrap_messages` 认三种外壳（`messages` / `data` / `data.messages`），
+拆不出来（比如平台回 `{"error": ...}`）返回 `None` 并置 `history_broken`，
+收尾降 `failed`。**`{}` 例外**：那是「这个群没有文件/公告」的正常回执，等于空列表。
+
+### 2. 锚点取成了「这一页最新那条」
+
+`_oldest_id` 默认「第一个元素就是最旧的」。OneBot 的 `get_group_msg_history`
+返回的是**新→旧**，于是锚点拿到这一页最新那条，而 `message_seq` 的语义是
+「从这条往回数 count 条」——下一页原地再取一遍同样的消息。
+
+现在先按时间戳 / message_id 比出朝向（`_detect_newest_first`），有锚点之后
+`_fetch_page` 不再同时发 `offset`：OneBot 里 `count` + `message_seq` 和
+`offset` 是两种互斥语义，一起发出去行为随实现而变。
+
+顺带发现补齐循环的一个死结：`offset += len(fresh)` 里的 `fresh` 是「本页里还
+没见过的」，第二页之后它常常等于整页，但锚点没推进时它不动——于是 `offset`
+原地踏步。改成按 `len(page)` 推进。
+
+### 3. 每页给得比 `PAGE_SIZE` 少就收工
+
+引擎用 `len(batch) < PAGE_SIZE` 判到底。可适配器不认 `count`、每页固定给 20 条
+时，第一页 20 < 50 就退出了——**补齐逻辑就是为了对付这种平台，判据用错等于没补**。
+
+现在分两种：有锚点时「给得比 `want` 少」才算到底，没锚点的 offset 翻页仍按
+半页判（平台可能只是不认 count）。收工兜底始终是「翻过的消息集合」，平台既不认
+count 也不认 offset 时靠它停下来。
+
+### 验证
+
+`test_round31_http_paging.py`（7 条）：真 aiohttp 服务、真 JSON、真 HTTP。
+其中 `test_full_backup_over_real_http_reads_every_message` 断言 120 条一条不少，
+且锚点序列无重复；`test_newest_first_and_oldest_first_both_read_everything`
+把同一批数据正着反着各跑一遍。旧代码上 `{"error"}` 那条断言失败——它报的是
+`completed`。
+
+一条方法论上的事：这轮的三处都不在「我写的逻辑」里，而在「我以为平台会怎么回」
+里。假客户端替我省掉的从来不是网络，是**平台实际怎么说话**。

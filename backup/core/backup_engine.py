@@ -39,28 +39,78 @@ def _raw_id(raw) -> str:
     return str(value) if value else repr(raw)[:512]
 
 
-def _oldest_id(batch: list) -> str:
-    """一页消息里最旧那条的 ID，用来当下一页的翻页锚点。"""
+def _raw_key(raw) -> Optional[float]:
+    """这条消息的「先后」标量：优先时间戳，退到 message_id / message_seq。
+
+    只用来比较同一页内谁更旧，不要求和平台时钟一致——所以解析不出来就返回
+    None，让调用方退化成「按数组位置猜」。
+    """
+    if isinstance(raw, dict):
+        values = (raw.get("timestamp"), raw.get("time"), raw.get("message_id"), raw.get("message_seq"))
+    else:
+        values = (
+            getattr(raw, "timestamp", None),
+            getattr(raw, "time", None),
+            getattr(raw, "message_id", None),
+        )
+    for value in values:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _unwrap_messages(result) -> Optional[list]:
+    """把历史消息接口的返回值拆成「消息列表」，拆不出来返回 None。
+
+    OneBot v11 的 `data` 长这样：`{"messages": [...]}`，而 `_call` 原样交回。
+    上一轮 `_fetch_page` 只在 `result` 是 dict 时取 `.get("messages")`——可那条
+    分支**永远走不到**：`_call` 在 return 之前先判 `asyncio.iscoroutine`，dict
+    不是协程，直接 `return result`；调用方拿到 dict，`list(result or [])` 得到
+    的是**键的名字** `["messages"]`。一个 dict 于是被当成「一页 1 条消息」，
+    `_raw_id` 退化成 `json.dumps("messages")` 的指纹，翻页判定彻底失效。
+
+    这里把三种常见外壳都拆掉：`{"messages": [...]}` / `{"data": [...]}` /
+    `{"data": {"messages": [...]}}`，并接受直接是 list 的情况。
+    """
+    if result is None:
+        return None
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict):
+        for key in ("messages", "data"):
+            if key not in result:
+                continue
+            value = result[key]
+            inner = _unwrap_messages(value)
+            if inner is not None:
+                return inner
+        # `{}` 是「这个群没有文件/公告」的正常回执，等同于空列表
+        if not result:
+            return []
+    return None
+
+
+def _oldest_id(batch: list, newest_first: bool = False) -> str:
+    """一页消息里最旧那条的 ID，用来当下一页的翻页锚点。
+
+    原来默认「第一个元素就是最旧的」，可 OneBot 的 `get_group_msg_history`
+    返回的是**新→旧**（`message_seq` 是「从这条往回数 count 条」）。于是锚点
+    取到的是这一页里最新那条，下一页原地再要一遍同样的 50 条——120 条的群
+    永远只备到 50 条，状态还是 completed。
+
+    有可比较的时间/ID 就以它为准（一眼就能看出朝向，不依赖平台约定）；
+    全都取不到才退化成按数组位置，用调用方给的朝向提示。
+    """
     if not batch:
         return ""
     first = batch[0]
-    ts = getattr(first, "timestamp", None) if not isinstance(first, dict) else first.get("timestamp")
-    try:
-        numeric = float(ts)
-    except (TypeError, ValueError):
-        numeric = None
-    if numeric is None:
-        return _raw_id(first)
-    oldest = first
-    for raw in batch[1:]:
-        other = getattr(raw, "timestamp", None) if not isinstance(raw, dict) else raw.get("timestamp")
-        try:
-            value = float(other)
-        except (TypeError, ValueError):
-            continue
-        if value < numeric:
-            numeric, oldest = value, raw
-    return _raw_id(oldest)
+    keyed = [(raw, _raw_key(raw)) for raw in batch]
+    keyed = [(raw, key) for raw, key in keyed if key is not None]
+    if not keyed:
+        return _raw_id(batch[-1] if newest_first else first)
+    return _raw_id(min(keyed, key=lambda item: item[1])[0])
 
 
 #: 平台接口的常见参数别名。引擎统一用 `group_id`，但适配器上可能是 `gid`、
@@ -161,6 +211,8 @@ class PlatformAdapter:
     def __init__(self, platform):
         self.platform = platform
         self._anchor: dict[int, str] = {}
+        #: 每个群的历史消息朝向（True = 新→旧），第一次拿到整页时定下来
+        self._newest_first: dict[int, bool] = {}
         #: 历史消息接口有没有真的调通过一次。
         #:
         #: 「适配器上每个候选名字都对不上签名」和「这个群确实一条消息都没有」
@@ -319,13 +371,14 @@ class PlatformAdapter:
         # 有 offset 语义的实现（适配器自己写的方法、测试替身）就照旧按 offset 翻页：
         # 引擎那套「连续两页都是翻过的才收工」的判定本来就是为它写的
         if self._supports("offset"):
-            return await self._fetch_page(group_id, count, offset, None)
+            return self._orient(await self._fetch_page(group_id, count, offset, None))
 
         if offset == 0:
             self._anchor.pop(group_id, None)
         collected: list = []
         seen: set[str] = set()
         anchor = self._anchor.get(group_id)
+        newest_first = self._newest_first.get(group_id)
         for _ in range(self.MAX_FILL_ROUNDS):
             want = max(count - len(collected), 1)
             page = await self._fetch_page(group_id, want, offset, anchor)
@@ -337,18 +390,64 @@ class PlatformAdapter:
             for raw in fresh:
                 seen.add(_raw_id(raw))
                 collected.append(raw)
-            oldest = _oldest_id(page)
+            # 朝向在第一次拿到整页时定下来，之后一直用同一个：同一轮里不会变
+            if newest_first is None:
+                newest_first = self._detect_newest_first(fresh)
+                self._newest_first[group_id] = newest_first
+            # 锚点必须取「最旧那条」：OneBot 的 message_seq 语义是「从这条往回数」，
+            # 给成这一页最新那条，下一页原地再取一遍同样的消息——120 条的群只备到
+            # 50 条，状态还是 completed。
+            # 收工判据只看「凑够 count 没有」，不看「这一页给满没有」：平台一次只给
+            # 20 条时（很多实现不认 count），按「给满没给满」判定会让补齐在第一轮
+            # 就退出——引擎拿到的永远是 20 条，120 条的群只备 20 条。补齐就是为了
+            # 对付这种平台，判据用错等于没补。
+            oldest = _oldest_id(fresh, newest_first=bool(newest_first))
             if not oldest or oldest == anchor:
                 break  # 翻不动了，锚点没推进
             anchor = oldest
+            # 按「本页实际拿到多少条」推进，不是 `len(fresh)`：`fresh` 是「本页里
+            # 还没见过的」，第二页之后它通常整页都是新的，但两页有重叠时就不是——
+            # 拿它当偏移量会原地打转，一次 SQL 都不往前走。
+            offset += len(page)
             self._anchor[group_id] = anchor
             if len(collected) >= count:
                 break
-        # 不能截断到 count：补齐时最后那一轮往往整页吐回来，截掉的几条（比如
-        # 补到 60 条只留 50）锚点已经推过去了，之后就再也翻不回来——群里那一
-        # 小段消息永久丢失，而备份报 completed。宁可这一页多给几条，让调用方
-        # 自己按条数判断，也不能把已拿到的消息扔掉
-        return collected
+        # 不能截断到 count：补齐时最后一轮往往整页吐回来，截掉的几条（比如
+        # 补到 60 条只留 50）锚点已经推过去了，之后就再也翻不回来——群里那一小段
+        # 消息永久丢失，而备份报 completed。宁可这一页多给几条，让调用方自己按
+        # 条数判断，也不能把已拿到的消息扔掉。
+        # 交出去之前统一成「新→旧」：引擎的翻页判定和去重都以顺序稳定为前提。
+        return self._orient(collected)
+
+    @staticmethod
+    def _detect_newest_first(page: list) -> bool:
+        """这一页是「新→旧」还是「旧→新」。
+
+        有两条以上带时间/ID 的消息就直接比首尾；只有一条或都取不到时，按 OneBot
+        v11 的约定猜「新→旧」（`get_group_msg_history` 的 `message_seq` 是从给定
+        那条往回数）。
+        """
+        first_key = _raw_key(page[0]) if page else None
+        last_key = _raw_key(page[-1]) if page else None
+        if first_key is not None and last_key is not None and first_key != last_key:
+            return first_key > last_key
+        return True
+
+    @staticmethod
+    def _orient(page: list) -> list:
+        """按内容朝向把一页排成「新→旧」。
+
+        引擎的翻页判定（「这一页是不是又全是翻过的」）和去重都建立在顺序稳定的
+        前提上；适配器给「旧→新」时，`本页不足半页就收工` 之外的兜底条件会被
+        自己搅乱，锚点也取错方向。
+        """
+        if len(page) < 2:
+            return list(page)
+        first_key = _raw_key(page[0])
+        last_key = _raw_key(page[-1])
+        if first_key is None or last_key is None:
+            return list(page)
+        return list(page) if first_key >= last_key else list(reversed(page))
 
     def _supports(self, param: str) -> bool:
         """平台的历史消息接口接不接受这个参数名。
@@ -376,6 +475,9 @@ class PlatformAdapter:
     ) -> list:
         """发一次历史消息请求。"""
         params = {"group_id": group_id, "count": count}
+        # `count` 和 `message_seq` 在 OneBot 里是两种互斥语义：给了 seq 就「从它
+        # 往回数 count 条」，再带一个 offset 只会让实现在两者之间挑一个，行为随
+        # 平台而变。有锚点时把 count 一起收进 params 就够了，offset 不再出场。
         if anchor:
             params["message_seq"] = anchor
         else:
@@ -392,9 +494,13 @@ class PlatformAdapter:
             # 参数名对不上的适配器，备份会一路报 completed、0 条
             self.history_broken = True
             return []
-        if isinstance(result, dict):
-            result = result.get("messages") or result.get("data") or []
-        return list(result or [])
+        unwrapped = _unwrap_messages(result)
+        if unwrapped is None:
+            # 拆不出消息列表（比如平台回了一句 `{"error": ...}`）：这是接口调不通，
+            # 不是「空页」。当成空页处理就会静默收工、报 completed
+            self.history_broken = True
+            return []
+        return list(unwrapped)
 
 
 class BackupEngine:
@@ -590,8 +696,14 @@ class BackupEngine:
                 # 只按「平台吐回来多少」判断翻页到头是错的：适配器不认 count、每页
                 # 固定给 30 条时，第一页就小于 PAGE_SIZE，循环当场退出，剩下 3 倍
                 # 的消息一条没备，备份还报 completed。低于半页才算到头（正常的最后
-                # 一页），否则继续要下一页。收工条件由「翻过的消息集合」兜底，
-                # 不会因为平台始终不认 offset 而死循环。
+                # 一页），否则继续要下一页。
+                #
+                # 分两种情况是因为「不足半页」本身不总等于到底：给了锚点之后
+                # （OneBot 的 `message_seq` 语义是「从这条往回数 count 条」），平台
+                # 返回得比 PAGE_SIZE 少就是真的没了；而没有锚点的 offset 翻页里，
+                # 平台照样可能每页只给固定条数（不认 count），这时按「给得少」判定
+                # 会漏掉后面所有页。收工兜底始终是「翻过的消息集合」——平台既不认
+                # count 也不认 offset 时，靠它停下来，不会死循环。
                 if len(batch) < PAGE_SIZE // 2:
                     break
 
