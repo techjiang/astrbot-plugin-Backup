@@ -177,54 +177,92 @@ def expires_header(expires_at: datetime) -> dict:
 MISSING = object()
 
 
-def _current_request():
-    """拿到当前框架的请求对象。拿不到返回 None（说明不在请求上下文里）。"""
-    # Flask / Quart：`ctx.request` 在应用上下文外会抛异常
-    try:  # pragma: no cover - 取决于宿主装了哪个框架
-        from flask import request as flask_request  # type: ignore
+#: 宿主会把插件路由挂在一层自己的前缀下面，这层前缀不属于我们的路由
+#:
+#: - AstrBot 4.14 的 `srv_plug_route`：`app.add_url_rule("/api/plug/<path:subpath>")`，
+#:   所以 `request.path` 是 `/api/plug/backup/download/<token>`，多出来的**不是** `/api`
+#:   而是 `/api/plug`。
+#: - 自建网关可能挂在 `/api`、`/plug`、`/web` 下面。
+#:
+#: 原来写死只削 `"/api/"` 四个字符，于是 `request.path` 被削成
+#: `/plug/backup/download/<token>`——既不等于 `/api/backup/download/...`，也不以
+#: `/backup/download/` 开头，`handle_download` 直接回 404。而 404 和「链接已失效」
+#: 在用户眼里是同一句话：下不了。
+HOST_PREFIXES = ("/api/plug", "/plug", "/api", "/web")
 
-        if flask_request is not None:
-            return flask_request
+
+def _current_request():
+    """拿到当前框架的请求对象。拿不到返回 None（说明不在请求上下文里）。
+
+    这里**必须**先判 Quart，不能先判 Flask：AstrBot 面板跑在 Quart（ASGI）上，
+    而 `astrbot/dashboard/server.py` 为了序列化 `import flask` 了东西（Werkzeug 也在
+    依赖树里）。先试 Flask 的话，`from flask import request` 会成功，拿到的是一个
+    「当前没有活动请求」的代理对象——`request.path` 一读就抛
+    `RuntimeError: Working outside of request context`，视图 500。
+    """
+    try:  # pragma: no cover - 取决于宿主装了哪个框架
+        from quart import request as quart_request, has_request_context
+
+        if has_request_context():
+            return quart_request
     except Exception:
         pass
-    try:
-        from quart import request as quart_request  # type: ignore
+    try:  # pragma: no cover
+        from flask import request as flask_request, has_request_context as flask_has
 
-        return quart_request
+        if flask_has():
+            return flask_request
     except Exception:
         pass
     return None
 
 
 def _request_path(request) -> str:
+    """请求路径。**只在真有请求上下文时**读，否则返回空串。
+
+    读的属性本身可能是 werkzeug/aiohttp 的代理对象，在上下文外取值直接抛
+    RuntimeError。外层只兜 `Exception` 不够——视图里那一句就是 500 的来源。
+    """
     if request is None:
         return ""
     for name in ("path", "full_path", "path_qs", "url"):
-        value = getattr(request, name, None)
+        try:
+            value = getattr(request, name, None)
+        except Exception:
+            continue
         if isinstance(value, str) and value:
             return value
     return ""
 
 
+def _strip_host_prefix(path: str) -> str:
+    """削掉宿主加的那层前缀，还原成插件自己的路由形状。"""
+    for prefix in HOST_PREFIXES:
+        if path == prefix or path.startswith(prefix + "/"):
+            return path[len(prefix):] or "/"
+    return path
+
+
 def _request_query_token(request) -> str:
     if request is None:
         return ""
-    args = getattr(request, "args", None)
-    if args is None:
-        return ""
     try:
+        args = getattr(request, "args", None)
+        if args is None:
+            return ""
         return str(args.get("token") or "")
     except Exception:
+        # 同上：上下文外的代理对象，读出去的每一步都可能抛
         return ""
 
 
 def _request_range(request) -> Optional[str]:
     if request is None:
         return None
-    headers = getattr(request, "headers", None)
-    if headers is None:
-        return None
     try:
+        headers = getattr(request, "headers", None)
+        if headers is None:
+            return None
         return headers.get("Range")
     except Exception:
         return None
@@ -243,14 +281,12 @@ def _read_request(request, kwargs: Optional[dict] = None) -> tuple[str, Optional
         path = str(kwargs.get("path") or "")
         if not path:
             path = _request_path(request)
-        base, _, query = path.partition("?")
-        # 群里点的是 `/api/backup/download/<token>`，不是 `/backup/download/<token>`。
-        # `handle_download` 只认后一种，前面那层 `/api` 前缀得在这里削掉，否则
-        # 每一次真实的群内点击都会 404——而 404 和「链接过期」在用户眼里一样。
-        short = base
-        if short.startswith("/api/"):
-            short = short[4:]
-        return short, header
+        base, _, _query = path.partition("?")
+        # 群里点的是 `/api/backup/download/<token>`，宿主实际挂载在
+        # `/api/plug/backup/download/<token>`，`handle_download` 只认
+        # `/backup/download/<token>`。中间这一层必须削掉，否则每一次真实的群内
+        # 点击都是 404——而 404 和「链接过期」在用户眼里一样。
+        return _strip_host_prefix(base), header
     return f"{PREFIX}{token}", header
 
 
@@ -347,7 +383,12 @@ def make_view(exports, range_header_getter=None, stream: Optional[bool] = None):
                 kwargs["range_header"] = range_header_getter()
             except Exception:
                 pass
-        path, header = _read_request(request, kwargs)
+        try:
+            path, header = _read_request(request, kwargs)
+        except Exception:
+            # 宿主框架的请求对象在上下文外一读就抛。视图是直接对着群成员的浏览器
+            # 的，抛出去就是 500 错误页——比「链接已失效」更让人摸不着头脑
+            path, header = "", None
         response = handle_download(path, exports, header)
         want_stream = _wants_stream(kwargs) if stream is None else stream
         if not want_stream:

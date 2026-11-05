@@ -143,6 +143,19 @@ def _call_or_value(event, name):
     return value
 
 
+def _role_of(node):
+    """一个节点（事件 / sender / 成员对象或 dict）上记着的角色。
+
+    两种形态都要吃：`{"role": "admin"}` 这种 dict，和 `member.role = "member"`
+    这种对象。返回原值（True / "admin" / "member" / None），由调用方判定。
+    """
+    if node is None:
+        return None
+    if isinstance(node, dict):
+        return node.get("role")
+    return _call_or_value(node, "role")
+
+
 def _is_private_event(event) -> bool:
     """判断是不是私聊事件。
 
@@ -159,19 +172,17 @@ def _is_private_event(event) -> bool:
     if scope is None:
         inner = getattr(event, "message_obj", None)
         scope = getattr(inner, "type", None) if inner is not None else None
+    # `MessageType` 是 `class MessageType(Enum)`，`.value` 才是
+    # `"GroupMessage"` / `"FriendMessage"`；不是 str 枚举，`str()` 会给出
+    # `"MessageType.GROUP_MESSAGE"`，`getattr(scope, "value", scope)` 那一步
+    # 在 scope 是裸字符串时也拿不到 value。两种形态都在这里收干净
     scope_value = getattr(scope, "value", scope)
-    if isinstance(scope_value, str) and scope_value.lower() in (
-        "private",
-        "friend",
-        "direct",
-        "friendmessage",
-    ):
+    if isinstance(scope_value, str):
+        scope_value = scope_value.replace("MessageType.", "").replace("_", "").replace(" ", "")
+        scope_value = scope_value.lower()
+    if scope_value in ("private", "friend", "direct", "friendmessage"):
         return True
-    if isinstance(scope_value, str) and scope_value.lower() in (
-        "group",
-        "groupmessage",
-        "othermessage",
-    ):
+    if scope_value in ("group", "groupmessage", "othermessage"):
         return False
     # 有群号就是群聊。AstrBot 的群号只从 `get_group_id()` 拿得到（返回字符串），
     # 私聊时是空串；`event.group_id` 这个属性根本不存在。
@@ -242,14 +253,16 @@ class PermissionChecker:
             role = getattr(event, name, None)
             if isinstance(role, str) and role.lower() in ADMIN_ROLES:
                 return True
-        # 有的适配器把角色挂在 sender / message_obj 里
-        for path in (("sender", "role"), ("message_obj", "sender", "role")):
-            node = event
-            for step in path:
-                node = node.get(step) if isinstance(node, dict) else getattr(node, step, None)
-                if node is None:
-                    break
-            if isinstance(node, str) and node.lower() in ADMIN_ROLES:
+        # 有的适配器把角色挂在 sender / message_obj 里。`_call_or_value` 而不是
+        # 裸 `getattr`：AstrBot 的 `AstrMessageEvent` 没有 `sender` 属性，真正的
+        # 发送者在 `message_obj.sender` 上；裸 getattr 拿到的是 None，这两级
+        # 探测从来没生效过
+        for holder, nested in (("sender", None), ("message_obj", "sender")):
+            node = _call_or_value(event, holder)
+            if nested:
+                node = _call_or_value(node, nested) if node is not None else None
+            role = _role_of(node)
+            if role is True or (isinstance(role, str) and role.lower() in ADMIN_ROLES):
                 return True
         return cls._sender_in_group_admins(event)
 
@@ -261,10 +274,14 @@ class PermissionChecker:
             sender = _call_or_value(event, "sender_id")
         inner = getattr(event, "message_obj", None)
         if sender in (None, "") and inner is not None:
-            member = getattr(inner, "sender", None)
-            sender = _call_or_value(member, "user_id") if member is not None else None
+            sender = _call_or_value(getattr(inner, "sender", None), "user_id")
         if sender in (None, ""):
             return False
+        # AstrBot 的 `MessageMember.user_id` / `Group.group_owner` /
+        # `Group.group_admins` 都是**字符串**，而这里原来两边不做归一：
+        # OneBot 回 `owner_id` 是 int、`group_admins` 是 int 列表时（适配器自己
+        # 组装的 Group 常见这种），`"123" != 123` 会让群主被判成没权限。
+        # 统一按字符串去空白后比。
         sender = str(sender).strip()
         group = getattr(inner, "group", None) if inner is not None else None
         if group is None:
@@ -278,7 +295,9 @@ class PermissionChecker:
                 str(v).strip() == sender for v in values
             ):
                 return True
-        return False
+        # 前两项都没有的适配器常把「这个人什么身份」写在发送者自己身上
+        role = _role_of(getattr(inner, "sender", None) if inner is not None else None)
+        return role is True or (isinstance(role, str) and role.lower() in ADMIN_ROLES)
 
 
 def format_record_line(record) -> str:

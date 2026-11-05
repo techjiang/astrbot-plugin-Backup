@@ -40,6 +40,23 @@ class _Filter:
         return deco
 
 
+def _status_of(response) -> int:
+    """响应状态码统一成 int。
+
+    装上 Werkzeug 之后 `_as_flask` 回的是 `werkzeug.wrappers.Response`，它的
+    `status` 是 `HTTPStatus` 枚举（`404 NOT FOUND`）。和 int 相等但类型不同，
+    断言里用 `== 404` 会在某些写法下给出反直觉的结果，比较前统一转一下。
+    """
+    status = getattr(response, "status", response)
+    # `werkzeug.wrappers.Response.status` 是 `"404 NOT FOUND"` 这样的字符串；
+    # `HTTPStatus` 枚举和 int 都能直接 int()。取前面的数字部分
+    if isinstance(status, str):
+        status = status.split(" ", 1)[0]
+    try:
+        return int(status)
+    except (TypeError, ValueError):
+        return int(getattr(status, "value", 0))
+
 def _install_fake_astrbot(monkeypatch):
     """装一份最小但形状正确的 astrbot 包，让 `main.py` 能被导入。"""
 
@@ -343,12 +360,15 @@ def test_download_view_accepts_query_token(plugin, tmp_path):
         headers = {}
 
     response = asyncio.run(view(Request()))
-    assert response.status == 200
+    assert _status_of(response) == 200
     assert response.headers["Content-Type"] == "application/zip"
 
 
 def test_download_view_runs_without_arguments(plugin, monkeypatch):
     """宿主一个参数都不传也要能跑：没有 token 就 404，不能 TypeError。
+
+    `status` 在装上 Werkzeug 之后是 `HTTPStatus` 枚举（`HTTPStatus.NOT_FOUND`），
+    和 `404` 相等但单独的 `404` 不完全等于它——比较前统一转成 int。
 
     这一条是上一版的真 bug：`make_view` 生成的视图签名是 `view(request=None)`
     但里面又 `getattr(request, ...)` 之后直接把自定义数据类返回给 Flask——
@@ -361,7 +381,7 @@ def test_download_view_runs_without_arguments(plugin, monkeypatch):
     monkeypatch.setattr(download_route, "_current_request", lambda: None)
     view = download_route.make_view(plugin.exports, stream=True)
     response = asyncio.run(view())
-    assert response.status == 404
+    assert _status_of(response) == 404
 
 
 def test_register_download_api_is_optional(plugin):

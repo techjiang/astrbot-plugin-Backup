@@ -6,7 +6,7 @@
 
 import inspect
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from .auto_trigger import AutoTrigger
@@ -41,6 +41,55 @@ NOTICE_FIELDS = ("post_type", "notice_type", "sub_type", "subtype", "group_id", 
 
 # 私聊消息在库里的 group_id。负数，和真实群号（正整数）区分开
 PRIVATE_ARCHIVE_GROUP = -1
+
+#: 同一条通知被两个 handler 各处理一次时的去重窗口。AstrBot 的处理器分发是
+#: 广播式的（见 `pipeline/process_stage` 里对 `star_handlers_registry` 的遍历），
+#: `on_message` 与 `on_notice` 都挂在 `EventMessageType.ALL` 上，同一条事件会
+#: 依次进两个函数。窗口只需覆盖「同一次分发」，不需要覆盖分钟级。
+NOTICE_DEDUPE_SECONDS = 120
+
+
+def event_fingerprint(event) -> str:
+    """给一条事件算个去重指纹：只取消息/通知的 ID 与群号，不含正文。
+
+    取不到 message_id 就退回「群号 + 类型 + 发送者 + 时间戳」，仍不碰内容——红线 1。
+    """
+    obj = _attr(event, "message_obj")
+    parts = []
+    for holder in (obj, event):
+        if holder is None:
+            continue
+        for name in ("message_id", "message_seq"):
+            value = _attr(holder, name)
+            if value not in (None, ""):
+                parts.append(f"{name}={value}")
+        if parts:
+            break
+    if not parts:
+        for name in ("timestamp", "time"):
+            value = _attr(obj, name) if obj is not None else None
+            if value not in (None, ""):
+                parts.append(f"{name}={value}")
+                break
+        sender = _attr(_attr(obj, "sender"), "user_id") if obj is not None else None
+        if sender not in (None, ""):
+            parts.append(f"from={sender}")
+    group = None
+    for holder in (obj, event):
+        value = _attr(holder, "group_id") if holder is not None else None
+        if value not in (None, ""):
+            group = value
+            break
+    kind = ""
+    for holder in (obj, event):
+        value = _attr(holder, "type") if holder is not None else None
+        value = getattr(value, "value", value)
+        if value:
+            kind = str(value)
+            break
+    parts.append(f"group={group}")
+    parts.append(f"type={kind}")
+    return "|".join(parts)
 
 
 def _get(obj: Any, name: str, default=None):
@@ -227,6 +276,11 @@ class EventHooks:
         # 冷却窗口放到一天，等于「被踢只备一次」。
         self.kick_cooldown = kick_cooldown_seconds
         self._last_kick_backup: dict[int, datetime] = {}
+        # 同一条通知会同时进 on_message 和 on_notice。退群聚合按「次数」计数，
+        # 一次退群被数两遍 → 阈值提前一半就到 → 备份多跑一轮；解散/被踢的冷却
+        # 窗口是按事件间隔算的，两次调用几乎同时，第二次能命中冷却，所以只有
+        # 退群聚合会真的翻倍。这里记「这条通知已经处理过」，第二个 handler 直接跳过
+        self._handled_notices: dict[str, datetime] = {}
 
     # ---------- 实时归档 ----------
     def archive_message(self, event, backup_id: str = "realtime") -> Optional[Message]:
@@ -281,6 +335,23 @@ class EventHooks:
         return self.trigger.should_trigger_mass_leave(group_id)
 
     # ---------- 触发式备份：解散 / 被踢 ----------
+    def seen_notice(self, event, now: Optional[datetime] = None) -> bool:
+        """这条通知是不是刚被另一个 handler 处理过。第一次返回 False。
+
+        不这么做的话，`on_message` 和 `on_notice` 会各数一次退群：阈值 10 的群实际
+        只退了 5 个人就触发备份，而且退群窗口里的人数永远比真实值多一倍。
+        """
+        key = event_fingerprint(event)
+        if not key or key == "group=None|type=":
+            return False
+        now = now or datetime.now()
+        cutoff = now - timedelta(seconds=NOTICE_DEDUPE_SECONDS)
+        for old in [k for k, t in self._handled_notices.items() if t < cutoff]:
+            self._handled_notices.pop(old, None)
+        last = self._handled_notices.get(key)
+        self._handled_notices[key] = now
+        return last is not None and last >= cutoff
+
     def handle_notice(self, payload, event=None) -> tuple[Optional[int], str, bool]:
         """统一处理一条通知事件。返回 (群号, 事件类型, 是否应当立即备份)。
 

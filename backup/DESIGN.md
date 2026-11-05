@@ -727,6 +727,52 @@ AstrBot 4.14 的 `AstrMessageEvent.role` 只有 `member` / `admin` 两个值，�
 `group_admins`（管理员 QQ 列表）。现在拿发送者 ID 去比对——比猜 `role` 字符串可靠，
 因为它不依赖适配器怎么填。`role == "admin"` 那条仍然保留（机器人主人也是人）。
 
+## 第 24 轮：把下载链路放进真 Quart 跑了一遍
+
+前几轮的下载用例全是拿假的 Request 对象喂 `make_view`，断言的是我们自己造出来的
+形状——用例和代码共用同一套假设，互相证明，谁也碰不到真实世界。这一轮装上真 Quart
+（AstrBot 面板跑的就是它）、照 `dashboard/server.py` 的 `srv_plug_route` 写转发，
+一次请求就撞出三个 500 / 404。
+
+**宿主前缀削错了长度**
+
+`srv_plug_route` 把插件路由挂在 `/api/plug/<path:subpath>` 上，于是 `request.path`
+是 `/api/plug/backup/download/<token>`。原来写死只削 `path[4:]`（等于只削 `/api`），
+削完是 `/plug/backup/download/<token>`——`handle_download` 两种前缀都不认，回 404。
+而 404 和「链接已失效」在用户眼里是同一句话：下不了。
+
+现在按宿主可能挂的几层前缀逐个匹配（`/api/plug`、`/plug`、`/api`、`/web`），
+按最长的那层削。
+
+**请求对象找错了框架**
+
+`_current_request` 先试 Flask 再试 Quart。AstrBot 面板跑在 Quart 上，但
+`astrbot/dashboard/server.py` 为了 JSON 序列化 `import flask` 了东西——于是
+`from flask import request` 成功，拿到的是一个「当前没有活动请求」的代理对象，
+一读 `request.path` 就 `RuntimeError: Working outside of request context`，视图 500。
+
+现在先判 Quart（并且用 `has_request_context()` 判，不是判 import 成功），再判 Flask；
+读请求对象的每一步都单独兜异常，`view` 自己也兜一层——视图是直接对着群成员的浏览器
+的，抛出去就是一个 500 错误页，比「链接已失效」更让人摸不着头脑。
+
+**群管身份：发送者在 `message_obj.sender` 上，不在事件上**
+
+23 轮修好了「拿发送者 ID 比 `group_owner` / `group_admins`」，但**发送者本身**是从
+`getattr(event, "sender")` 拿的——`AstrMessageEvent` 根本没有 `sender` 属性，拿到
+None 就直接放弃。所以那个修法一行都没生效：群主发 `/backup now` 依旧被挡。
+
+同时 `sender.role` 写成 dict（`event.sender = {"role": "admin"}`）时也读不到。
+现在两级都走 `_call_or_value`（`getattr` + 可调用就调），dict 形态单独认。
+
+**同一条通知被数两遍退群**
+
+AstrBot 的处理器分发是广播式的：`on_message` 和 `on_notice` 都挂在
+`EventMessageType.ALL` 上，同一条 notice 会依次进两个函数。解散/被踢有冷却窗口挡着，
+退群聚合却是**按次数累加**的——一次退群被数两遍，阈值 10 的群 5 个人就触发备份。
+
+现在按事件指纹（`message_id` + 群号 + 类型，**不含正文**）在 120 秒窗口内去重，
+先到的那个 handler 处理，后到的直接跳过。
+
 ## 红线对照
 
 | 红线 | 落地位置 |

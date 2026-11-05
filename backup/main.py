@@ -635,6 +635,12 @@ class BackupPlugin(Star):
             # 普通消息：`on_message` 已经归档过了，不能在这里再走一遍退群聚合，
             # 否则一次普通聊天就能把「大量退群」的阈值顶满
             return
+        if self.hooks.seen_notice(event):
+            # 同一条通知会同时进 on_message 和 on_notice（两个 handler 都挂在
+            # AllEventMessage 上，分发是广播式的）。两个都往下走的话，一次退群被
+            # 数两遍，阈值 10 的群 5 个人就触发备份。只让先到的那个处理
+            logger.debug("同一条通知已被处理过，跳过：%s", extract_group_id(event))
+            return
         if not self._notice_probe_done and payload:
             self._notice_probe_done = True
             logger.debug(self.hooks.describe_notice(payload))

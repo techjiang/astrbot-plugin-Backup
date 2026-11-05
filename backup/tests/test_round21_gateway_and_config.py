@@ -23,6 +23,24 @@ import pytest
 from .conftest import install_fake_astrbot, make_message
 
 
+def _status_of(response) -> int:
+    """响应状态码统一成 int。
+
+    装上 Werkzeug 之后 `_as_flask` 回的是 `werkzeug.wrappers.Response`，它的
+    `status` 是 `HTTPStatus` 枚举（`404 NOT FOUND`）。和 int 相等但类型不同，
+    断言里用 `== 404` 会在某些写法下给出反直觉的结果，比较前统一转一下。
+    """
+    status = getattr(response, "status", response)
+    # `werkzeug.wrappers.Response.status` 是 `"404 NOT FOUND"` 这样的字符串；
+    # `HTTPStatus` 枚举和 int 都能直接 int()。取前面的数字部分
+    if isinstance(status, str):
+        status = status.split(" ", 1)[0]
+    try:
+        return int(status)
+    except (TypeError, ValueError):
+        return int(getattr(status, "value", 0))
+
+
 @pytest.fixture
 def main_mod(tmp_path, monkeypatch):
     install_fake_astrbot(monkeypatch)
@@ -144,7 +162,7 @@ def test_view_without_any_argument_is_not_a_typeerror(plugin, monkeypatch):
     monkeypatch.setattr(download_route, "_current_request", lambda: None)
     view = download_route.make_view(plugin.exports, stream=True)
     response = asyncio.run(view())
-    assert response.status == 404
+    assert _status_of(response) == 404
 
 
 def test_view_returns_410_when_werkzeug_absent(plugin, monkeypatch):
@@ -163,7 +181,7 @@ def test_view_returns_410_when_werkzeug_absent(plugin, monkeypatch):
     monkeypatch.setitem(sys.modules, "werkzeug", no_werkzeug)
     monkeypatch.setitem(sys.modules, "werkzeug.wrappers", no_werkzeug)
     response = asyncio.run(download_route.make_view(plugin.exports, stream=False)())
-    assert response.status == 200
+    assert _status_of(response) == 200
     assert response.file == result.path
 
 
@@ -204,7 +222,7 @@ def test_aiohttp_view_returns_file_response(plugin):
 
     response = asyncio.run(aiohttp_view(plugin.exports)(Request()))
     assert isinstance(response, web.FileResponse)
-    assert response.status == 200
+    assert _status_of(response) == 200
 
 
 # ---------------------------------------------------------------- 配置来源
