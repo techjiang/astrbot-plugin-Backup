@@ -1189,3 +1189,113 @@ if target is None and _looks_like_archive(backup_id):   # ← 两头落空
 但这轮四条里，**三条不在「字段名对不对」上，而在「谁调用谁」上**：
 `request` 传了没用、`archive` 赋值条件写错、`_public_base_url` 没有调用点。
 这些读源码看不出来——源码每一段都对自己的，缝在拼接处。
+
+---
+
+## 第 33 轮：三个钩子功能其实一次都没跑过
+
+这一轮没加功能，只问了一个问题：**那两个事件钩子，到底有没有被调用过？**
+用真 AstrBot 4.14.6 的 `WakingCheckStage` + `StarRequestSubStage` 跑下来，
+答案是「没有」，而且不止一处原因。
+
+### 1. 装饰器顺序把钩子堵死了
+
+`main.py` 里两个钩子挂了三层装饰器，最初是这样写的：
+
+```python
+@filter.command("__backup_archive")        # 登记位
+@filter.custom_filter(_hook_filter(...))   # 认领过滤器
+@filter.event_message_type(ALL)
+async def on_message(self, event): ...
+```
+
+装饰器是**自下向上**应用的，所以 `custom_filter` 拿到的是 `command` 刚刚建出来的
+`handler_md`；而 `command` 在 `init_handler_md` 里 `inspect.signature` 了被包装的
+函数——那时它还是裸函数，参数是 `(self, event)`，跳过前两个后 `handler_params`
+为空。看着没问题。
+
+问题在 `CommandFilter` 本身：它留在 `event_filters` 里，`filter()` 是
+
+```python
+message_str.startswith("__backup_archive")   # 真实聊天里永远不成立
+```
+
+`WakingCheckStage` 对 `event_filters` 是 AND 关系，一条不通过整条事件就被判掉。
+于是「登记位」直接变成了「否决票」：实时归档、退群聚合、解散/被踢备份三个功能
+代码在、文档在、用例绿，**一次都没执行过**。
+
+现在的写法：
+
+- 钩子上**不挂** `CommandFilter`（只挂 `event_message_type` + 认领过滤器）；
+- 钩子函数自己置 `event.is_at_or_wake_command = True` / `event.is_wake = True`：
+  `WakingCheckStage` 只把这两个标记为真的 handler 交给 `StarRequestSubStage`，
+  而钩子是后台任务，本来就不该靠「有人 @ 机器人」来唤醒；
+- 注册表那边仍要能查到 handler——`event_filters` 非空即可（空 filter 会被
+  `WakingCheckStage` 直接 `continue`）。
+
+### 2. 认领过滤器不能带注解，也不能传实例
+
+`@filter.custom_filter` 对**裸指令**做的事是 `custom_filter(raise_error)`——
+它**调用**传进去的对象。所以：
+
+- 传类 → 得到实例，正常；
+- 传实例 → `TypeError: object is not callable`，插件加载失败；
+- 传工厂函数 → 得到工厂函数自己的返回值（一个普通函数），而调用处写的是
+  `filter.filter(event, cfg)`，每条事件 `AttributeError`。
+
+另外，`CommandFilter.init_handler_md` 会在 `@filter.command` 那一步
+`inspect.signature` 并把**第三个参数之后的**都当「要注入的参数」。过滤器类上写
+`def filter(self, event, _config=None) -> bool:` 时，`event_filters` 里前两个
+filter 是事件类型和认领过滤器，第三个正好是 `CommandFilter`——它 inspect 的是
+被包装的函数，不受影响；但如果 `custom_filter` 排在 `command` **上面**，
+inspect 到的是过滤器自己的 `filter` 方法，`-> bool` 就成了「必填参数」，
+`validate_and_convert_params` 抛 `ValueError: 必要参数缺失`，整条事件被终止。
+
+结论：**过滤器的 `filter` 方法不写注解**，`custom_filter` 永远排在 `command`
+下面。
+
+### 3. `raw_message` 被当成消息本体
+
+`archive_message` → `parse_event_message` 会拿
+`event.message_obj or event.raw_message` 去 `parse_message`。
+
+AstrBot 的 `message_obj` 是 `AstrBotMessage`，`raw_message` 属性是 **OneBot 原始
+事件 dict**——`{"post_type": "message", "message_id": "xxx", "raw_message": "真正的那句话", ...}`。
+它有自己的 `message_id`、`group_id`、`timestamp`、`sender`，看起来就是一条消息；
+直接丢进 `parse_message` 会走到 `_segments` 的兜底分支 `return [raw]`，整份事件
+被当成「一段」，`content` 扣出来的是一串既不像消息 ID、也不像正文的东西。
+
+后果不是「多一条脏数据」：**真正文、媒体、引用全丢**，而实时归档正是「群被炸时
+最后那几条」的唯一来源。
+
+现在 `parse_event_message` 先用 `is_event_payload` 判一层：事件 → 不当消息用，
+回退到 `message_str`。
+
+### 4. 验证方式
+
+`test_round32_hooks_never_ran.py`（5 条）+ `test_round28_real_astrbot_loader.py`
+里改写的 3 条，都跑真 stage：
+
+- 普通群消息 → `on_message` 被激活 → 库里真有这条；
+- 一条退群通知 → 只有 `on_notice` 被激活 → 窗口人数 +1（不是 +2）；
+- 9 个人退群不触发、第 10 个才触发一次备份；
+- 通知事件不被当成消息入库；
+- `raw_message` 是事件时不顶替消息本体。
+
+旧代码上这组里 3 条是红的。
+
+### 一句总结
+
+前几轮我一直在验「钩子里的逻辑对不对」，没人验「钩子有没有被调用」。
+**注册表里有名字 ≠ 会被调用；装饰器写上 ≠ 生效；用例绿 ≠ 跑过。**
+
+### 补记：为什么不再用 `@filter.command` 当登记位
+
+前几轮的做法是给钩子挂 `@filter.command("__backup_archive")`，理由是
+「`star_manager` 只认注册表，而往注册表里塞东西的只有 register 系列装饰器」。
+前半句对，后半句是我自己推出来的：`@filter.event_message_type` 也会
+`get_handler_or_create` 并塞进注册表。两个装饰器都能让 handler 出现在注册表里，
+区别只在 `event_filters` 里多不多一条 `CommandFilter`——而那条 `CommandFilter`
+恰恰是钩子的死刑判决书。
+
+所以现在钩子上只有 `event_message_type` + 认领过滤器，不带任何命令语义。

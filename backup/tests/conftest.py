@@ -127,6 +127,12 @@ def install_fake_astrbot(monkeypatch):
         def event_message_type(_kind):
             return lambda fn: fn
 
+        @staticmethod
+        def custom_filter(_filter):
+            # 真 AstrBot 里 `register_custom_filter` 会 `custom_filter(raise_error)`
+            # 再把它挂到 handler 上；替身只要保证「是个装饰器」即可
+            return lambda fn: fn
+
     api_event = types.ModuleType("astrbot.api.event")
     api_event.AstrMessageEvent = AstrMessageEvent
     api_event.filter = Filter

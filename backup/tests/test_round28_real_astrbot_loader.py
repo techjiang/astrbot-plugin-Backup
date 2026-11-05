@@ -12,6 +12,7 @@
 import asyncio
 import uuid
 
+import astrbot.api.event  # noqa: F401  先把 `astrbot.api.event` 拉起来再碰 platform
 import pytest
 
 from .conftest import load_plugin_for_real, real_astrbot_available
@@ -185,52 +186,87 @@ def plugin(monkeypatch, tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_handlers_are_in_registry_with_a_command_filter(plugin):
-    """两个钩子都得在注册表里，且**带 CommandFilter**。
+def test_handlers_are_reachable_without_any_command(plugin):
+    """两个钩子都得能被**普通聊天**触发，不能只有命令能进来。
 
-    AstrBot 往 `star_handlers_registry` 里塞东西的唯一入口是 register 系列
-    装饰器。只挂 `@filter.event_message_type` 的话 handler 会进注册表，
-    但 `WakingCheckStage` 对「event_filters 为空」的 handler 直接 `continue`——
-    注册表里有名字、插件详情里能看到，但永远不会被调用。实测过：旧代码
-    `on_message` / `on_notice` 的 filters 只有 `EventMessageTypeFilter`。
+    这里钉的是三个真跑出来的结论，缺一个钩子就一次都不会跑：
+
+    - handler 必须在注册表里（`star_manager` 只认注册表）；
+    - `event_filters` 不能为空——`WakingCheckStage` 对空 filter 直接 `continue`；
+    - 里面**不能有** `CommandFilter`。命令过滤是
+      `message_str.startswith("__backup_archive")`，真实聊天里永远不成立，
+      把它挂在钩子上等于给钩子判死刑（前几轮就是这么写的）。
     """
     from astrbot.core.star.filter.command import CommandFilter
 
     handlers = plugin_handlers()
     for name in ("on_message", "on_notice"):
         assert name in handlers, f"{name} 没进注册表"
-        kinds = {type(f) for f in handlers[name].event_filters}
-        assert CommandFilter in kinds, f"{name} 缺注册位 CommandFilter，永远不会被调到"
+        kinds = [type(f).__name__ for f in handlers[name].event_filters]
+        assert handlers[name].event_filters, f"{name} 的 event_filters 为空，永远不会被调到"
+        assert not any(
+            isinstance(f, CommandFilter) for f in handlers[name].event_filters
+        ), f"{name} 上挂了 CommandFilter，命令匹配永远不成立：{kinds}"
         assert any(
-            isinstance(f, CommandFilter) and f.command_name.startswith("__backup")
+            not isinstance(f, CommandFilter) and hasattr(f, "filter")
             for f in handlers[name].event_filters
-        ), f"{name} 的注册位命令名不该是用户能敲到的名字"
+        ), f"{name} 缺一个能放行的过滤器：{kinds}"
 
 
-def test_command_filter_can_inspect_the_hook_signature(plugin):
-    """`CommandFilter.init_handler_md` 会 `inspect.signature` 并跳过前两个参数。
+def test_each_hook_owns_exactly_one_kind_of_event(plugin):
+    """同一条事件只能被一个钩子认领。
 
-    `async def on_notice(self)` 只有一个参数，这条路径是 `TypeError`——真实
-    加载器下插件直接加载失败。这里把「签名能被 inspect 且参数解析为空」钉住。
+    AstrBot 会把它投给两个 handler。退群聚合是按**次数**累加的，两个都跑就是
+    阈值 10 的群退了 5 个人就触发备份。认领标记挂在 event 上（两个钩子拿到的
+    是同一个对象），过滤器负责置位、另一个钩子看到就退出。
     """
-    from astrbot.core.star.filter.command import CommandFilter
+    from astrbot.core.star.filter.custom_filter import CustomFilter
 
+    handlers = plugin_handlers()
+    claims = {}
     for name in ("on_message", "on_notice"):
-        cmd = next(
-            f for f in plugin_handlers()[name].event_filters if isinstance(f, CommandFilter)
+        filt = next(
+            f for f in handlers[name].event_filters
+            if isinstance(f, CustomFilter) and hasattr(f, "kind")
         )
-        assert cmd.handler_params == {}, f"{name} 不该有额外的必填参数"
+        claims[name] = filt
+
+    message = make_event("大家好")
+    notice = make_notice("group_decrease", "leave", user_id=9, group_id=100)
+    for event, expected in ((message, "on_message"), (notice, "on_notice")):
+        verdicts = {name: filt.filter(event, None) for name, filt in claims.items()}
+        assert verdicts[expected] is True, f"{expected} 没认领自己的事件：{verdicts}"
+        assert [k for k, v in verdicts.items() if v] == [expected], (
+            f"同一条事件被多个钩子认领：{verdicts}"
+        )
 
 
-def test_plain_group_message_does_not_wake_anything(plugin):
-    """没人 @ 机器人、也没唤醒前缀的普通群消息：一个 handler 都不该被激活。
+def test_plain_group_message_is_archived_without_a_command(plugin):
+    """没人 @ 机器人、也没敲命令的普通群消息，实时归档照样得写库。
 
-    `EventMessageTypeFilter.ALL` 在 AstrBot 里不等于「无条件」——没唤醒的事件
-    到不了 ProcessStage。把这条钉住，以后往钩子上加东西时不会误以为「反正会跑」。
+    这是「群被炸时数据还在不在」的那条底线。旧代码里 `on_message` 因为挂着
+    `CommandFilter` 永远不被激活，一条消息都进不了库。
     """
+    handler = plugin_handlers()["on_message"]
     event = make_event("大家好")
-    activated = asyncio.run(wake_and_activate(event))
-    assert activated == []
+    activated = asyncio.run(_run_handler(handler, event))
+    assert activated is True
+    rows = [dict(r) for r in plugin.db.query("SELECT message_id FROM messages")]
+    assert event.message_obj.message_id in {r["message_id"] for r in rows}, (
+        "普通群消息没进库——实时归档的钩子又没被调到"
+    )
+
+
+async def _run_handler(handler, event):
+    """只跑一个 handler 的过滤 + 调用，不掺别的（不依赖 stage 的副作用）。"""
+    from astrbot.core.pipeline.context_utils import call_handler
+
+    for filt in handler.event_filters:
+        if not filt.filter(event, None):
+            return False
+    async for _ in call_handler(event, handler.handler):
+        pass
+    return True
 
 
 def test_command_is_dispatched_and_replies(plugin):

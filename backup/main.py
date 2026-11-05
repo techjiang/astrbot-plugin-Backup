@@ -11,6 +11,7 @@ from typing import Optional
 
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
+from astrbot.core.star.filter.custom_filter import CustomFilter
 
 from .core.backup_engine import BackupEngine
 from .core.commands import (
@@ -46,6 +47,93 @@ from .core.verifier import read_manifest, verify_zip
 logger = logging.getLogger(__name__)
 
 PLUGIN_DIR = Path(__file__).resolve().parent
+
+
+#: 事件上记「这条已经被哪个钩子认领过」的键。`event.set_extra` 是 AstrBot 自己
+#: 传参用的同一个通道（`activated_handlers` / `parsed_params` 都在里面），同一条
+#: 事件在整条管道里是同一个对象，所以这个标记两个钩子都看得见。
+_HOOK_CLAIM = "__backup_hook_claim"
+
+
+def _looks_like_notice(event) -> bool:
+    """这条事件是不是群通知（退群/踢人/解散/上传…）。
+
+    `post_type` 是权威字段，只在 OneBot 原始事件里有，所以要摊一层
+    （`notice_payload` 会顺着 `message_obj.raw_message` 往下找）。
+    `poke` 例外：它是「有人戳了你一下」，是消息不是通知，AstrBot 甚至把它塞进了
+    消息链（`message=[Poke(...)]`），走归档那条路才对。
+    """
+    payload = notice_payload(event)
+    post_type = str(payload.get("post_type") or "").lower()
+    subtype = str(payload.get("sub_type") or payload.get("subtype") or "").lower()
+    if post_type == "notice" and subtype != "poke":
+        return True
+    return False
+
+
+class _HookClaimFilter(CustomFilter):
+    """给两个钩子用的自定义过滤器（`@filter.custom_filter`）。
+
+    为什么非要有它：钩子必须能在**任何**事件上被调到，而不是「有人敲了某条命令」
+    才跑。`@filter.command` 那套匹配是 `message_str.startswith("<命令名>")`，挂在
+    钩子上等于给它判死刑——实时归档、退群聚合、解散/被踢备份三个功能全成空谈。
+
+    用法上有个坑必须写下来：`register_custom_filter` 对**裸指令**做的是
+    `custom_filter = custom_filter(raise_error)`——它**调**传进来的那个对象。
+    所以：
+
+    - 传**类** → 得到一个实例，`filter.filter(event, cfg)` 正常；
+    - 传**实例** → `TypeError: object is not callable`，插件加载当场失败；
+    - 传**工厂函数** → 得到的是工厂函数自己的返回值，而调用处写的是
+      `filter.filter(...)`，会在每条事件上 `AttributeError: 'function' object
+      has no attribute 'filter'`，`WakingCheckStage` 记一条错误并停止事件传播。
+
+    后两种我都写出来过。所以这里固定用 `type(...)` 造一个「绑好 kind 的子类」
+    再把它交给装饰器，既是类、又能带上参数。
+
+    过滤器只做两件事：判断这条事件归哪个钩子、以及同一条事件别被两个钩子都认领。
+    不做权限判断——归档和触发式备份是后台任务，不该因为发送者不是管理员就跳过。
+    """
+
+    def __init__(self, kind: str = "", raise_error: bool = True):
+        super().__init__(raise_error)
+        self.kind = kind
+
+    def filter(self, event, _config=None):
+        try:
+            if event.get_extra(_HOOK_CLAIM):
+                return False  # 另一个钩子已经认领，别走两遍
+            if (self.kind == "notice") != _looks_like_notice(event):
+                return False
+            event.set_extra(_HOOK_CLAIM, self.kind)
+            return True
+        except Exception:  # 过滤器抛错会让整条消息的处理停摆，绝不能抛
+            return False
+
+    def __call__(self, event, cfg=None):
+        return self.filter(event, cfg)
+
+    def __str__(self):
+        return self.__class__.__name__
+
+    __repr__ = __str__
+
+
+def _hook_filter(kind: str):
+    """造一个绑好 `kind` 的过滤器**类**（不是实例，见 `_HookClaimFilter` 注释）。"""
+    return type(
+        f"_HookClaimFilter_{kind}",
+        (_HookClaimFilter,),
+        {"__init__": _init_with_kind(kind)},
+    )
+
+
+def _init_with_kind(kind: str):
+    def __init__(self, raise_error: bool = True, *args, **kwargs):
+        CustomFilter.__init__(self, raise_error)
+        self.kind = kind
+
+    return __init__
 
 
 def _looks_like_archive(token: str) -> bool:
@@ -674,21 +762,36 @@ class BackupPlugin(Star):
 
     # ---------- 事件钩子 ----------
     #
-    # 两个钩子都带 `@filter.command("...")`。这不是「注册成命令」，而是
-    # **唯一能让 handler 进注册表的入口**：AstrBot 的 `star_manager` 只认
-    # `star_handlers_registry`，而往注册表里塞东西的只有 register 系列装饰器。
-    # 只挂 `@filter.event_message_type` 的话，加载阶段 `event_filters` 是空的，
-    # `WakingCheckStage` 对空 filter 的 handler 直接 `continue` —— 函数写好了、
-    # 名字也在插件详情里，但永远不会被调用。而 `CommandFilter.init_handler_md`
-    # 会 `inspect.signature(handler)` 并**跳过前两个参数**当 `self` 和 `event`，
-    # 所以签名必须够长；命令名用 `__backup_*` 这种没人会敲的字符串，只当登记位。
-    @filter.command("__backup_archive")
+    # 这两个钩子前几轮一直是「代码在、单测绿、一次都没跑过」。下面这四条都是
+    # 真装 AstrBot 4.14.6、跑它的 `WakingCheckStage` / `StarRequestSubStage`
+    # 才看见的，按踩到的顺序记：
+    #
+    # ① 只挂 `@filter.event_message_type`：`WakingCheckStage` 对「event_filters
+    #    为空」的 handler 直接 `continue`，钩子永远不被调用。
+    # ② 补 `@filter.command("__backup_archive")` 当登记位：handler 进得了注册表，
+    #    但命令过滤是 `message_str.startswith("__backup_archive")`，真实聊天里
+    #    永远不成立——钩子仍旧不跑。
+    # ③ 补 `@filter.custom_filter(...)` 并把它放在 `command` 下面：过滤器到位了，
+    #    可 `CommandFilter` 还在——它一样会把整条事件判掉。所以最后把
+    #    `@filter.command` 整个撤掉，钩子自报家门。
+    # ④ 最后一步：`event.is_at_or_wake_command = True`。`WakingCheckStage` 只把
+    #    这个标记为真的 handler 交给 `StarRequestSubStage`，而真实事件里它是
+    #    False（没人 @ 机器人、也没人敲命令）。钩子是后台任务，不靠人唤醒。
+    #
+    # 装饰器顺序：`command` 在最上（先建出 handler_md）→ `custom_filter`
+    # （把认领过滤器追加到它身上，放 `command` 上面会追加到上一个 handler）→
+    # `event_message_type` 在最下（最先执行、先登记事件类型）。
+    @filter.custom_filter(_hook_filter("archive"))
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
         """实时归档：消息进群就落库，之后增量备份不必再回捞。
 
         只写库不下载媒体，也不回复任何内容——群聊里静默干活。
         """
+        # `WakingCheckStage` 只把 `is_at_or_wake_command` 为真的 handler 交给
+        # ProcessStage，而真实群聊里没人 @ 机器人也不会敲命令——不补这一行，
+        # 钩子只会在注册表里躺着。归档是后台任务，不靠人唤醒。
+        event.is_at_or_wake_command = True
         try:
             self.hooks.archive_message(event)
         except Exception as e:  # 归档失败不能影响机器人正常聊天
@@ -700,15 +803,7 @@ class BackupPlugin(Star):
             except Exception:  # 探测自己出错绝不能影响归档
                 pass
 
-    # `@filter.command` 不是修饰命令、是**注册 handler**：AstrBot 的
-    # `star_manager` 只认 `star_handlers_registry` 里的东西，而往注册表里塞的
-    # 唯一入口是 register 系列装饰器。只有 `@filter.event_message_type` 的话，
-    # 加载阶段 `event_filters` 为空，`WakingCheckStage` 直接 `continue`，
-    # 这个函数永远不会被调用；而且 `CommandFilter.init_handler_md` 会 `inspect`
-    # 被调函数的签名、跳过前两个参数当 `self` 和 `event`——`on_notice(self)` 缺了
-    # `event`，真实加载器下这里是 TypeError，插件加载直接失败。
-    # 命令名用 `__backup_notice` 这种永不会被输入的字符串：它只是登记位，不是命令。
-    @filter.command("__backup_notice")
+    @filter.custom_filter(_hook_filter("notice"))
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_notice(self, event: AstrMessageEvent):
         """群事件通知（成员变动 / 解散 / 机器人被踢）→ 触发式备份。
@@ -724,6 +819,10 @@ class BackupPlugin(Star):
         事件，靠 `raw_message.post_type` 区分——这里先判 `post_type`，不是
         notice 就直接返回，别把正常聊天当成退群。
         """
+        # 同 `on_message`：没人 @ 机器人时这条标记是 False，钩子不会被交给
+        # ProcessStage。通知处理是后台任务，不靠人唤醒。
+        event.is_at_or_wake_command = True
+        event.is_wake = True
         try:
             await self._handle_notice(event)
         except Exception as e:

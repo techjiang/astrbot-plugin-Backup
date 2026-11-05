@@ -191,6 +191,14 @@ def parse_event_message(event, group_id: int) -> Optional[Message]:
     from .parser import parse_message
 
     raw = _get(event, "message_obj") or _get(event, "raw_message")
+    # `raw_message` 是 OneBot 原始事件 dict，**不是**消息本体：它只有
+    # `raw_message: "你好"` 这一个字符串字段，消息链根本不在里头。把它当消息解析，
+    # 会走进 parser 的 `_segments` 兜底分支 `return [raw]`，整份原始事件被当成
+    # 「一段」，扣出一个既不像消息 ID、也不像群号的正文写进库；真正文、媒体、
+    # 引用全丢。所以只有在 `raw_message` 本身就是一条聊天消息、而且事件上没有任何
+    # 结构化消息可用时，才把它当消息的来源。
+    if is_event_payload(raw):
+        raw = None
     text = _get(event, "message_str") or ""
     if raw is None and not text:
         return None

@@ -39,6 +39,15 @@ class _Filter:
 
         return deco
 
+    @staticmethod
+    def custom_filter(_filter):
+        # 真 AstrBot 的 `register_custom_filter` 会先 `custom_filter(raise_error)`
+        # 再挂到 handler 上；替身保证它是个可用的装饰器就够
+        def deco(fn):
+            return fn
+
+        return deco
+
 
 def _status_of(response) -> int:
     """响应状态码统一成 int。
