@@ -120,7 +120,7 @@ class TestTriggers:
         """OneBot 把类型放 notice_type、原因放 sub_type。反过来取会让所有退群通知认不出来。"""
         hooks = make_hooks(db)
         for _ in range(3):
-            _, subtype, should = hooks.handle_notice(
+            _, subtype, should, _ = hooks.handle_notice(
                 {"group_id": 100, "notice_type": "group_decrease", "sub_type": "leave"}
             )
         assert subtype == "leave"
@@ -169,19 +169,19 @@ class TestHandleNotice:
     def test_leave_aggregates_until_threshold(self, db):
         hooks = make_hooks(db)
         for _ in range(3):
-            group_id, subtype, should = hooks.handle_notice({"group_id": 100, "sub_type": "leave"})
+            group_id, subtype, should, _ = hooks.handle_notice({"group_id": 100, "sub_type": "leave"})
         assert group_id == 100
         assert subtype == "leave"
         assert should is True  # 阈值 3，最后一次刚好触发
 
     def test_leave_below_threshold_does_not_backup(self, db):
         hooks = make_hooks(db)
-        _, _, should = hooks.handle_notice({"group_id": 100, "sub_type": "leave"})
+        _, _, should, _ = hooks.handle_notice({"group_id": 100, "sub_type": "leave"})
         assert should is False
 
     def test_disband_triggers(self, db):
         hooks = make_hooks(db)
-        _, subtype, should = hooks.handle_notice({"group_id": 100, "sub_type": "disband"})
+        _, subtype, should, _ = hooks.handle_notice({"group_id": 100, "sub_type": "disband"})
         assert subtype == "disband"
         assert should is True
 
@@ -194,7 +194,7 @@ class TestHandleNotice:
     def test_notice_without_group_falls_back_to_event(self, db):
         hooks = make_hooks(db)
         event = FakeEvent(group_id=555)
-        group_id, _, _ = hooks.handle_notice({"sub_type": "disband"}, event)
+        group_id, _, _, _ = hooks.handle_notice({"sub_type": "disband"}, event)
         assert group_id == 555
 
     def test_unknown_payload_returns_none(self, db):

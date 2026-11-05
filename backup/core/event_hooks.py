@@ -356,28 +356,35 @@ class EventHooks:
         self._handled_notices[key] = now
         return last is not None and last >= cutoff
 
-    def handle_notice(self, payload, event=None) -> tuple[Optional[int], str, bool]:
-        """统一处理一条通知事件。返回 (群号, 事件类型, 是否应当立即备份)。
+    def handle_notice(self, payload, event=None, group_id: Optional[int] = None):
+        """统一处理一条通知事件。返回 (群号, 事件类型, 是否应当立即备份, 是否计入聚合)。
 
         拆成三段是为了让 main.py 只做接线：
         认群号 → 退群聚合 → 解散/被踢判定。
+
+        第四个返回值是给接线层用的：退群这条路径**已经**数过一个人了。而 AstrBot
+        会把同一条 notice 广播给 `on_message` 和 `on_notice` 两个 handler（两个都
+        挂在 `EventMessageType.ALL` 上，见 `pipeline/process_stage` 的实现），
+        第二个调用方不能再数一遍——否则阈值 10 的群退了 5 个人就触发。
+        去重指纹在这里拿不到（这里只有一个 dict），所以由接线层把 `group_id`
+        传进来、用它加指纹。
         """
         if is_message_echo(payload):
             # on_message 已经归档过了。同一条消息再走一遍退群聚合，等于凭空
             # 造出 N 个退群者，一次普通聊天就能把「大量退群」的阈值顶满
-            return None, "", False
-        group_id, subtype = None, ""
+            return None, "", False, False
+        found, subtype = None, ""
         for item in notice_candidates(payload):
-            group_id, subtype = classify_group_event(item)
-            if group_id is not None or subtype:
+            found, subtype = classify_group_event(item)
+            if found is not None or subtype:
                 break
-        if group_id is None and event is not None:
-            group_id = extract_group_id(event)
-        if group_id is None:
-            return None, "", False
+        if found is None:
+            found = group_id if group_id is not None else extract_group_id(event)
+        if found is None:
+            return None, "", False, False
         if subtype in DECREASE_SUBTYPES and subtype not in DISBAND_SUBTYPES:
-            return group_id, subtype, self.note_group_decrease(group_id)
-        return group_id, subtype, self.note_group_event(group_id, subtype)
+            return found, subtype, self.note_group_decrease(found), True
+        return found, subtype, self.note_group_event(found, subtype), False
 
     def note_group_event(self, group_id: int, subtype: str = "") -> bool:
         subtype = (subtype or "").lower()

@@ -5,6 +5,7 @@
 
 import json
 import logging
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +31,7 @@ from .core.export_manager import ExportManager
 from .exporters import SUPPORTED_FORMATS
 from .core.auto_trigger import AutoTrigger
 from .core.event_hooks import (
+    NOTICE_DEDUPE_SECONDS,
     EventHooks,
     extract_group_id,
     is_message_echo,
@@ -302,6 +304,7 @@ class BackupPlugin(Star):
             archive_private=bool((self.config.get("scope") or {}).get("private_messages", False)),
         )
         self._notice_probe_done = False
+        self._notice_keys: dict[str, datetime] = {}
         self._event_probe_done = False
         # 通知钩子里触发的那次「最后备份」不回话：群解散/被踢的现场，回复既发不出去
         # （群没了），也可能把被踢这件事再暴露给在场的人。手动 `/backup` 才回话
@@ -318,6 +321,43 @@ class BackupPlugin(Star):
     async def _scheduled_backup(self, group_id: int) -> None:
         """定时任务入口：没有事件，用全局平台对象。"""
         await self._backup(group_id)
+
+    def _note_notice_once(self, event) -> bool:
+        """第一次见到这条通知返回 True；重复投递返回 False。
+
+        AstrBot 的分发是广播式的：`on_message` 与 `on_notice` 都挂着
+        `EventMessageType.ALL`，同一条退群通知必然进两个函数。退群聚合是按
+        **次数**累加的，所以必须在这里拦住第二次。
+
+        原来这道闸在 `EventHooks.seen_notice` 里，用的是「事件对象上凑出来的
+        指纹」。它的兜底逻辑是「指纹算不出来就直接放行」——而真实事件上算出来的
+        就是空的（`message_obj.group_id` 是个 property，`_attr` 按设计绕开
+        property 读，于是读到 None）。闸判断「没有指纹」，每次放行，等于没装。
+
+        所以指纹改从 `notice_payload()` 摊出来的字段里取：那里已经有群号、
+        事件类型、发送者。这些是**结构字段**，不含正文（红线 1）。
+
+        只认「用户维度」的变化（`user_id` / `target_id`）——同一个人退两次是两次
+        事件，得数两次；`operator_id` 不进指纹：一个管理员连踢 10 个人，10 条
+        通知的操作者是同一个，拿它当归一化键会把 10 次退群并成 1 次。
+        """
+        from .core.event_hooks import notice_payload as _payload
+
+        payload = _payload(event)
+        group_id = payload.get("group_id")
+        subtype = payload.get("sub_type") or payload.get("subtype") or ""
+        who = payload.get("user_id") or payload.get("target_id") or ""
+        kind = payload.get("notice_type") or payload.get("post_type") or ""
+        if group_id in (None, "") and not subtype:
+            return True  # 连「是什么」都不知道，别拦
+        key = f"{group_id}|{kind}|{subtype}|{who}"
+        now = datetime.now()
+        cutoff = now - timedelta(seconds=NOTICE_DEDUPE_SECONDS)
+        for old_key in [k for k, t in self._notice_keys.items() if t < cutoff]:
+            self._notice_keys.pop(old_key, None)
+        last = self._notice_keys.get(key)
+        self._notice_keys[key] = now
+        return last is None or last < cutoff
 
     def _deny(self, event) -> Optional[str]:
         perm = self.permission.check_event(event)
@@ -592,6 +632,16 @@ class BackupPlugin(Star):
         )
 
     # ---------- 事件钩子 ----------
+    #
+    # 两个钩子都带 `@filter.command("...")`。这不是「注册成命令」，而是
+    # **唯一能让 handler 进注册表的入口**：AstrBot 的 `star_manager` 只认
+    # `star_handlers_registry`，而往注册表里塞东西的只有 register 系列装饰器。
+    # 只挂 `@filter.event_message_type` 的话，加载阶段 `event_filters` 是空的，
+    # `WakingCheckStage` 对空 filter 的 handler 直接 `continue` —— 函数写好了、
+    # 名字也在插件详情里，但永远不会被调用。而 `CommandFilter.init_handler_md`
+    # 会 `inspect.signature(handler)` 并**跳过前两个参数**当 `self` 和 `event`，
+    # 所以签名必须够长；命令名用 `__backup_*` 这种没人会敲的字符串，只当登记位。
+    @filter.command("__backup_archive")
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
         """实时归档：消息进群就落库，之后增量备份不必再回捞。
@@ -609,6 +659,15 @@ class BackupPlugin(Star):
             except Exception:  # 探测自己出错绝不能影响归档
                 pass
 
+    # `@filter.command` 不是修饰命令、是**注册 handler**：AstrBot 的
+    # `star_manager` 只认 `star_handlers_registry` 里的东西，而往注册表里塞的
+    # 唯一入口是 register 系列装饰器。只有 `@filter.event_message_type` 的话，
+    # 加载阶段 `event_filters` 为空，`WakingCheckStage` 直接 `continue`，
+    # 这个函数永远不会被调用；而且 `CommandFilter.init_handler_md` 会 `inspect`
+    # 被调函数的签名、跳过前两个参数当 `self` 和 `event`——`on_notice(self)` 缺了
+    # `event`，真实加载器下这里是 TypeError，插件加载直接失败。
+    # 命令名用 `__backup_notice` 这种永不会被输入的字符串：它只是登记位，不是命令。
+    @filter.command("__backup_notice")
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_notice(self, event: AstrMessageEvent):
         """群事件通知（成员变动 / 解散 / 机器人被踢）→ 触发式备份。
@@ -635,16 +694,17 @@ class BackupPlugin(Star):
             # 普通消息：`on_message` 已经归档过了，不能在这里再走一遍退群聚合，
             # 否则一次普通聊天就能把「大量退群」的阈值顶满
             return
-        if self.hooks.seen_notice(event):
-            # 同一条通知会同时进 on_message 和 on_notice（两个 handler 都挂在
-            # AllEventMessage 上，分发是广播式的）。两个都往下走的话，一次退群被
-            # 数两遍，阈值 10 的群 5 个人就触发备份。只让先到的那个处理
-            logger.debug("同一条通知已被处理过，跳过：%s", extract_group_id(event))
-            return
         if not self._notice_probe_done and payload:
             self._notice_probe_done = True
             logger.debug(self.hooks.describe_notice(payload))
-        group_id, subtype, should_backup = self.hooks.handle_notice(payload, event)
+        # 数之前先问一句「这条通知是不是刚被另一个 handler 数过」。问在
+        # `handle_notice` **之前**：退群聚合是累加的，数完再撤不回来。
+        if not self._note_notice_once(event):
+            logger.debug("同一条通知已被处理过，跳过：%s", extract_group_id(event))
+            return
+        group_id, subtype, should_backup, _counted = self.hooks.handle_notice(
+            payload, event
+        )
         if group_id is None or not should_backup:
             return
         logger.warning("群 %s 事件 %s，触发备份", group_id, subtype or "unknown")

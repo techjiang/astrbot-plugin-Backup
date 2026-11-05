@@ -222,8 +222,18 @@ python -m coverage run --source=backup/core,backup/exporters -m pytest -q && pyt
 ```
 
 覆盖率要求 ≥ 80%（当前 90%，按 `backup/core` + `backup/exporters` 口径统计）。
-`backup/main.py` 是 AstrBot 接线层，用一份照真实形状写的 astrbot 替身在
-`tests/test_round20_plugin_wiring.py` 里跑到 36%——它的 bug 恰恰不在纯逻辑里。
+
+**接线层要拿真 AstrBot 验**。`backup/main.py` 的 bug 从来不在纯逻辑里：
+`@filter.command` 到底是不是「注册 handler」、`CommandFilter` 会不会 inspect 签名、
+真 pipeline 会不会把一条通知送进两个钩子——这些只有装一份 AstrBot 才能确定。
+
+```bash
+git clone https://github.com/AstrBotDevs/AstrBot.git && pip install -e AstrBot
+python -m pytest -q      # tests/test_round28_real_astrbot_loader.py 自动生效
+```
+
+没装时那一组自动 skip（不是「不用验」，是「这个环境验不了」）。它只假一件事：
+OneBot 客户端——那本来就是平台本身。
 
 项目结构：
 

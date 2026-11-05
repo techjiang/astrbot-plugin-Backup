@@ -340,14 +340,14 @@ def test_mass_leave_threshold_is_not_halved(db):
         for _ in range(2):  # 两个 handler 各来一次
             if hooks.seen_notice(event):
                 continue
-            _, _, should = hooks.handle_notice({"notice_type": "group_decrease", "sub_type": "leave", "group_id": 100}, event)
+            _, _, should, _ = hooks.handle_notice({"notice_type": "group_decrease", "sub_type": "leave", "group_id": 100}, event)
             if should:
                 fired.append(i)
     assert fired == []  # 5 个人，不该触发
 
     event = _notice_event(message_id="n-last", user_id="999")
     hooks.seen_notice(event)
-    _, _, should = hooks.handle_notice(
+    _, _, should, _ = hooks.handle_notice(
         {"notice_type": "group_decrease", "sub_type": "leave", "group_id": 100}, event
     )
     # 退群计数用的是 10 分钟滑动窗口，而上面 5 次循环和这一句都在同一瞬间跑完——
@@ -356,7 +356,7 @@ def test_mass_leave_threshold_is_not_halved(db):
     for i in range(4):
         nxt = _notice_event(message_id=f"n-last{i}", user_id=str(500 + i))
         hooks.seen_notice(nxt)
-        _, _, should = hooks.handle_notice(
+        _, _, should, _ = hooks.handle_notice(
             {"notice_type": "group_decrease", "sub_type": "leave", "group_id": 100}, nxt
         )
     assert should is True

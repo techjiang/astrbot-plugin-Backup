@@ -904,3 +904,67 @@ payload 塞在里头），`url` 就只在段上、`data` 里没有——`_media_
    **空群和「接口根本用不了」在返回值上都是空列表**，不区分就是骗人。
 3. 参数名对不上的调用会建出一个永不 await 的 coroutine（`coroutine was never
    awaited`）。探测失败要 `close()` 掉，别把半成品协程堆在事件循环上。
+
+## round28：真 AstrBot 跑一遍接线，四个钩子全是哑的
+
+前二十七轮用的都是自己写的替身：假事件、假注册器、假 `filter`。这一轮把 AstrBot
+4.14.6 的源码装进来（`pip install -e <源码>`），用真 `Star` / `Context` /
+`star_handlers_registry` / `WakingCheckStage` / `StarRequestSubStage` 跑了一遍。
+只保留一件假事：OneBot 客户端——它就是平台本身。
+
+**1. `on_notice` 少了 `event`，插件在真实加载器下装不上**
+
+```python
+@filter.command("backup")               # 这一行把 handler 塞进注册表
+async def backup(self, event): ...
+
+@filter.event_message_type(ALL)         # 这一行只加 filter，不注册
+async def on_notice(self):              # 少一个参数
+```
+
+`filter.command` 不是「修饰命令」，它是**注册入口**：AstrBot 只认
+`star_handlers_registry`，而往里面塞东西的只有 register 系列装饰器。它顺带
+`inspect.signature(handler)` 并把前两个参数当 `self` / `event` 跳过——所以
+两个钩子的签名必须够长。
+
+**2. 两个钩子只挂 `event_message_type`，从来没被调用过**
+
+`WakingCheckStage` 对「`event_filters` 为空」的 handler 直接 `continue`。
+只有 `EventMessageTypeFilter` 的钩子照样进注册表、照样在插件详情里显示，
+`is_wake` 也不会因为 `ALL` 变成无条件——实测普通群消息一个 handler 都不激活。
+
+修法：两个钩子都加一个 `@filter.command("__backup_archive")` /
+`@filter.command("__backup_notice")` 当**注册位**。命令名用双下划线开头，
+用户敲不出来，只负责把函数登记进注册表。
+
+**3. 真 pipeline 会把同一条 notice 送进两个钩子，退群被数两遍**
+
+`star_request` 遍历 `activated_handlers`，两个钩子都挂着 `ALL`，所以一条退群
+通知必然进两次。旧代码靠 `EventHooks.seen_notice(event)` 挡——而它用的是**事件**
+指纹，认不出群号时会自己放开（`if not key or key == "group=None|type=": return False`）。
+认不出群，闸就整道失效。
+
+修法：退群聚合的锁挪到接线层（`BackupPlugin._notice_seen_in_group`），用**已知
+群号**拼指纹。`EventHooks.handle_notice` 的返回值从三个加到四个，第四个是
+「这次数过一个人了」——接线层据此判断要不要再往下走。
+
+**4. 面板注入的配置形状和 `config.yaml` 不一样**
+
+`AstrBotConfig` 按 `_conf_schema.json` 摊平，`storage_dir` 在顶层、`scope` 是
+一层 dict；`config.yaml` 外面还包了一层 `backup:`。`_load_config` 的优先顺序
+（注入 > yaml > schema 默认值）已经对，但缺一条断言：**注入的每一层都得是
+dict，且 `config.yaml` 里的每个键在注入那份里都有**。两边形状漂移时，面板改了
+不生效，而日志里一句提示都没有。
+
+**这一轮的教训**
+
+「核了源码」不等于「跑过」。前面第 20 轮我核过 `ComponentType`、第 24 轮核过
+Quart，结论都对；但「`filter.command` 到底会不会注册 handler」「`CommandFilter`
+会不会 inspect 签名」这两条，只读源码能看出疑点，只有**真装一遍**才能确定是
+`TypeError` 还是「静默不调用」。区别很大：
+
+- `TypeError` → 插件加载失败，用户看得见（但只看得见「插件加载出错」）
+- 静默不调用 → 功能写着、文档写着、单测绿着，**一次都没运行过**
+
+所以 `test_round28_real_astrbot_loader.py` 是这批用例里唯一不打桩的那个文件，
+没装 AstrBot 时整组 skip——不是「不用验」，是「这个环境验不了」。
