@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from .auto_trigger import AutoTrigger
+from .parser import is_event_payload
 from .commands import PermissionChecker
 from .models import Message
 
@@ -292,6 +293,9 @@ class EventHooks:
             if not self.archive_private:
                 return None
             group_id = self.private_group_id
+        if is_event_payload(_attr(event, "message_obj")):
+            # 通知/请求事件：不是聊天消息，不进消息库（理由见 parser.is_event_payload）
+            return None
         msg = parse_event_message(event, group_id)
         if msg is None:
             return None

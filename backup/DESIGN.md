@@ -773,6 +773,56 @@ AstrBot 的处理器分发是广播式的：`on_message` 和 `on_notice` 都挂�
 现在按事件指纹（`message_id` + 群号 + 类型，**不含正文**）在 120 秒窗口内去重，
 先到的那个 handler 处理，后到的直接跳过。
 
+## 第 25 轮：去找「谁在送事件、平台从哪来、地址在哪一层」
+
+前 24 轮盯着 `message_obj` 的字段名和 `sub_type` 的取值——这两处这次核完是对的
+（`Group.group_id` 是字符串、`group_owner` / `group_admins` 在 `Group` 上、
+OneBot 的 `group_decrease` + `leave` / `kick_me` 与代码里的集合一致）。但我漏了
+三个更上游的问题：**谁把事件送进钩子**、**平台实例从哪来**、**媒体地址放在哪一层**。
+
+**`platform_insts[0]` 永远是 webchat**
+
+`PlatformManager.load_webchat_platform` 在加载真实 IM 适配器**之前**就把
+`WebChatAdapter` 塞进 `platform_insts`。而 `_platform_by` 在「没给 key」时是
+`return insts[0]`——定时备份、以及任何走全局找平台的路径，拿到的是 webchat。
+webchat 没有群历史、没有成员列表，`get_user_info` 一类动作直接抛，备份一条也拉不到，
+日志里只有一句「当前没有可用的平台适配器」。
+
+现在没给 key 时按「有没有客户端」挑：`aiocqhttp` 的 `CQHttp`、telegram 的 `client`
+都有，webchat 没有；都有或有都没时，再按平台类型（`aiocqhttp` / `telegram` /
+`discord` / `slack` / `wecom`）挑。纯 webchat 部署退回第一个，不抛异常。
+
+**`Image.url` 才是地址，`data` 只是 OneBot 那一层**
+
+AstrBot 的 `Image` / `Record` / `File` 把地址放在**段上**：`url`、`file`、`path`。
+`data` 是 OneBot 原始 dict 才有的一层。解析器先 `data = _safe_get(seg, "data", seg)`，
+段上没有 `data` 时退化成段自己没问题；但段上要是也带了个 `data`（有些适配器把原始
+payload 塞在里头），`url` 就只在段上、`data` 里没有——`_media_url` 从 `data` 里找，
+返回空串。
+
+后果是图片/语音的 `media_paths` 一条都没有，导出里全是断图；纯图消息还会因为
+「没有内容也没有媒体」被判定成空消息直接丢弃。现在三个来源依次试：`seg` 优先，
+`data` 兜底。
+
+**通知事件不该进消息库**
+
+`aiocqhttp` 的 `_convert_handle_notice_event` 把 notice 包成 `OTHER_MESSAGE` 的普通
+消息事件投进管道（`message` 空链、`message_str` 空串、原始事件在 `raw_message`）。
+`on_message` 收到的就是这样一条「消息」。
+
+实测这一轮的形状下它解析不出内容，`archive_message` 本来就会放弃。但那是巧合：
+解析器对未知段的兜底是「记 TEXT、内容能抠就抠」，任何一次退化都会凭空多出一条
+「消息」，内容还是发送者 QQ 号。备份库里的消息必须是真人说的话，所以在
+`archive_message` 里显式拦一层：`raw_message.post_type` 是 `notice` / `request` /
+`meta_event` 就不进库（`parser.is_event_payload`）。
+
+**`route == f"/{subpath}"` 只认固定路径**
+
+宿主比的是字符串相等：`/api/plug/backup/download/<token>` 进来时 `subpath` 是
+`backup/download/<token>`，等于 `/<token>` 的 route 永远比不中。真正会命中的是
+`"/backup/download"` 那条（视图自己从 request 里取 token）。所以登记顺序改成
+固定前缀在前——顺序错了不影响功能，但会影响「哪条先被找到」的直觉。
+
 ## 红线对照
 
 | 红线 | 落地位置 |

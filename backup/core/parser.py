@@ -224,7 +224,15 @@ def parse_message(raw: Any, group_id: Optional[int] = None) -> Message:
                 forward_chain = [_forward_node(n) for n in chain]
         elif mtype in (MessageType.IMAGE, MessageType.VOICE, MessageType.VIDEO, MessageType.FILE):
             types.append(mtype)
-            url = _media_url(seg, data, mtype)
+            # 媒体段要**先看段自己**：AstrBot 的 `Image` / `Record` 把地址放在段上的
+            # `url` / `file`，`data` 只是 OneBot 原始 dict 才有的一层。段上要是也带了
+            # 一个 `data`（有些适配器把原始 payload 塞在里头），地址只在段上，
+            # 从 `data` 里找就是空串——图片/语音全丢，导出里一片断图。
+            url = (
+                _media_url(seg, data, mtype)
+                or _media_url(seg, seg, mtype)
+                or _media_url(data, data, mtype)
+            )
             if url:
                 media_paths.append(url)
             label = (
@@ -315,6 +323,39 @@ def parse_message(raw: Any, group_id: Optional[int] = None) -> Message:
         is_forward=is_forward,
         forward_chain=forward_chain,
     )
+
+
+#: OneBot 的 `post_type` 取值。`notice` / `request` / `meta_event` 是**事件**，
+#: 不是聊天消息——它们没有消息链、没有正文，只有「谁在什么时候干了什么」。
+_NON_MESSAGE_POST_TYPES = {"notice", "request", "meta_event"}
+
+
+def is_event_payload(raw: Any) -> bool:
+    """这份 raw 是平台事件（通知/请求/心跳）而不是一条聊天消息。
+
+    AstrBot 把 OneBot 的 notice 也包成普通消息事件投进管道：`type` 是
+    `OTHER_MESSAGE`、`message` 是空链、`message_str` 是空串、原始事件在
+    `raw_message` 里。它在 `on_message` 里照样会被当成「一条新消息」——
+    解析器给不出内容（`content` 空、`media_paths` 空）时 `archive_message`
+    本来会放弃，但任何一次解析退化（未知段被兜底成 TEXT、段里带了个无关字符）
+    就会凭空多出一条「消息」，内容还是发送者 QQ 号。备份库里的消息必须是
+    真人说的话，所以这里显式拦一层。
+
+    注意只认 `post_type`，不认 `notice_type`：导出包和平台原始消息里
+    `post_type` 是权威字段。
+    """
+    if isinstance(raw, dict) and "post_type" not in raw:
+        # `{"raw_message": {...}}` 这种包了一层的形态（也见于导出/回灌）
+        inner = raw.get("raw_message")
+        if isinstance(inner, dict):
+            raw = inner
+    if not isinstance(raw, dict):
+        inner = _safe_get(raw, "raw_message") if raw is not None else None
+        if not isinstance(inner, dict):
+            return False
+        raw = inner
+    post_type = str(raw.get("post_type") or "").lower()
+    return post_type in _NON_MESSAGE_POST_TYPES
 
 
 def _is_flat(raw: Any) -> bool:

@@ -690,18 +690,34 @@ class BackupPlugin(Star):
         # 定时任务没有事件：库里/配置里只有一个平台时就它了
         return self._platform_by(None, by_id=False)
 
+    #: 要登记的下载路由，顺序即优先级（宿主按顺序精确匹配）
+    DOWNLOAD_ROUTES = ("/backup/download", "/backup/download/<token>", "/download/<token>")
+
+    #: 能拉取群历史消息的平台类型。备份的全部数据都从这几个平台来
+    HISTORY_CAPABLE = ("aiocqhttp", "telegram", "discord", "slack", "wecom")
+
     def _platform_by(self, key, by_id: bool):
-        """按 id / 名字 / 「随便哪个」找平台实例。"""
+        """按 id / 名字 / 「随便哪个」找平台实例。
+
+        原来没有 `key` 时直接 `return insts[0]`。而 AstrBot 的 `platform_insts`
+        第一位永远是 **webchat**（`PlatformManager.load_webchat_platform` 先装它，
+        排在所有真实 IM 适配器前面）——于是定时备份、以及任何走「全局找平台」
+        的路径，拉到的都是 webchat，`get_user_info` 一类动作直接抛，备份一条
+        也拉不到，报的还是「当前没有可用的平台适配器」这种看不懂的话。
+
+        现在没给 key 时按「这个平台有没有客户端」挑：`aiocqhttp` 的
+        `CQHttp`、telegram 的 `client` 都有，webchat 没有。一个都没有的部署
+        （纯 webchat）才退回第一个。
+        """
         ctx = self.context
-        for name in ("get_platform_inst",):
-            fn = getattr(ctx, name, None)
-            if by_id and callable(fn) and key:
-                try:
-                    found = fn(key)
-                except Exception:
-                    found = None
-                if found is not None:
-                    return found
+        fn = getattr(ctx, "get_platform_inst", None)
+        if by_id and callable(fn) and key:
+            try:
+                found = fn(key)
+            except Exception:
+                found = None
+            if found is not None:
+                return found
         manager = getattr(ctx, "platform_manager", None)
         insts = list(getattr(manager, "platform_insts", []) or [])
         if not insts:
@@ -721,7 +737,25 @@ class BackupPlugin(Star):
                 meta = inst.meta() if callable(getattr(inst, "meta", None)) else None
                 if meta is not None and str(getattr(meta, "name", "")) == str(key):
                     return inst
-        return insts[0]
+        return self._pick_by_capability(insts)
+
+    def _pick_by_capability(self, insts: list):
+        """挑一个真能拉数据的平台：先看有没有客户端，再看平台类型。"""
+        with_client = []
+        for inst in insts:
+            getter = getattr(inst, "get_client", None)
+            client = getter() if callable(getter) else None
+            if client is None:
+                client = getattr(inst, "client", None)
+            if client is not None:
+                with_client.append(inst)
+        candidates = with_client or insts
+        for inst in candidates:
+            meta = inst.meta() if callable(getattr(inst, "meta", None)) else None
+            name = str(getattr(meta, "name", "") or "").lower()
+            if name in self.HISTORY_CAPABLE:
+                return inst
+        return candidates[0]
 
     async def _backup(self, group_id: int, event=None):
         """统一的备份入口：优先用事件自带的平台对象，退回全局平台。
@@ -774,6 +808,13 @@ class BackupPlugin(Star):
         - `/backup/download/<token>`：完整路径，群里点的就是它；
         - `/backup/download`：固定路径 + query token，面板按钮用；
         - `/download/<token>`：短前缀，宿主如果自己吃掉了前缀，这条兜住。
+
+        三条的先后顺序很要紧：宿主按 `route == f"/{subpath}"` 逐个比，`/<token>`
+        这类带尖括号的 route 永远不会等于任何真实 subpath，所以它其实匹配不到；
+        真正会命中 `/api/plug/backup/download/<token>` 的，是**字符串前缀等于
+        整条路径**——也就是 `"/backup/download"` 这条（`DownloadResponse` 自己
+        从 request 里取 token，见 `download_route`）。三条都登记，哪条先命中
+        都走向同一个视图。
         """
         registrar = getattr(self.context, "register_web_api", None)
         if not callable(registrar):
@@ -781,7 +822,7 @@ class BackupPlugin(Star):
             return False
         view = make_view(self.exports)
         registered = []
-        for route in ("/backup/download/<token>", "/backup/download", "/download/<token>"):
+        for route in self.DOWNLOAD_ROUTES:
             try:
                 registrar(route, view, ["GET"], "Backup 导出文件下载（需 token）")
                 registered.append(route)
