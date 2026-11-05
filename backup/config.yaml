@@ -32,15 +32,23 @@ backup:
   export:
     default_format: "sqlite"
     download_link_expire: "24h"
-    # 下载链接前缀，最终链接是 <base_url>/<token>。
-    # 留空时自动用面板的公网地址拼成 <面板>/api/backup/download（该前缀在
-    # AstrBot 4.14 的鉴权白名单里，群成员直接点就能下）。
-    # 自建网关就填网关上兑换 token 的地址。
+    # 下载链接的对外前缀，最终链接是 <base_url>/<token>。
+    # 填反向代理/内网穿透指向网关的地址，例如 https://bak.example.com。
+    # 留空 = 用网关本机回环地址，那种链接只有本机能打开，发到群里点不动。
     base_url: ""
 
-  # 面板公网地址。下载链接要发到群里，前缀必须是群成员点得到的地址：
-  # 优先 export.base_url，留空时用这里的 public_url（再留空则读 AstrBot 面板
-  # 配置里的 dashboard 地址），都没有就退回裸路径并提示去配。
+  # 内置下载网关。为什么需要它：AstrBot 4.14 的 dashboard 里
+  #   - srv_plug_route 用 `route == f"/{subpath}"` 做精确字符串比较，
+  #     注册成 "/backup/download/<token>" 的路由永远比不中任何真实路径；
+  #   - auth_middleware 的白名单是源码常量，只放行 /api/backup/download，
+  #     而那条已经被宿主自己的 BackupRoute 占了。
+  # 两条一起把「把链接挂在面板上」这条路堵死，所以群内下载链接只能由网关提供。
+  gateway:
+    enabled: true
+    host: "127.0.0.1"
+    port: 0
+
+  # 面板公网地址。仅作拼链接时的兜底；群成员能不能点开取决于网关的对外地址。
   dashboard:
     public_url: ""
 

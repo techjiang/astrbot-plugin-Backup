@@ -139,18 +139,39 @@
       },
       "base_url": {
         "type": "string",
-        "description": "下载链接前缀，最终为 <base_url>/<token>。留空则用面板公网地址自动拼成 <面板>/api/backup/download（该前缀在 AstrBot 4.14 鉴权白名单内，群成员可直接点）。",
+        "description": "下载链接对外前缀，最终为 <base_url>/<token>。填反代/内网穿透指向网关的地址即可（如 https://bak.example.com）。留空则用网关本机回环地址——那种链接只能本机打开，发到群里点不动。",
         "default": ""
+      }
+    }
+  },
+  "gateway": {
+    "type": "object",
+    "description": "内置下载网关",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用内置网关。AstrBot 4.14 的插件路由既匹配不到 /backup/download/<token>，整条又在面板鉴权之外，宿主面板上挂不通，所以群内下载链接靠这个网关提供。",
+        "default": true
+      },
+      "host": {
+        "type": "string",
+        "description": "监听地址。只建议回环地址，对外暴露交给反向代理",
+        "default": "127.0.0.1"
+      },
+      "port": {
+        "type": "int",
+        "description": "监听端口。0 = 由系统分配（重启后可能变化，配了 base_url 才稳定）",
+        "default": 0
       }
     }
   },
   "dashboard": {
     "type": "object",
-    "description": "面板公网地址（只读参考；链接前缀优先用 export.base_url，留空时从这里取）",
+    "description": "面板地址（只读兜底；群内下载链接请用 export.base_url 指向网关）",
     "items": {
       "public_url": {
         "type": "string",
-        "description": "面板的公网地址，如 https://bot.example.com .留空时自动读 AstrBot 面板配置里的 dashboard 地址",
+        "description": "AstrBot 面板的公网地址，例如 https://bot.example.com。仅在拼链接没有更具体的地址可用时兜底，不改变「群成员能否打开」这件事。",
         "default": ""
       }
     }

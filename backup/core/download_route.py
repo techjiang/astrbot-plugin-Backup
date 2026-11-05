@@ -169,10 +169,11 @@ def expires_header(expires_at: datetime) -> dict:
 # 所以视图必须自己去找「当前请求」：Flask/Quart 走 `flask.request` 上下文，
 # aiohttp 走 `web.Request` 形参。找一个不该由调用方操心的事，放在这里做。
 #
-# 另有一处不是我们能改的：AstrBot 4.14 把 `/api/backup/download` 写进了
-# `auth_middleware` 的白名单，**按前缀**放行——`/api/backup/download/<token>`
-# 上的所有路径都不需要面板 JWT。于是群里点链接这件事其实做得成：
-# 注册一条固定前缀路由，token 走路径尾段。上一版「4.14 做不到」的结论下错了。
+# 再往下还有一层更硬的约束，是后面才核出来的（见文件末尾「内置网关」那段）：
+# 宿主面板这条路上**没有**能同时满足「带 token」和「免鉴权」的挂载点。
+# 白名单里唯一的 `/api/backup/download` 被宿主自己的 BackupRoute 占了；
+# 插件能挂的 `/api/plug/*` 既比不中带参数的路径，也不在免鉴权白名单里。
+# 所以文件末尾给出了网关方案，`make_view` 保留下来给「自建网关/新版宿主」用。
 
 MISSING = object()
 
@@ -534,3 +535,52 @@ def aiohttp_view(exports):
         return await _send_file_aiohttp(request, response)
 
     return view
+
+
+# ---------------------------------------------------------------------------
+# 内置网关：宿主面板这条路，在 AstrBot 4.14.6 上是堵死的
+# ---------------------------------------------------------------------------
+#
+# 前面几轮一直假设「注册一条插件路由，群里点链接就能下」。把 4.14.6 装进来
+# 逐行核过之后，这个假设在旧面板（Quart）上不成立，两条硬约束同时挡着：
+#
+# 1. **精确字符串匹配。**`dashboard/server.py::srv_plug_route` 是
+#
+#        if route == f"/{subpath}" and request.method in methods:
+#
+#    `route` 是我们注册的字面量，`subpath` 是从 `/api/plug/<path:subpath>` 抓来的
+#    实际尾巴。`"/backup/download/<token>"` 这个字面量永远不会等于任何真实
+#    subpath——尖括号里的占位符不参与匹配，它是拿来「注册」的，不是拿来「比」的。
+#    所以群里点 `/api/plug/backup/download/<token>` 落到的是「未找到该路由」。
+# 2. **鉴权白名单是源码里的常量。**`auth_middleware` 里
+#
+#        allowed_endpoints = ["/api/auth/login", "/api/file", ...,
+#                             "/api/backup/download"]
+#
+#    按前缀放行。`/api/plug/...` 不在其中，任何插件路由都要带面板 JWT——群成员
+#    显然没有。而唯一在白名单里的 `/api/backup/download` 已经被宿主自己的
+#    `BackupRoute.download_backup` 占了（`routes/backup.py`，收 `filename` +
+#    JWT `token` 两个 query 参数），插不进去。
+#
+# 结论：想让群成员点开链接就直接下载，只能自己起一个 HTTP 口。这就是「网关」。
+# 它只监听回环地址，默认不开；开了就要给一个对外可用的地址（反代/穿透），
+# 否则拼出来的链接还是点不动——这件事只能由部署的人决定，不能替它猜。
+
+
+class GatewayError(RuntimeError):
+    """网关起不来，或者配置不足。"""
+
+
+def gateway_path(token: str) -> str:
+    """网关上的下载路径。和面板路由同形，换部署方式时链接不用跟着改。"""
+    return f"{PREFIX}{token}"
+
+
+def handle_gateway_request(raw_path: str, headers, exports) -> DownloadResponse:
+    """网关的一次请求。纯逻辑，不碰 socket，便于用真 HTTP 之外的层次验证。"""
+    header = None
+    try:
+        header = headers.get("Range") if headers is not None else None
+    except Exception:
+        header = None
+    return handle_download(raw_path, exports, header)

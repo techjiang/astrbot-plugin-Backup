@@ -19,6 +19,7 @@
 """
 
 import asyncio
+import importlib.util
 
 import pytest
 
@@ -28,6 +29,16 @@ fastapi = pytest.importorskip("fastapi", reason="需要真 fastapi")
 pytest.importorskip("httpx", reason="需要 httpx 的 ASGITransport")
 if not real_astrbot_available():
     pytest.skip("需要真 AstrBot", allow_module_level=True)
+
+# `astrbot.api.web` / `astrbot.dashboard.api` 是**新版面板（FastAPI）**才有的模块。
+# 只判 `astrbot` 装没装不够：AstrBot 4.14.6 装着，面板还是 Quart，这两个 import
+# 直接 ModuleNotFoundError——收集阶段就炸，整轮 pytest 中断。环境验不了就 skip，
+# 不是「不用验」。
+if importlib.util.find_spec("astrbot.api.web") is None:
+    pytest.skip(
+        "这个 AstrBot 版本没有 FastAPI 面板（astrbot.api.web 不存在）",
+        allow_module_level=True,
+    )
 
 from fastapi import FastAPI, Request  # noqa: E402
 from fastapi.responses import Response  # noqa: E402

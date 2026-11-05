@@ -27,6 +27,7 @@ from .core.commands import (
 )
 from .core.database import Database
 from .core.download_route import LEGACY_PREFIX, handle_download, make_view
+from .core.gateway import DownloadGateway
 from .core.export_manager import ExportManager
 from .exporters import SUPPORTED_FORMATS
 from .core.auto_trigger import AutoTrigger
@@ -331,8 +332,15 @@ class BackupPlugin(Star):
         # （群没了），也可能把被踢这件事再暴露给在场的人。手动 `/backup` 才回话
         self._silent_backup = False
         self.scheduler.restore_jobs()
-        # 面板里能点开下载链接（群成员直接点需要自己的网关，见 register_download_api）
+        # 群内下载链接：宿主面板那条路在 4.14 上走不通（见 core/gateway.py），
+        # 所以由内置网关提供。仍尝试登记面板路由——新版本宿主可能已经修好匹配逻辑。
+        self.gateway = DownloadGateway(
+            self.exports,
+            (self.config.get("gateway") or {}).get("host") or "127.0.0.1",
+            (self.config.get("gateway") or {}).get("port") or 0,
+        )
         self.register_download_api()
+        self._start_gateway()
         if self.config.get("retention", {}).get("auto_clean"):
             self.exports.clean_exports(
                 int(self.config.get("retention", {}).get("keep_days", 90))
@@ -475,12 +483,14 @@ class BackupPlugin(Star):
         except Exception as e:
             yield event.plain_result(f"导出失败：{e}")
             return
-        base = self._public_base_url(event)
-        link = f"{base}/{result.token}" if base else ""
+        link = self.download_link(result.token, event)
         hint = ""
-        if not link:
-            link = f"/backup/download/{result.token}"
-            hint = "\n⚠️ 没配公网地址，这条链接只能本机用。把 `export.base_url` 填成面板的地址（或自建网关）后重新导出"
+        if "/backup/download/" in link and link.startswith("/"):
+            hint = (
+                "\n⚠️ 没有可用的下载入口：内置网关没起来，也没配 `export.base_url`。"
+                "把 `gateway.enabled` 打开、或把 `export.base_url` 填成网关的对外地址"
+                "（反代/内网穿透）后重新导出"
+            )
         yield event.plain_result(
             f"✅ 导出完成（{result.format}）\n消息 {result.message_count} 条 · "
             f"{human_size(result.size)}\n临时链接（{result.expires_at:%H:%M} 过期，仅可使用一次）：{link}{hint}"
@@ -888,37 +898,32 @@ class BackupPlugin(Star):
         return handle_download(path, self.exports)
 
     def register_download_api(self) -> bool:
-        """把下载链接真正接到宿主的 Web 上。
+        """尝试把下载视图登记到宿主面板上。返回值只说明「登记成功」，不代表能下。
 
-        AstrBot 4.14.6 的事实（`dashboard/server.py`）：
+        AstrBot 4.14.6 的 `dashboard/server.py` 里有两条同时成立的硬约束：
 
-        - 插件用 `context.register_web_api(route, view, methods, desc)` 登记路由，
-          宿主把 `/api/plug/<path:subpath>` 转给所有插件登记的路由，按
-          `route == f"/{subpath}"` **精确匹配**；
-        - `auth_middleware` 的白名单是**按前缀**放行的，里面已经有
-          `/api/backup/download`，注释写着「备份下载使用 URL 参数传递 token」。
+        1. `srv_plug_route` 是
+               if route == f"/{subpath}" and request.method in methods:
+           我们注册的是**字面量**，`subpath` 是真实尾巴。`"/backup/download/<token>"`
+           永远不等于任何具体路径——尖括号不参与比较，它只在注册时被当作可用路径
+           登记，宿主这边却是拿来做字符串相等的。所以带 token 的路径**匹配不到**。
+        2. `auth_middleware` 的白名单是源码里的常量，按前缀放行
+           `/api/backup/download`；插件能挂的 `/api/plug/*` **不在其中**，一律要面板
+           JWT。而群里点链接的人没有 JWT。唯一免鉴权的那条前缀又被宿主自己的
+           `BackupRoute.download_backup` 占了。
 
-        上一版把「精确匹配」读成了「只能用固定路径 + query token」，还据此写下
-        「群里点链接在 4.14 上做不到」。再核一遍源码：插件登记的 route 是**前缀**，
-        subpath 是尾巴——`/api/backup/download/<token>` 能匹配到，且整条在面板鉴权
-        白名单里。所以群里点链接这条路本来是通的，是我上一轮下错了结论。
+        上一版我据「白名单里有 /api/backup/download」推断「群里点链接是通的」，那是
+        又拿一半事实当全部：那条前缀属于宿主，不属于插件。`make_view` 留着，是因为
+        这两条约束都是**宿主版本相关**的——哪天匹配逻辑改成 startswith、或者白名单
+        开放给插件，这里就能直接生效。真正兜底的是 `core/gateway.py` 的内置网关。
 
-        现在登记三条（宿主侧是精确匹配，只能一条一条登记）：
-
-        - `/backup/download/<token>`：完整路径，群里点的就是它；
-        - `/backup/download`：固定路径 + query token，面板按钮用；
-        - `/download/<token>`：短前缀，宿主如果自己吃掉了前缀，这条兜住。
-
-        三条的先后顺序很要紧：宿主按 `route == f"/{subpath}"` 逐个比，`/<token>`
-        这类带尖括号的 route 永远不会等于任何真实 subpath，所以它其实匹配不到；
-        真正会命中 `/api/plug/backup/download/<token>` 的，是**字符串前缀等于
-        整条路径**——也就是 `"/backup/download"` 这条（`DownloadResponse` 自己
-        从 request 里取 token，见 `download_route`）。三条都登记，哪条先命中
-        都走向同一个视图。
+        登记的是固定路径 `/backup/download`：它是唯一可能在 `route ==` 精确比较下
+        命中的形状（`/api/plug/backup/download`），token 从 `?token=` 取。命中之后
+        仍然过不了鉴权——所以这条路在当前版本上只能算「尽力」。
         """
         registrar = getattr(self.context, "register_web_api", None)
         if not callable(registrar):
-            logger.debug("宿主没有 register_web_api，下载链接需要一个自建网关来兑换 token")
+            logger.debug("宿主没有 register_web_api，下载链接改由内置网关提供")
             return False
         view = make_view(self.exports)
         registered = []
@@ -929,11 +934,8 @@ class BackupPlugin(Star):
             except Exception as e:  # 宿主版本差异，注册不上不影响备份本身
                 logger.warning("下载路由 %s 注册失败：%s", route, type(e).__name__)
         if registered:
-            logger.info("下载路由已注册：%s", "、".join(registered))
-        # 链接前缀跟着「宿主的插件路由挂在哪」走，不跟着「哪条先注册成功」走：
-        # 新版面板挂在 `/api/v1/plugins/extensions/<插件名>/`，旧版挂在 `/api/plug/`。
-        # 写死旧版那个，群里点开就是 404；写死新版那个，旧面板同样 404。
-        # 判断依据是宿主的挂载点声明，不是我们自己的注册顺序。
+            logger.info("下载路由已登记：%s", "、".join(registered))
+        # 前缀记账：即使当前宿主下走不通，链接拼装仍是「宿主给的挂载点 + 尾段」
         self.exports.set_route_prefix(*self._host_mount())
         return bool(registered)
 
@@ -1035,13 +1037,40 @@ class BackupPlugin(Star):
             proto = "https" if str(getattr(request, "scheme", "") or "") == "https" else "http"
         return f"{proto}://{host}"
 
+    def _start_gateway(self) -> bool:
+        """起内置网关。没开或起不来都只影响「链接点不点得动」，不影响备份本身。"""
+        cfg = self.config.get("gateway") or {}
+        if not cfg.get("enabled", True):
+            logger.info("内置下载网关未启用（gateway.enabled=false）")
+            return False
+        return self.gateway.start()
+
     def download_link(self, token: str, request=None) -> str:
-        """给用户看的完整链接。没配公网地址时退回裸路径（可下载但点不动）。"""
-        base = self._public_base_url(request)
-        if not base:
-            return f"{self._route_path()}/{token}"
-        return f"{base.rstrip('/')}/{token}"
+        """给用户看的完整链接。
+
+        网关在跑就以网关为根：它能真正兑换 token。宿主面板那条路在 4.14 上不通
+        （注释见 `core/gateway.py`），所以面板地址只作为「配置了 export.base_url
+        且网关没开」时的退回选项。
+
+        全都没有时退回裸路径——明确是「点不动」，不是假装能用。
+        """
+        export_cfg = self.config.get("export") or {}
+        explicit = str(export_cfg.get("base_url") or "").strip()
+        if getattr(self, "gateway", None) is not None and self.gateway.running:
+            return self.gateway.url_for(token, explicit)
+        if explicit:
+            return f"{explicit.rstrip('/')}/backup/download/{token}"
+        # 没有网关也没有对外地址：给裸路径，让上层打「点不动」的提示。
+        # 这里刻意不用 `_route_path()`——它拼出来的是宿主的挂载前缀
+        # （`/api/plug/backup/download`），而那条路在 4.14 上既比不中带 token 的
+        # 路径、又要面板 JWT。给一条看着像能用、实际 404/401 的链接，比给裸路径更糟。
+        return f"/backup/download/{token}"
 
     async def terminate(self):
+        try:
+            if getattr(self, "gateway", None) is not None:
+                self.gateway.stop()
+        except Exception:
+            pass
         self.scheduler.shutdown()
         self.db.close()

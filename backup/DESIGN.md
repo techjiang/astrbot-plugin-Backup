@@ -603,38 +603,51 @@ zip，目录本身留着（本地翻着方便）。
 还有一处：链解析出「文本 + 引用」会归成 `REPLY`，但摊平消息自带权威的 `message_type`，
 不能再改——改了就成了「库里 `text`、包里 `reply`」，校验和必然对不上。
 
-**下载链接：上一轮的结论是错的**
+**下载链接：连着两轮都读错了，这轮把宿主源码跑了一遍**
 
-上一轮我写在这里的结论是「4.14 上群里点链接做不到，因为 `/api/plug/*` 一律要 JWT」。
-再核一遍 `dashboard/server.py`，两处都读错了：
+这条线上我错过两次，方向相反：
 
-- `auth_middleware` 的白名单是**按前缀**放行的，里面明明白白有一条
-  `/api/backup/download`，注释写着「备份下载使用 URL 参数传递 token」；
-- 插件登记的 `route` 在前缀匹配里就是**前缀**：`/api/plug/<path:subpath>` 命中后
-  用 `route == f"/{subpath}"` 去比，`/backup/download/<token>` 这条能匹配上
-  `backup/download/xxx` 这个 subpath。
+1. 第一轮：「4.14 上群里点链接做不到，`/api/plug/*` 一律要 JWT」；
+2. 第二轮：「白名单里有 `/api/backup/download`，说明这条路通」，据此写了「上一轮
+   结论下错了」，还把理由写进代码注释。
 
-所以「把链接发给群成员、他点开就能下」本来是通的，是我上一轮下错了结论，还把错的
-理由写进了代码注释，免得「下次又当成 bug 去查」——反过来把正确判断挡住了。
+两次都是**只核一半就下结论**。把 AstrBot 4.14.6 装进来逐行对着
+`dashboard/server.py` 核完之后，实际是两条约束同时成立：
 
-真正卡住的是另外两处，都是接线细节，一起修了：
+- `srv_plug_route` 里是 `if route == f"/{subpath}"`，**字符串精确比较**。
+  `"/backup/download/<token>"` 是我们的**字面量**，`subpath` 是真实尾巴——尖括号
+  不参与比较，所以带 token 的路径**一条都命中不了**。第二轮我把「注册时能写路径参数」
+  当成了「匹配时也认路径参数」，这是把两件事混作一件。
+- `auth_middleware` 的白名单确实是前缀放行，但 `/api/backup/download` **属于宿主**：
+  `routes/backup.py` 的 `BackupRoute` 已经把 `/backup/download` 注册成自己的
+  `download_backup`（收 `filename` + JWT `token` 两个 query）。插件插不进去。而插件
+  能挂的 `/api/plug/*` 不在白名单里，一律要面板 JWT，群里点链接的人没有 JWT。
+
+所以在这个版本的宿主上，「把链接挂到面板上、群成员点开就下」**做不到**。这轮起了一个
+内置网关（`core/gateway.py`）：`ThreadingHTTPServer`，只监听回环，默认开启，端口可配。
+`download_link` 优先用它——它能真正兑换 token。
+
+`make_view` 和面板路由登记都留着，因为这两条约束都是**宿主版本相关**的：哪天匹配改成
+`startswith`、或者白名单对插件开放，登记的那条就会生效。但不再拿它当「能用」来宣传。
+
+三条教训，记在这里免得再犯：
+
+- **注册成功 ≠ 能命中 ≠ 能下载。** 这三件事要分别验证。`register_web_api` 返回没报错
+  只说明前两件里第一件成立。
+- **白名单里有一条前缀，不等于那条前缀归你。** 得看谁先注册、注册的是什么。
+- **读源码得出的结论也要跑一遍。** 第二轮那条错误注释在代码里躺了一轮多，把后来每次
+  排查都往「这条路是通的」上引，比没有注释更糟。
+
+顺带两处接线 bug 一并修了（都是跑真框架才看得见的）：
 
 1. **视图函数的参数对不上**。`srv_plug_route` 是 `await view_handler(*args, **kwargs)`，
-   而 `subpath` 已经被它自己吃掉当路由匹配用，视图拿到的是**零个**位置参数。视图
-   签名里写 `request` 就是 `TypeError`。现在视图自己去找当前请求（Flask/Quart 的
-   请求上下文、aiohttp 的形参），并且所有形参可选。
+   `subpath` 已经被它自己吃掉当路由匹配用，视图拿到的是**零个**位置参数。视图签名里
+   写 `request` 就是 `TypeError`。现在视图自己去找当前请求。
 2. **回元组是空文件**。`DownloadResponse.body` 在正常下载里是空的（文件在 `file` 上），
    回 `(body, status, headers)` 会让 Flask 认为响应体就是 0 字节：状态 200、
-   `Content-Length: 0`、下下来的 ZIP 打不开。现在回一个 WSGI 响应对象，把
-   `iter_chunks()` 接上去。这个 bug 只有跑真 Flask 才看得见，假 Request 的用例永远绿。
+   `Content-Length: 0`、下下来的 ZIP 打不开。
 
-顺带两件：`/api/backup/download/<token>` 前面那层 `/api` 要在 `handle_download` 之前
-削掉（否则每次真实点击都是 404）；`export.base_url` 空着时从面板配置里找公网地址拼成
-`<面板>/api/backup/download`——原来只给裸路径，发到群里没人点得动。
-
-三条路由都登记（宿主侧精确匹配，只能一条一条来）：`/backup/download/<token>` 是群里
-点的，`/backup/download` 是面板按钮 + query token，`/download/<token>` 兜住宿主自己
-吃掉前缀的情况。
+**域名只有一个来源是不够的**
 
 **域名只有一个来源是不够的**
 
@@ -862,7 +875,7 @@ payload 塞在里头），`url` 就只在段上、`data` 里没有——`_media_
 | 日志不打印消息内容 | 全仓日志只打 message_id / 群号 / 异常类型 |
 | 媒体失败不阻塞 | `BackupEngine._download_media` 内 try/except，计失败数 |
 | 备份不在 Web 目录 | `storage/exports`，靠 token 转发 |
-| 链接带 token 且过期 | `ExportManager._issue_token` / `resolve_token` |
+| 链接带 token 且过期 | `ExportManager._issue_token` / `resolve_token`；兑换入口是 `core/gateway.py`（宿主面板挂不通，见上文） |
 | 恢复二次确认 + 校验 | `RestoreEngine.restore(confirm=True)` + `verify_backup` + 本机 `export_evidence` 快照比对 |
 | 大群分页 | `PAGE_SIZE = 50` 循环拉取 |
 | 超时兜底 | aiohttp `ClientTimeout`、APscheduler `misfire_grace_time` |

@@ -97,20 +97,44 @@ def test_dashboard_section_is_in_the_panel_schema():
     assert "dashboard" in config
 
 
-def test_host_falls_back_to_request_for_the_export_receipt(main_mod, monkeypatch):
-    """`/backup export` 的回执里必须是一个完整 URL，不能用裸路径糊过去。"""
+def test_export_receipt_is_a_complete_usable_url(main_mod, monkeypatch):
+    """`/backup export` 的回执里必须是一个**点得动**的完整 URL，不能用裸路径糊过去。
+
+    这一条原来断言「链接 = 面板地址 + 挂载前缀」，依据是「`/api/backup/download`
+    在面板鉴权白名单里，所以群成员点得到」。把 AstrBot 4.14.6 装进来核过之后，那个
+    前提有两处不成立（见 `core/gateway.py` 顶部）：白名单里那条属于宿主自己的
+    `BackupRoute`，而插件能挂的 `/api/plug/*` 既要过 JWT、路径又比不中带参数的形状。
+
+    所以「点得动」的唯一来源是内置网关。断言改成验证这件事：有网关时链接指向网关
+    的真实端口，没网关但有 `export.base_url` 时用它，两者都没有才退化成裸路径。
+    """
     Context = sys.modules["astrbot.api.star"].Context
     monkeypatch.setattr(main_mod, "_dashboard_host", lambda _cfg: "")
     instance = main_mod.BackupPlugin(Context())
     try:
-        base = instance._public_base_url(_Req(headers={"Host": "bot.example.com"}))
-        # 路径那一段跟着宿主的挂载点走（新版面板带插件名，旧版不带，见 round29）
-        route_path = instance._route_path()
-        assert base == f"http://bot.example.com{route_path}"
-        assert base.endswith("/backup/download")
-        assert instance.download_link("tok", _Req(headers={"Host": "bot.example.com"})) == (
-            f"http://bot.example.com{route_path}/tok"
-        )
+        assert instance.gateway.running, "内置网关默认应已启动"
+        link = instance.download_link("tok", _Req(headers={"Host": "bot.example.com"}))
+        assert link.startswith("http://127.0.0.1:"), link
+        assert link.endswith("/backup/download/tok"), link
+        assert str(instance.gateway.bound_port) in link
+
+        # 配了对外地址就跟着它走：反代后面群成员点的就是那个域名
+        instance.config["export"]["base_url"] = "https://bak.example.com"
+        assert instance.download_link("tok") == "https://bak.example.com/backup/download/tok"
+    finally:
+        instance.gateway.stop()
+        instance.db.close()
+
+
+def test_export_receipt_degrades_to_a_bare_path_without_gateway_or_base_url(main_mod):
+    """网关没开、也没有对外地址时，宁可给出「点不动」的裸路径，也不假装能用。"""
+    Context = sys.modules["astrbot.api.star"].Context
+    instance = main_mod.BackupPlugin(Context())
+    try:
+        instance.gateway.stop()
+        instance.config["export"]["base_url"] = ""
+        link = instance.download_link("tok")
+        assert link == "/backup/download/tok", link
     finally:
         instance.db.close()
 
