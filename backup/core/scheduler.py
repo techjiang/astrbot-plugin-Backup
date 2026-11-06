@@ -126,6 +126,31 @@ class BackupScheduler:
     def _job_id(group_id: int) -> str:
         return f"backup_group_{group_id}"
 
+    def reconfigure(self, enabled: bool, default_cron: str = "") -> None:
+        """改总闸与默认 cron，并立刻让调度器跟着变。
+
+        原来 `schedule.enabled` 只在构造时读一次：`/backup config set
+        schedule.enabled false` 回执「✅ 已设置」，可已经挂上去的任务照旧在跑
+        ——用户以为自己关掉了定时备份，第二天凌晨三点它还是把群备了一遍。
+        """
+        self.enabled = bool(enabled)
+        if default_cron:
+            self.default_cron = default_cron
+        if self.enabled:
+            self.restore_jobs()
+        else:
+            self.pause_jobs()
+
+    def pause_jobs(self) -> None:
+        """撤下所有任务，但**不删**库里的 cron 记录：再打开总闸就全回来。"""
+        if self._scheduler is None:
+            return
+        for job in self.db.list_schedules():
+            try:
+                self._scheduler.remove_job(self._job_id(job["group_id"]))
+            except Exception:
+                pass
+
     def validate_cron(self, cron: str) -> bool:
         return validate_cron(cron)
 

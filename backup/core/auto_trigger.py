@@ -10,12 +10,20 @@ logger = logging.getLogger(__name__)
 
 class AutoTrigger:
     def __init__(self, config: Optional[dict] = None, cooldown_seconds: int = 1800):
-        cfg = config or {}
-        self.mass_leave_threshold = int(cfg.get("mass_leave_threshold", 10))
-        self.on_group_disband = bool(cfg.get("on_group_disband", True))
         self.cooldown = timedelta(seconds=cooldown_seconds)
+        self.reconfigure(config)
         self._leaves: dict[int, Deque[datetime]] = {}
         self._last_trigger: dict[int, datetime] = {}
+
+    def reconfigure(self, config: Optional[dict] = None) -> None:
+        """把配置读进运行参数。构造和 `/backup config set` 共用。
+
+        原来只在构造时读一次，`/backup config set auto_trigger.mass_leave_threshold 3`
+        回执「✅ 已设置」，实际还按 10 个人才触发。
+        """
+        cfg = config or {}
+        self.mass_leave_threshold = max(int(cfg.get("mass_leave_threshold", 10) or 1), 1)
+        self.on_group_disband = bool(cfg.get("on_group_disband", True))
 
     def record_leave(self, group_id: int, now: Optional[datetime] = None) -> int:
         """记一次退群，返回窗口内退群数。"""

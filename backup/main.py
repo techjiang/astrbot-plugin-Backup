@@ -210,38 +210,6 @@ def _astrbot_extensions_mount() -> bool:
     return False
 
 
-def _dashboard_host(config: dict) -> str:
-    """面板自己的配置里有没有记着公网地址。
-
-    AstrBot 的面板地址存在**宿主**配置里（`data/cmd_config.json` 的 `dashboard`），
-    插件注入的配置里通常没有这一项。所以顺带翻一次宿主的：拿到就是赚到，拿不到
-    不报错——这条只影响"链接里有没有域名"，不该让导出本身失败。
-    """
-    candidates = []
-    try:
-        from astrbot.core import astrbot_config  # type: ignore
-
-        getter = getattr(astrbot_config, "get_config", None)
-        if callable(getter):
-            candidates.append(getter())
-        for name in ("ASTRBOT_CONFIG", "astrbot_config"):
-            value = getattr(astrbot_config, name, None)
-            if isinstance(value, dict):
-                candidates.append(value)
-    except Exception:
-        pass
-    for data in candidates:
-        try:
-            dashboard = (data or {}).get("dashboard") or {}
-        except Exception:
-            continue
-        for key in ("public_url", "base_url", "webui_url", "host"):
-            value = dashboard.get(key)
-            if isinstance(value, str) and value.startswith(("http://", "https://")):
-                return value.rstrip("/")
-    return ""
-
-
 def _event_self_id(event):
     """机器人自己的 QQ/用户 id，用来把「我说的话」放在气泡右侧。"""
     for name in ("get_self_id", "self_id", "bot_id"):
@@ -795,9 +763,85 @@ class BackupPlugin(Star):
             yield event.plain_result(f"⚠️ {message}")
             return
         saved = _save_config(self.config, self.injected_config)
+        # 改完立刻让运行中的组件跟着变。不做这一步，回执上那句「✅ 已设置」只说
+        # 配置字典变了：`media.timeout` 还是 30 秒、`export.base_url` 还是空、
+        # `schedule.enabled=false` 关不掉已经挂上的任务——15 个配置项无一例外，
+        # 全都得重载插件才生效，而回执里一个字都没提。
+        note = self._apply_config()
+        tail = "" if saved else "（仅本次运行生效）"
         yield event.plain_result(
-            f"✅ `{key}` = `{_config_get(self.config, key)}`" + ("" if saved else "（仅本次运行生效）")
+            f"✅ `{key}` = `{_config_get(self.config, key)}`{tail}{note}"
         )
+
+    # ---------- 配置生效 ----------
+    def _apply_config(self) -> str:
+        """把 self.config 的当前值灌进所有运行中的组件，返回要写进回执的说明。
+
+        为什么要有这一步：`__init__` 只在插件加载时读一次配置，之后每个组件都把
+        值抄进自己的属性里（信号量、token 有效期、超时、阈值、开关……）。改配置
+        字典对这些属性没有任何作用——`config set` 于是成了一句「已写在纸上」，
+        而干活的还是老参数。
+
+        处理不了的只有一处：存储目录。它牵扯正在打开的 SQLite 连接和已经落盘的
+        媒体/导出文件，热切等于把库和文件劈成两半，所以只提示「重启才生效」。
+        """
+        notes: list[str] = []
+
+        self.engine.media.reconfigure(self.config.get("media") or {})
+        self.exports.reconfigure(self.config)
+
+        permission_cfg = self.config.get("permission") or {}
+        self.permission.require_admin = bool(permission_cfg.get("require_admin", True))
+        self.permission.allow_private = bool(permission_cfg.get("allow_private", True))
+
+        self.hooks.reconfigure(self.config)
+        self.hooks.reconfigure_triggers(self.config)
+        self.auto_trigger.reconfigure(self.config.get("auto_trigger") or {})
+
+        schedule_cfg = self.config.get("schedule") or {}
+        self.scheduler.reconfigure(
+            bool(schedule_cfg.get("enabled", True)),
+            str(schedule_cfg.get("default_cron") or ""),
+        )
+        # 网关的开关和端口是「绑定/解绑一个 socket」，不是读个值：关掉要真的
+        # shutdown，打开要真的 listen，改端口还得先关再开。同样在这里一次做完
+        notes.extend(self._apply_gateway())
+
+        # 存储目录：改不了，只能如实说
+        target = resolve_storage_root(self.config, PLUGIN_DIR)
+        try:
+            same = target.resolve() == self.storage.resolve()
+        except OSError:
+            same = False
+        if not same:
+            notes.append(
+                f"\n⚠️ `storage_dir` 改成 {target} 要重启插件才生效"
+                f"（当前仍在使用 {self.storage}，库和媒体文件不会自动搬家）"
+            )
+
+        return "".join(notes)
+
+    def _apply_gateway(self) -> list[str]:
+        """按当前配置启停内置网关。返回需要写进回执的说明。"""
+        cfg = self.config.get("gateway") or {}
+        want = bool(cfg.get("enabled", True))
+        host = str(cfg.get("host") or "127.0.0.1")
+        port = int(cfg.get("port") or 0)
+        current = self.gateway
+
+        if not want:
+            if current is not None and current.running:
+                current.stop()
+            return []
+        if current is not None and current.running:
+            if current.host == host and current.port == port:
+                return []
+            # 换地址/端口：先下线，否则新实例绑不上（旧 socket 还占着）
+            current.stop()
+        self.gateway = DownloadGateway(self.exports, host, port)
+        if self.gateway.start():
+            return []
+        return [f"\n⚠️ 内置网关没起来：{self.gateway.last_error}"]
 
     # ---------- 事件钩子 ----------
     #

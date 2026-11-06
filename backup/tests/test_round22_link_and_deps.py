@@ -82,8 +82,19 @@ def test_forwarded_header_with_port_and_list(main_mod):
     assert BackupPlugin._host_from_request(req) == "http://bot.example.com:8443"
 
 
-def test_dashboard_section_is_in_the_panel_schema():
-    """面板上看不到的配置等于不存在：这一项得出现在 schema 和 config.yaml 里。"""
+def test_dashboard_section_is_gone_because_nothing_read_it():
+    """`dashboard.public_url` 从面板上撤掉了——它从来没被读过。
+
+    这一条原来断言的是**反方向**：「面板上看不到的配置等于不存在」，所以要把它
+    写进 schema。前提没错，结论错在另一半：写进面板之后，得真有人读它。第 33 轮
+    删掉 `_public_base_url` 之后，全仓只有 `_dashboard_host()` 还在翻宿主配置，而
+    那个函数本身零调用点——它的两个用例（`monkeypatch.setattr(main_mod,
+    "_dashboard_host", ...)` 和本条）都只是把它按住，没有一条在验它有用。
+
+    面板上摆一个填了不生效的输入框，比不摆更糟：用户按提示填了面板地址、重新
+    导出，链接还是裸路径。所以整块撤掉，链接来源只剩 `export.base_url` →
+    请求进来的域名 → 裸路径。
+    """
     import json
     from pathlib import Path
 
@@ -91,10 +102,13 @@ def test_dashboard_section_is_in_the_panel_schema():
 
     plugin_dir = Path(__file__).resolve().parent.parent
     schema = json.loads((plugin_dir / "_conf_schema.json").read_text(encoding="utf-8"))
-    assert "public_url" in schema["dashboard"]["items"]
+    assert "dashboard" not in schema
 
     config = yaml.safe_load((plugin_dir / "config.yaml").read_text(encoding="utf-8"))["backup"]
-    assert "dashboard" in config
+    assert "dashboard" not in config
+
+    main_src = (plugin_dir / "main.py").read_text(encoding="utf-8")
+    assert "_dashboard_host" not in main_src
 
 
 def test_export_receipt_is_a_complete_usable_url(main_mod, monkeypatch):
@@ -111,7 +125,6 @@ def test_export_receipt_is_a_complete_usable_url(main_mod, monkeypatch):
     收了 `request` 却从没用过），把「群成员点自己电脑的 127.0.0.1」当成了正确答案。
     """
     Context = sys.modules["astrbot.api.star"].Context
-    monkeypatch.setattr(main_mod, "_dashboard_host", lambda _cfg: "")
     instance = main_mod.BackupPlugin(Context())
     try:
         assert instance.gateway.running, "内置网关默认应已启动"

@@ -46,13 +46,24 @@ class MediaDownloader:
     def __init__(self, media_dir: str | Path, config: Optional[dict] = None):
         self.media_dir = Path(media_dir)
         self.media_dir.mkdir(parents=True, exist_ok=True)
-        cfg = config or {}
-        self.max_file_size = parse_size(cfg.get("max_file_size", "100MB"))
-        self.max_concurrent = int(cfg.get("max_concurrent", 3))
-        self.retry_count = int(cfg.get("retry_count", 3))
-        self.timeout = int(cfg.get("timeout", 30))
-        self._sem = asyncio.Semaphore(self.max_concurrent)
         self._url_index: dict[str, Path] = {}
+        self.reconfigure(config)
+
+    def reconfigure(self, config: Optional[dict] = None) -> None:
+        """把配置读进运行参数。构造和 `/backup config set` 走同一条路。
+
+        原来只在 `__init__` 里读一次：`/backup config set media.timeout 5` 回执
+        写着「✅ 已设置」，可已经建好的下载器还按 30 秒超时干活，直到插件重载。
+        `max_concurrent` 还要重建信号量——`asyncio.Semaphore` 的额度在构造时就定死了，
+        改属性等于没改。
+        """
+        cfg = config if config is not None else {}
+        self.max_file_size = parse_size(cfg.get("max_file_size", "100MB"))
+        self.max_concurrent = max(int(cfg.get("max_concurrent", 3) or 1), 1)
+        self.retry_count = max(int(cfg.get("retry_count", 3) or 1), 1)
+        self.timeout = max(int(cfg.get("timeout", 30) or 1), 1)
+        # 正在跑的下载会继续用它自己那份旧信号量，这没关系：下一个文件就用新的
+        self._sem = asyncio.Semaphore(self.max_concurrent)
 
     def url_hash(self, url: str) -> str:
         return hashlib.sha256(url.encode("utf-8")).hexdigest()[:8]

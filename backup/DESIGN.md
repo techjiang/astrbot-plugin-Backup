@@ -1960,3 +1960,121 @@ message_id 共用一份媒体。
 
 **产物要跟着用户走完全程，才算验过。** 停在「导出了、里面有这句话」，
 和第 38 轮停在「文件生成了」是同一个坑。
+
+---
+
+## 第 40 轮：`config set` 的每一句「已设置」都是假的
+
+这轮的起点不是读代码，是**把 schema 里每一项都改一遍，再回头看组件变没变**。
+
+```python
+p = BackupPlugin(Context())                             # 组件在这个时刻抄走了配置
+replies = await _cmd_config(ev, ["set", "media.timeout", "5"])
+p.engine.media.timeout                                  # → 30
+```
+
+15 项，15 项全没变。回执写的是「✅ `media.timeout` = `5`」——它说的是配置字典变了，
+一个字没提「这次运行仍然按 30 秒超时」。用户按回执以为改好了，实际得重载插件。
+
+### 1. 值被抄进属性里，改字典对属性没有任何作用
+
+每个组件都在 `__init__` 里把需要的值取出来存成自己的字段：`MediaDownloader.timeout`、
+`ExportManager.expire_seconds`、`PermissionChecker.require_admin`、`AutoTrigger.threshold`、
+`EventHooks.archive`、`BackupScheduler.enabled`。这是对的（组件不该每次用到都回头翻配置），
+错的是**只有一条写入路径**：`config set` 只改字典。
+
+现在每个组件多一个 `reconfigure()`，`__init__` 和 `config set` 共用它。构造路径和
+改配置路径走同一段代码，才不会一边改一边忘。
+
+两处只能重建、改不了属性：
+
+- `media.max_concurrent` 落在 `asyncio.Semaphore` 里。额度构造时定死，改属性不改信号量
+  等于没改——必须新建一个。
+- 网关的开关是 bind/unbind socket。关掉要 `shutdown()`，打开要真 `listen()`，换端口要先关再开。
+
+### 2. `storage_dir` 是唯一诚实的例外
+
+换目录牵扯正在打开的 SQLite 连接、已经落盘的媒体、已经发出去的 token 里的路径。
+热切等于把库和文件劈成两半。所以这一项**改不了**——但回执必须说出来：
+
+```
+✅ `storage_dir` = `/new/path`
+⚠️ `storage_dir` 改成 /new/path 要重启插件才生效（当前仍在使用 /old/path，库和媒体文件不会自动搬家）
+```
+
+「做不到」和「装作做到了」的区别，就在这句话上。
+
+### 3. `scope.group_members` 是一张从没兑现的支票
+
+schema 里写着、README 里写着「成员列表」，代码里**一次都没读过**。关掉它照样每轮拉
+一次全员名单：2000 人的群，一次几千条。用户关它的理由（省时间、省配额、平台不给权限）
+一条都没兑现。
+
+### 4. 私聊归档只进不出
+
+`scope.private_messages` 打开后，私聊消息落在虚拟群号 `-1`。可 `parse_group_arg` 的
+下限是 5 位数字：
+
+```python
+parse_group_arg("-1")   # → None
+```
+
+于是 `/backup status -1`、`/backup export -1 zip` 一律回「请指定群号」。数据在库里，
+**没有任何命令能把它们导出来**——而「私聊也备份」这个开关唯一的价值就是导出来看。
+
+现在 `-1` 可寻址，`render_status` 把它显示成「私聊归档」而不是「群 -1（-1）」：
+内部约定的负数群号不该甩到用户脸上。
+
+### 5. 第二个「写全了、零调用点」
+
+`dashboard.public_url` 没人读，`_dashboard_host()`（去翻宿主 `cmd_config.json` 的那个）
+自己也没有任何调用点。第 33 轮刚删过同形状的 `_public_base_url`，这是第二个。
+
+它比上一个更隐蔽：它有**两条用例**。一条断言「它得出现在 schema 里」，另一条把它
+`monkeypatch` 掉——两条都在把它按住，没有一条在验它有用。用例数量和它是否被调用
+毫无关系。
+
+一并删掉。链接来源现在只有三层：`export.base_url` → 这条命令进来的域名 → 裸路径。
+
+### 6. 顺手撞出来的：`ExportResult.link` 少了路径段
+
+```python
+f"{self.base_url.rstrip('/')}/{self.token}"        # → https://host/<token>
+```
+
+网关只认 `/backup/download/<token>` 开头。这条拼法在网关上一定 404，而
+`download_link()`（`/backup export` 回执走的那条）拼得是对的——同一个配置项、两条产出、
+两种拼法。之所以一直没被发现：`ExportResult.link` 全仓零引用，用例也只断言了
+`base_url` 前缀、没断言路径。
+
+写这轮的用例时我才注意到：第一版断言写的是 `download_link()` 的返回值，而那个函数
+每次都直接读 `self.config`——**旧代码上它也是对的**，这条用例在旧代码上蒙过了。
+改成断言 `ExportManager.base_url` 和 `result.link` 之后才真的红。
+
+### 7. 验证
+
+`test_round40_config_takes_effect.py` 27 条，旧代码上 **26 条红**（1 条是「顺手撞出来
+的少了路径段」那条的初版，见上）。留着没红的那条说明我第一版写弱了，不是说明旧代码对。
+
+- 15 个配置项逐个走 `/backup config set` 命令路径，断言**运行中组件**的值变了
+  （不是断言 `self.config` 变了——那正是旧代码唯一的动作）；
+- `max_concurrent` 断言信号量额度真的重建（`_sem._value`）；
+- `schedule.enabled=false` 断言已挂的任务从 `get_jobs()` 消失，且库里的 cron 记录留着
+  （再打开就回来，不能连配置一起删）；
+- `gateway.enabled` 断言 socket 真的关/真的开；
+- `storage_dir` 断言运行目录一个字节没动、且回执里说了「重启才生效」；
+- `group_members` 关掉时断言 `get_group_members` 调用次数为 0（真的没去要）；
+- 私聊归档：`-1` 可解析、`status` 显示「私聊归档」、`export -1 zip` 出的包里有那条消息；
+- 一条「schema 里每一项都得有代码读它」的静态检查——`dashboard.public_url` 和
+  `scope.group_members` 都会被它抓出来。
+
+全量 **620 passed / 1 skipped**，覆盖率 92%。
+
+### 8. 一句总结
+
+前几轮的 bug 大多是「这条路径本身写错了」。这轮不一样：**代码每一段都对，
+只是它们之间没有连线**。配置键在 schema 里、在 README 里、在回执里、在字典里，
+唯独不在干活的组件里。回执说「已设置」不算撒谎——它只是回答了另一个问题。
+
+**「配置项存在」和「配置项生效」之间隔着一次连线，而 schema / 文档 / 回执都证明不了
+那条线存在。** 唯一能证明的是：改一下，然后去问那个干活的组件。

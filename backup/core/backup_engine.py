@@ -598,6 +598,8 @@ class BackupEngine:
         )
         self.db.save_record(record)
 
+        # 备份范围开关。放在这里取，因为下面每一步都要读它
+        scope = self.config.get("scope") or {}
         # 群信息/成员拉不到不等于备份失败：权限受限的适配器给不出成员列表，但历史
         # 消息照样能拉。原来任何一个抛错都会把整次备份标成 failed，一条消息都不留。
         info = None
@@ -617,8 +619,12 @@ class BackupEngine:
             auxiliary_errors.append("群信息")
             logger.warning("群信息拉取失败 group=%s: %s", group_id, type(e).__name__)
         try:
-            raw_members = await adapter.get_group_members(group_id)
-            members = parse_group_members(raw_members, group_id)
+            # `scope.group_members` 原来是个从没人读的开关：schema 和 README 都写着
+            # 「成员列表」，关掉它照样每轮去拉一次全员名单。2000 人的群这是一次
+            # 几千条的请求，用户关它的理由（省时间/省配额/平台不给权限）一条都没兑现。
+            if scope.get("group_members", True):
+                raw_members = await adapter.get_group_members(group_id)
+                members = parse_group_members(raw_members, group_id)
             # 成员列表是「当前状态」：整群替换，退群的人才会真的从名单里消失。
             # 只做 upsert 的话名单只会越攒越大，`/backup status` 的成员数永远不降。
             # 拉回来是空的（权限不足的适配器常见）就当没拉到，不能拿空表把快照清空。
@@ -634,7 +640,6 @@ class BackupEngine:
             members = self.db.get_members(group_id)
 
         # 群公告 / 群文件：开关在配置里，之前没人读。同样不影响主流程成败
-        scope = self.config.get("scope") or {}
         # 拉回来的条目挂在实例上，下面写 bundle 时要一并存进「这份备份的快照」。
         # 只进 `group_announcements`（当前状态表）是不够的：导出包读的是
         # `get_announcements(ctx.group_id)`，而这条路径对**历史上任意一份备份**

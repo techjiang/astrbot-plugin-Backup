@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from .database import REALTIME_BACKUP_ID, Database
+from .models import PRIVATE_ARCHIVE_GROUP
 
 SIZE_UNITS = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3}
 
@@ -111,9 +112,21 @@ def human_size(size: int) -> str:
 
 
 def parse_group_arg(token: Optional[str]) -> Optional[int]:
-    if token and re.fullmatch(r"-?\d{5,20}", token.strip()):
-        return int(token.strip())
-    return None
+    """把命令里的群号参数解析成 int。认不出返回 None。
+
+    两个容易踩的地方：
+
+    - 群号下限写成 5 位，于是 `-1`（私聊归档的虚拟群号）永远解析不出来。
+      私聊消息照 `scope.private_messages` 落进库了，`/backup export -1 zip`
+      却回一句「请指定群号」——数据在库里，没有任何命令能把它导出来。
+    - 上界 20 位是给平台 ID 留的余量（Discord 的 snowflake 已经 19 位）。
+    """
+    text = (token or "").strip()
+    if not re.fullmatch(r"-?\d{1,20}", text):
+        return None
+    if text.lstrip("-") == "0":
+        return None
+    return int(text)
 
 
 @dataclass
@@ -350,13 +363,25 @@ def render_backup_list(db: Database, group_id: Optional[int] = None, limit: int 
     return "\n".join(lines)
 
 
+def group_label(group_id: int, info=None) -> str:
+    """给一个群号配个能读的名字。
+
+    私聊归档落在 `-1` 这个虚拟群号下，回执直接写「**群 -1**（-1）」等于把内部
+    约定甩给用户看。真实群号照旧显示群名，取不到群名就显示群号。
+    """
+    if group_id == PRIVATE_ARCHIVE_GROUP:
+        return "私聊归档"
+    name = info.group_name if info is not None and info.group_name else group_id
+    return f"群 {name}（{group_id}）"
+
+
 def render_status(db: Database, group_id: int) -> str:
     info = db.get_group_info(group_id)
     # 取「最近一次真正落了消息的备份」，而不是列表第一行：
     # 空跑一次会留下 0 条的记录，按第一行取会把实绩藏起来
     record = db.latest_completed_record(group_id)
     members = db.get_members(group_id)
-    lines = [f"**群 {info.group_name if info else group_id}**（{group_id}）"]
+    lines = [f"**{group_label(group_id, info)}**"]
     lines.append(f"消息总数：{db.count_messages(group_id)}")
     lines.append(f"成员数：{len(members)}")
     if record:

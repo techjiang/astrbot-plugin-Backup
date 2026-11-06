@@ -5,6 +5,11 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
+#: 私聊消息在库里的群号。负数，与真实群号（正整数）区分开。
+#: 放在 models 里是为了让命令层也能引用它——`/backup export -1 zip` 要能寻址到
+#: 「私聊归档」这批消息，否则私聊归档只进不出（写进库、永远导不出来）。
+PRIVATE_ARCHIVE_GROUP = -1
+
 
 class MessageType(Enum):
     TEXT = "text"

@@ -133,11 +133,18 @@ def test_download_route_strips_query(exports, db, tmp_path):
 
 
 def test_link_includes_base_url(exports, db, tmp_path):
+    """`base_url` 是**域名**，不是完整前缀——路径段得由插件补上。
+
+    这一条原来断言 `f"https://example.com/{result.token}"`，注释写「base_url 就是
+    链接前缀，不能再补一层 `/backup/download`」。那个理解是错的：网关只认
+    `/backup/download/<token>`，按旧写法拼出来的链接在网关上一定是 404，而
+    `download_link()`（`/backup export` 回执走的那条）一直拼的是带路径段的形状。
+    同一个配置项、两条产出、两种拼法，其中一条从没被点开过。
+    """
     _save(db)
     exports.base_url = "https://example.com"
     result = exports.export(100, "txt")
-    # base_url 就是链接前缀，拼 token 时不能再补一层 `/backup/download`
-    assert result.link == f"https://example.com/{result.token}"
+    assert result.link == f"https://example.com/backup/download/{result.token}"
     assert result.download_path == f"/backup/download/{result.token}"
 
 

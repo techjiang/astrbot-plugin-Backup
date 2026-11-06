@@ -73,9 +73,16 @@ class ExportResult:
 
     @property
     def link(self) -> str:
-        """直接可用的下载地址。没配 base_url 时只给路径。"""
+        """直接可用的下载地址。没配 base_url 时只给路径。
+
+        路径段必须是 `/backup/download/<token>`，原来拼的是 `<base_url>/<token>`
+        ——少了那一段，网关只认 `/backup/download/` 开头，点开一律 404。
+        `download_link()`（`/backup export` 回执走的那条）拼得是对的，所以这个
+        错只在**没有人调**的那条路上：`ExportResult.link` 全仓零引用，用例也只
+        断言过 `base_url` 前缀，没断言过路径。
+        """
         if self.base_url:
-            return f"{self.base_url.rstrip('/')}/{self.token}"
+            return f"{self.base_url.rstrip('/')}{self.download_path}"
         return self.download_path
 
 
@@ -91,16 +98,27 @@ class ExportManager:
         self.export_dir = Path(export_dir)
         self.export_dir.mkdir(parents=True, exist_ok=True)
         self.media_dir = Path(media_dir)
-        cfg = config or {}
-        export_cfg = cfg.get("export") or {}
-        self.expire_seconds = parse_expire(export_cfg.get("download_link_expire", "24h"))
-        self.base_url = str(export_cfg.get("base_url") or "").rstrip("/")
+        self.expire_seconds = 24 * 3600
+        self.base_url = ""
+        self.reconfigure(config)
         # 群里点的链接前缀：面板自己的公网地址 + `/api/backup/download`。插件启动后
         # 由 main.py 填进来（配置里不一定有），导出时 `link` 就用它拼
         self.public_prefix = ""
         # 插件路由在面板上的挂载前缀与尾段，注册路由时由 main.py 写进来
         self.route_prefix = ""
         self.route_suffix = "/backup/download"
+
+    def reconfigure(self, config: Optional[dict] = None) -> None:
+        """把配置读进运行参数。构造和 `/backup config set` 共用。
+
+        原来 `download_link_expire` / `base_url` 只在 `__init__` 里读一次：
+        `/backup config set export.download_link_expire 1m` 回执「✅ 已设置」，
+        而已经建好的导出管理器仍然发 24 小时的 token；`base_url` 更是要重载插件
+        才生效——用户按提示填完对外地址、重新导出，拿到的还是裸路径。
+        """
+        export_cfg = (config or {}).get("export") or {}
+        self.expire_seconds = parse_expire(export_cfg.get("download_link_expire", "24h"))
+        self.base_url = str(export_cfg.get("base_url") or "").rstrip("/")
 
     def set_base_url(self, value: str) -> None:
         """设置下载链接前缀（`<前缀>/<token>`）。"""

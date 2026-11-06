@@ -89,10 +89,10 @@ backup:
     web_roots: []             # 数据目录不允许落在这里面，否则启动直接报错
   scope:
     group_messages: true      # 群消息
-    private_messages: false   # 私聊（默认关；开则落在虚拟群号 -1 下，命令/导出照旧）
+    private_messages: false   # 私聊（默认关；开则落在虚拟群号 -1 下，用 -1 寻址）
     group_announcements: true # 群公告
     group_files: true         # 群文件列表
-    group_members: true       # 成员列表
+    group_members: true       # 成员列表（关掉就不再去要全员名单）
     download_media: true      # 下载图片/语音/视频/文件
   media:
     max_file_size: "100MB"    # 单文件上限，超过跳过
@@ -114,8 +114,6 @@ backup:
     enabled: true             # 内置下载网关：群内下载链接靠它
     host: "127.0.0.1"         # 只监听回环，对外暴露交给反代
     port: 0                   # 0 = 系统分配
-  dashboard:
-    public_url: ""            # 面板公网地址，仅作拼链接时的兜底
   permission:
     require_admin: true       # 仅群主/管理员可用
     allow_private: true       # 私聊里没有管理员概念，关掉则私聊一律拒绝
@@ -126,6 +124,15 @@ backup:
     on_group_disband: true
     on_bot_kicked: true       # 机器人被踢前补最后一次备份
 ```
+
+### 配置改完立即生效
+
+`/backup config set <键> <值>` 改完当场生效，不必重载插件——每一项都会灌回正在
+干活的组件（下载上限、超时、token 有效期、对外地址、权限开关、触发阈值、定时总闸、
+网关开关），不只是改配置字典。
+
+唯一例外是 `storage_dir`：换目录等于把正在用的库和已落盘的媒体劈成两半，所以只会在
+回执里明说「要重启才生效，当前仍在使用旧目录」。
 
 ## 数据存放
 

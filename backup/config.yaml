@@ -32,7 +32,7 @@ backup:
   export:
     default_format: "sqlite"
     download_link_expire: "24h"
-    # 下载链接的对外前缀，最终链接是 <base_url>/<token>。
+    # 下载链接的对外前缀，最终链接是 <base_url>/backup/download/<token>。
     # 填反向代理/内网穿透指向网关的地址，例如 https://bak.example.com。
     # 留空 = 用网关本机回环地址，那种链接只有本机能打开，发到群里点不动。
     base_url: ""
@@ -47,10 +47,6 @@ backup:
     enabled: true
     host: "127.0.0.1"
     port: 0
-
-  # 面板公网地址。仅作拼链接时的兜底；群成员能不能点开取决于网关的对外地址。
-  dashboard:
-    public_url: ""
 
   permission:
     require_admin: true

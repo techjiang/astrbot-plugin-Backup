@@ -51,8 +51,10 @@ def plugin(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "backup.main.assert_writable_target", lambda root, roots: tmp_path / "storage"
     )
-    instance, _context, main_mod = load_plugin_for_real(monkeypatch)
-    monkeypatch.setattr(main_mod, "_dashboard_host", lambda _cfg: "")
+    instance, _context, _main_mod = load_plugin_for_real(monkeypatch)
+    # 原来这里按住了 `_dashboard_host`——一个零调用点的函数，按住它验的是「它不会
+    # 干扰」，而它本来就从没被调用过。那个函数连同 `dashboard.public_url` 这项
+    # 配置一起删掉了（见 test_round40），这里不再需要。
     yield instance
     try:
         instance.gateway.stop()

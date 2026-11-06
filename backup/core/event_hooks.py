@@ -12,7 +12,7 @@ from typing import Any, Optional
 from .auto_trigger import AutoTrigger
 from .parser import is_event_payload
 from .commands import PermissionChecker
-from .models import Message
+from .models import PRIVATE_ARCHIVE_GROUP, Message
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +40,8 @@ EVENT_FIELDS = (
 )
 NOTICE_FIELDS = ("post_type", "notice_type", "sub_type", "subtype", "group_id", "group")
 
-# 私聊消息在库里的 group_id。负数，和真实群号（正整数）区分开
-PRIVATE_ARCHIVE_GROUP = -1
+# 私聊消息在库里的 group_id（负数）定义挪到了 models 里，这里仍然是同一个名字：
+# `from .models import PRIVATE_ARCHIVE_GROUP` 之后它对 import 本模块的人照旧可见。
 
 #: 同一条通知被两个 handler 各处理一次时的去重窗口。AstrBot 的处理器分发是
 #: 广播式的（见 `pipeline/process_stage` 里对 `star_handlers_registry` 的遍历），
@@ -290,6 +290,24 @@ class EventHooks:
         # 窗口是按事件间隔算的，两次调用几乎同时，第二次能命中冷却，所以只有
         # 退群聚合会真的翻倍。这里记「这条通知已经处理过」，第二个 handler 直接跳过
         self._handled_notices: dict[str, datetime] = {}
+
+    def reconfigure(self, config: Optional[dict] = None) -> None:
+        """把 `scope` / `auto_trigger` 读进运行参数。构造和 `config set` 共用。
+
+        原来这些开关只在 `BackupPlugin.__init__` 里读一次并传进来，
+        `/backup config set scope.group_messages false` 回执「✅ 已设置」，而钩子
+        照旧归档每条群消息——「关掉了还在存」比「关不掉」更糟，用户以为自己已经
+        让它别再记了。
+        """
+        scope = (config or {}).get("scope") or {}
+        self.archive = bool(scope.get("group_messages", True))
+        self.archive_private = bool(scope.get("private_messages", False))
+
+    def reconfigure_triggers(self, config: Optional[dict] = None) -> None:
+        """`auto_trigger` 里与钩子相关的开关。"""
+        triggers = (config or {}).get("auto_trigger") or {}
+        self.on_leave = bool(triggers.get("on_bot_kicked", True))
+        self.on_disband = bool(triggers.get("on_group_disband", True))
 
     # ---------- 实时归档 ----------
     def archive_message(self, event, backup_id: str = "realtime") -> Optional[Message]:

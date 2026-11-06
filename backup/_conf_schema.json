@@ -139,7 +139,7 @@
       },
       "base_url": {
         "type": "string",
-        "description": "下载链接对外前缀，最终为 <base_url>/<token>。填反代/内网穿透指向网关的地址即可（如 https://bak.example.com）。留空则用网关本机回环地址——那种链接只能本机打开，发到群里点不动。",
+        "description": "下载链接对外前缀，最终链接为 <base_url>/backup/download/<token>。填反代/内网穿透指向网关的地址即可（如 https://bak.example.com）。留空则退回裸路径——那条链接只能本机打开，发到群里点不动。",
         "default": ""
       }
     }
@@ -162,17 +162,6 @@
         "type": "int",
         "description": "监听端口。0 = 由系统分配（重启后可能变化，配了 base_url 才稳定）",
         "default": 0
-      }
-    }
-  },
-  "dashboard": {
-    "type": "object",
-    "description": "面板地址（只读兜底；群内下载链接请用 export.base_url 指向网关）",
-    "items": {
-      "public_url": {
-        "type": "string",
-        "description": "AstrBot 面板的公网地址，例如 https://bot.example.com。仅在拼链接没有更具体的地址可用时兜底，不改变「群成员能否打开」这件事。",
-        "default": ""
       }
     }
   },
