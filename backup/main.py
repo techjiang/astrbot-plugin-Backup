@@ -599,6 +599,13 @@ class BackupPlugin(Star):
                     "发到群里点不动。把 `export.base_url` 填成网关的**对外地址**"
                     "（反代/内网穿透的域名），或让宿主面板这一层反代到网关端口，再重新导出"
                 )
+            elif (self.config.get("gateway") or {}).get("enabled", True) and getattr(
+                self.gateway, "last_error", ""
+            ):
+                # 配了 enabled=true 却没起来：这时再说「把 gateway.enabled 打开」
+                # 就是叫人去查一项本来就对的东西。网关自己记着原因（端口被占 /
+                # 主机名写错），直接搬过来。
+                hint = f"\n⚠️ 内置网关没起来：{self.gateway.last_error}"
             else:
                 hint = (
                     "\n⚠️ 没有可用的下载入口：内置网关没起来，也没配 `export.base_url`。"
@@ -1099,68 +1106,6 @@ class BackupPlugin(Star):
             )
         return LEGACY_PREFIX, "/backup/download"
 
-
-    def _public_base_url(self, request=None) -> str:
-        """下载链接的前缀。返回 `<base>`，完整链接是 `<base>/<token>`。
-
-        链接是要发到群里的，前面必须是一个群成员点得到的地址。`export.base_url`
-        空着的时候，`/backup export` 原来只给一个裸路径 `/backup/download/<token>`
-        ——发到 QQ 群里没人点得动。
-
-        找地址的顺序（前面能定就不再往后找）：
-
-        1. `export.base_url`：你明确指定的；
-        2. 面板配置里的公网地址（`dashboard.public_url` 等几种写法都认）；
-        3. **当前这条消息来自哪个地址**——反代/内网穿透部署下，配置里往往没有
-           任何公网地址，但消息本身是从一个群成员点得到的域名进来的。取 `Host`
-           头 + 转发协议拼出 `<proto>://<host><挂载前缀><route 尾段>`。挂载前缀
-           来自「哪条路由注册成功了」——旧版面板 `/api/plug`，新版
-           `/api/v1/plugins/extensions/<插件名>`。
-
-        三条都落空就返回空串，上层退回裸路径并提示去配 `export.base_url`。
-        """
-        export_cfg = self.config.get("export") or {}
-        explicit = str(export_cfg.get("base_url") or "").strip()
-        if explicit:
-            base = explicit.rstrip("/")
-        else:
-            dashboard = self.config.get("dashboard") or {}
-            host = ""
-            for key in ("public_url", "base_url", "webui_url", "host"):
-                value = dashboard.get(key)
-                if isinstance(value, str) and value.startswith(("http://", "https://")):
-                    host = value.rstrip("/")
-                    break
-            if not host:
-                host = self._host_from_request(request) or _dashboard_host(self.config)
-            if not host:
-                return ""
-            base = f"{host}{self._route_path()}"
-        # base_url 的语义是「链接前缀」。写成挂载前缀（`/api/plug`、
-        # `/api/v1/plugins/extensions/backup`）、写成完整前缀（`.../backup/download`）、
-        # 或者干脆只写了域名，都收成 `<host><挂载前缀><route 尾段>` 这一种形状
-        route_path = self._route_path()
-        if base.endswith(route_path):
-            pass
-        elif base.endswith("/backup/download"):
-            base = base[: -len("/backup/download")] + route_path
-        elif base.endswith(f"/{self.PLUGIN_NAME}/backup/download"):
-            pass  # 用户把新版面板的完整前缀抄进来了
-        else:
-            base = f"{base.rstrip('/')}{route_path}"
-        self.exports.set_base_url(base)
-        return base
-
-    def _route_path(self) -> str:
-        """链接里路径那一段：`<挂载前缀><route 尾段>`。
-
-        新版面板是 `/api/v1/plugins/extensions/backup/backup/download`，旧版是
-        `/api/plug/backup/download`。写死旧版那条，新版面板上图裂成 404——所以这个
-        值来自注册路由时记下的 `exports.download_prefix`，没注册成功才退回旧版。
-        """
-        prefix = getattr(self.exports, "download_prefix", "")
-        return prefix or f"{LEGACY_PREFIX}/backup/download"
-
     @staticmethod
     def _headers_of(source) -> dict:
         """从一个「可能是 request、也可能是事件」的对象上取请求头。
@@ -1226,12 +1171,11 @@ class BackupPlugin(Star):
            内网与本机地址一律不认（见 `_host_from_request`）；
         3. 网关照旧给本机回环地址。
 
-        第 2 条是这一轮的修复重点。原来 `request` 收进来后**一次都没用**：
-        `_public_base_url` 里那套「反代后面真实域名在 X-Forwarded-Host 里」的
-        推断逻辑写得很完整，却没有任何调用点——它自己的用例直接调它，全绿。
-        于是反代/内网穿透部署下（配置里通常没有任何公网地址），发进群的永远是
-        `http://127.0.0.1:<端口>/...`：群成员点的是**他自己电脑**的 127.0.0.1，
-        一辈子点不开，而回执上看起来像条正常链接。
+        第 2 条修的是「`request` 收进来后一次都没用」（第 33 轮）。这轮把
+        `_public_base_url` 整个删了——它是**第二个**「写全了、零调用点」的：
+        拼的是面板那条路的链接前缀，而那条路在 4.14 上已被证伪（见
+        `download_route.py` 末尾）。面板路由登记仍然留着（宿主版本会变），但
+        链接前缀只有这一个来源：`<对外地址><GATEWAY_PREFIX><token>`。
 
         全都没有时退回裸路径——明确是「点不动」，不是假装能用。
         """
@@ -1254,9 +1198,9 @@ class BackupPlugin(Star):
             # 链子只回裸路径，让上层明说「点不动」。
             return f"/backup/download/{token}"
         # 没有网关也没有对外地址：给裸路径，让上层打「点不动」的提示。
-        # 这里刻意不用 `_route_path()`——它拼出来的是宿主的挂载前缀
-        # （`/api/plug/backup/download`），而那条路在 4.14 上既比不中带 token 的
-        # 路径、又要面板 JWT。给一条看着像能用、实际 404/401 的链接，比给裸路径更糟。
+        # 这里刻意不拼宿主的挂载前缀（`/api/plug/backup/download`）——那条路在
+        # 4.14 上既比不中带 token 的路径、又要面板 JWT。给一条看着像能用、实际
+        # 404/401 的链接，比给裸路径更糟。
         return f"/backup/download/{token}"
 
     async def terminate(self):

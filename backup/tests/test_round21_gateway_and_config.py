@@ -91,11 +91,15 @@ def test_registers_prefix_routes_on_the_host(plugin):
     assert "/backup/backup/download/<token>" in routes
 
 
-def test_download_link_is_clickable_when_dashboard_url_is_set(main_mod, tmp_path):
-    """面板配了公网地址，导出回执里给的必须是能直接点的完整 URL。
+def test_dashboard_url_does_not_override_the_gateway_link(main_mod, tmp_path):
+    """面板配了公网地址，也不该把它当成下载链接的前缀。
 
-    原来 `export.base_url` 空着就只给 `/backup/download/<token>`——发到群里
-    谁点得动？面板自己的地址配置里明明有。
+    旧代码在这里断言 `_public_base_url() == 面板地址 + /api/plug/backup/download`。
+    那条路在 AstrBot 4.14 上是**死的**：`/api/plug/*` 既比不中带 token 的路径，
+    又整条要面板 JWT（推导见 `core/download_route.py` 末尾）。断言写在这条死路上，
+    等于把一个点不开的链接锁成了正确答案。
+
+    现在链接前缀只有一个来源：`export.base_url`。没配就老实说「点不动」。
     """
     Context = sys.modules["astrbot.api.star"].Context
     (tmp_path / "plugin" / "config.yaml").write_text(
@@ -112,21 +116,16 @@ def test_download_link_is_clickable_when_dashboard_url_is_set(main_mod, tmp_path
     )
     instance = main_mod.BackupPlugin(Context())
     try:
-        base = instance._public_base_url()
-        # 路径那一段由宿主的挂载点决定：旧面板是 `/api/plug/backup/download`，
-        # 新版面板是 `/api/v1/plugins/extensions/<插件名>/backup/download`。
-        assert base == (
-            "https://bot.example.com" + instance._route_path()
-        )
-        assert base.endswith("/backup/download")
-        assert base.startswith("https://bot.example.com/api/")
+        # 面板地址不再是链接来源：拼不出可点链接就是拼不出
+        assert not hasattr(main_mod.BackupPlugin, "_public_base_url")
+        assert instance.download_link("tok") == "/backup/download/tok"
     finally:
         instance.db.close()
 
 
 def test_no_public_url_falls_back_to_bare_path(plugin):
     """一个公网地址都没有时，别硬编一个假域名出来——给裸路径 + 提示。"""
-    assert plugin._public_base_url() == ""
+    assert plugin.download_link("tok") == "/backup/download/tok"
 
 
 # ---------------------------------------------------------------- 视图层

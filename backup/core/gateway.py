@@ -14,6 +14,7 @@
 - **只认 `/backup/download/<token>`**。其余路径一律 404，不暴露任何目录。
 """
 
+import errno
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -95,6 +96,31 @@ class DownloadGateway:
         self.port = int(port or 0)
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
+        #: 上次 `start()` 失败的原因。`running` 只说「没起来」，这个说「为什么」。
+        #: 宿主重载插件时，旧实例若没被 `terminate()`，新实例绑同一个端口必然失败
+        #: ——而配置里 `enabled` 明明是 true，光看配置会查到错的地方去。
+        self.last_error: str = ""
+
+    def _explain(self, error: OSError) -> str:
+        """把绑定失败翻成一句能照着办的话。
+
+        只有 `EADDRINUSE` 是「端口被占」——那多半是宿主重载插件时旧实例还活着
+        （它的 `terminate()` 没被调到），或者部署里有两个进程配了同一个端口。
+        其余情况（主机名解析不了、端口越界、没权限绑低端口）不是「被占」，
+        混成一句话会让人去查错的那一项。
+
+        端口写 0 时 `self.port` 是「让系统挑」，把它打进这句话毫无意义，所以
+        只打真正想绑的那个端口。
+        """
+        where = f"{self.host}:{self.port}" if self.port else self.host
+        detail = str(error) or type(error).__name__
+        if getattr(error, "errno", None) == errno.EADDRINUSE:
+            return (
+                f"{where} 端口已被占用（{detail}）。"
+                "常见原因：宿主重载插件时旧实例还在（它的 terminate() 没被调到），"
+                "或有两个进程配了同一个 gateway.port"
+            )
+        return f"{where} 绑定失败（{detail}）"
 
     @property
     def running(self) -> bool:
@@ -110,13 +136,17 @@ class DownloadGateway:
         if self._httpd is not None:
             return True
         if self.exports is None:
+            self.last_error = "没有导出管理器，网关无事可做"
             return False
         handler = type("_BoundHandler", (_Handler,), {"exports": self.exports})
         try:
             httpd = ThreadingHTTPServer((self.host, self.port), handler)
         except OSError as e:
-            # 端口被占、地址不合法——都只是「这条链接点不动」，不该让插件起不来
-            logger.warning("下载网关启动失败 %s:%s：%s", self.host, self.port, type(e).__name__)
+            # 端口被占、地址不合法——都只是「这条链接点不动」，不该让插件起不来。
+            # 但要说清是哪一种：`errno` 之外，`str(e)` 里就是系统原话（"Address
+            # already in use"），那是唯一能让人一眼定位的信息，原来被丢掉了。
+            self.last_error = self._explain(e)
+            logger.warning("下载网关启动失败：%s", self.last_error)
             return False
         httpd.daemon_threads = True
         thread = threading.Thread(
@@ -134,6 +164,7 @@ class DownloadGateway:
         httpd, self._httpd = self._httpd, None
         if httpd is None:
             return
+        self.last_error = ""
         try:
             httpd.shutdown()
         except Exception:
