@@ -29,7 +29,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from pathlib import Path
+from datetime import datetime
 
 import pytest
 
@@ -38,7 +38,6 @@ from backup.core.download_route import PREFIX, handle_download
 from backup.core.export_manager import ExportManager
 from backup.core.gateway import DownloadGateway
 from backup.core.models import Message, MessageType
-from datetime import datetime
 
 PAYLOAD = b"PK\x03\x04" + bytes(range(256)) * 400
 
