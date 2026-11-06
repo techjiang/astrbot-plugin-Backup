@@ -1407,3 +1407,95 @@ target = exports.resolve_token(token, shared=partial)   # 片段请求 → 不�
 这轮三处都不是「逻辑写错」，是**承诺与实现相反**：README 说「点得动」，回执说
 「仅一次」，代码两样都没做到。而且两处都有一条用例把错误答案写成断言——**用例绿
 不等于承诺成立，它只等于「代码和用例的假设一致」**。
+
+---
+
+## 第 35 轮：钩子把机器人变成了话痨
+
+验证方式还是第 32 轮那套：装真 `astrbot==4.14.6`，跑真 `WakingCheckStage` /
+`StarRequestSubStage` / `ProcessStage` / `RespondStage`，只把平台出口换成一个
+记账用的替身。这轮撞出来的东西有一个共同点：**它不是新功能的 bug，是上一轮
+修法的副作用**。
+
+### 1. 每一条群消息都换来一句 LLM 回复
+
+第 32 轮为了让钩子被调用，在 `on_message` / `on_notice` 里写了：
+
+```python
+event.is_at_or_wake_command = True
+```
+
+这个标记的语义是宿主的、不是插件的。`ProcessStage` 的逻辑是：
+
+```python
+if activated_handlers:
+    async for resp in self.star_request_sub_stage.process(event):
+        yield
+# 跑完所有 handler 之后，再看这个
+if (
+    not event._has_send_oper
+    and event.is_at_or_wake_command     # ← 钩子刚置的
+    and not event.call_llm
+):
+    async for _ in self.agent_sub_stage.process(event):
+        yield                            # ← 默认 LLM 链路
+```
+
+于是：群里每来一句闲聊 → 钩子归档 → `ProcessStage` 收尾时判定「被唤醒了，回一句」
+→ `AgentRequestSubStage` 真的去问模型 → `RespondStage` 把答案发进群。
+**备份插件成了全群最话痨的成员。**
+
+退群、撤回、戳一戳这些通知更难看：宿主把 notice 也包成事件丢进管道，置真之后
+机器人会对着一条**退群通知**现编一段话发进群。
+
+为什么本地试不出来：`provider_settings.enable` 关掉时这条链路不跑。真部署里它
+默认是开的。
+
+修法：钩子自己把默认 LLM 链路关掉。
+
+```python
+event.should_call_llm(False)
+```
+
+这是宿主为「置真了唤醒标记但不想被 AI 接管」留的口子，语义很死：只挡默认 LLM
+请求，不挡插件自己的调用。
+
+**不能回滚 `is_at_or_wake_command`**：回滚了钩子就进不了 `ProcessStage`，第 32 轮
+那个「钩子从来没被调用过」原样还回来。两个标记必须一真一关。
+
+### 2. 「只写了归档，不回复任何内容」这句 docstring 一直是假的
+
+`on_message` 的注释从第一版就写着「只写库不下载媒体，也不回复任何内容——群聊里
+静默干活」。第 32 轮之前它确实不回复（因为压根没被调用）；第 32 轮之后它被调用了，
+于是每句话都回。**注释是对的，代码不是**，中间隔了两轮没人发现。
+
+这也是这轮真正该记住的一条：第 32 轮把「钩子没被调用」修成「钩子被调用」，
+验收标准只有「`activated` 里有没有 `on_message`」。**「调用成功」不等于「行为正确」**
+——钩子跑起来了，副作用没人看。
+
+### 3. 验证方式
+
+`test_round34_default_llm.py`（7 条，旧代码上 4 条红）：
+
+- 一条群消息跑完真 pipeline：`event.call_llm` 必须是 `False`（钩子关掉了默认
+  LLM），且消息仍然在库里（归档照旧）；
+- 一条 `group_recall` 通知：同上；
+- 反方向：`/backup help` 这种命令仍然被唤醒（钩子只是把标记又置了一遍，不该
+  把命令的唤醒也弄丢）；
+- 契约：`on_message` / `on_notice` 的源码里必须出现 `_silence_default_llm`，
+  且那个 helper 调的是 `should_call_llm(False)`；
+- 老宿主兼容：事件对象上没有 `should_call_llm` 时不抛（「禁不掉」不是「出错」）。
+
+第一版测试写成「`agent_sub_stage` 那个替身有没有被调用」。这个断言**骗人**：
+`ProcessStage` 是洋葱模型，钩子把 `call_llm` 关掉之后，`StarRequestSubStage`
+收尾时还会动一次事件状态，中间的调用顺序和最终落在 event 上的值不是同一件事。
+后来改成直接断言 `event.call_llm` —— 那是钩子唯一真正改动的、也是宿主唯一真正
+读取的那个位。**断言要落在「宿主的判据」上，不是「我搭的替身被调了几次」。**
+
+### 4. 一句总结
+
+第 32 轮修「钩子没被调用」，第 33 轮修「链接点不动」，第 34 轮修「一次性不成立」，
+这一轮的起点是「**上一轮的修法有没有留下副作用**」。三条修法本身都对，但每一条都
+只验了「目标行为出现了」，没验「别的东西有没有跟着变」。宿主那一层是别人写的，
+它的判断条件不会因为插件「只置了一个标记」就放过——**改动一个共享状态位之前，
+先看这个位还被谁读**。

@@ -439,6 +439,24 @@ class BackupPlugin(Star):
         """定时任务入口：没有事件，用全局平台对象。"""
         await self._backup(group_id)
 
+    @staticmethod
+    def _silence_default_llm(event) -> None:
+        """钩子把 `is_at_or_wake_command` 置真之后，得亲手把默认 LLM 链路关掉。
+
+        `ProcessStage` 跑完所有被激活的 handler 之后，只要「没发过消息 + 被唤醒 +
+        没禁 LLM」就接着走 `AgentRequestSubStage`。钩子为了被调用必须置真前两个
+        标记（见上面 ④），于是第三个得由钩子自己关——否则归档一条群消息的代价是
+        机器人回一句话，一条退群/撤回通知也一样。
+
+        `should_call_llm(False)` 是宿主为此留的口子：只挡默认 LLM 请求，不挡插件
+        自己的调用。老宿主/替身上没有这个方法时静默跳过——那是「禁不掉」，不是
+        「必须出错」。
+        """
+        try:
+            event.should_call_llm(False)
+        except Exception:
+            pass
+
     def _note_notice_once(self, event) -> bool:
         """第一次见到这条通知返回 True；重复投递返回 False。
 
@@ -800,6 +818,11 @@ class BackupPlugin(Star):
         # ProcessStage，而真实群聊里没人 @ 机器人也不会敲命令——不补这一行，
         # 钩子只会在注册表里躺着。归档是后台任务，不靠人唤醒。
         event.is_at_or_wake_command = True
+        # 「被唤醒」是宿主的状态位，不只是我们自己的开关。没人 @ 机器人、也没敲
+        # 唤醒词，群友只是正常聊天：这个标记留着 True，`ProcessStage` 结束掉所有
+        # handler 后会接着把这条消息送进默认 LLM 链路——备份插件于是对**每一句
+        # 群聊**插嘴。钩子自己伪造出来的唤醒，得自己关掉。
+        self._silence_default_llm(event)
         try:
             self.hooks.archive_message(event)
         except Exception as e:  # 归档失败不能影响机器人正常聊天
@@ -831,6 +854,10 @@ class BackupPlugin(Star):
         # ProcessStage。通知处理是后台任务，不靠人唤醒。
         event.is_at_or_wake_command = True
         event.is_wake = True
+        # 更要紧的是这里：退群、撤回、戳一戳这些通知宿主也包成事件丢进管道，
+        # 置真唤醒标记后默认 LLM 链路照跑——机器人会对着一条**退群通知**现编一段
+        # 话发进群。
+        self._silence_default_llm(event)
         try:
             await self._handle_notice(event)
         except Exception as e:
