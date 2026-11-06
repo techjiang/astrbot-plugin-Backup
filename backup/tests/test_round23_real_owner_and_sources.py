@@ -237,11 +237,15 @@ class TestFailedBackupSources:
         """
         history = [_raw(f"m{i}") for i in range(60)]
         engine = BackupEngine(db, db.path.parent / "media", {"scope": {"download_media": False}})
+        engine.page_retry_delays = (0, 0, 0)
         platform = _Platform(history, fail_after_first_page=True)
 
         record = await engine.backup_group(100, platform, download_media=False)
 
-        assert record.status.value == "failed"
+        # 第 41 轮把「一页失败 = 整轮 failed」改成了 partial：已经写进库的那 50 条
+        # 是真数据，说 failed 会让人以为一条都没备上、或者以为要重来一遍。
+        assert record.status.value == "partial"
+        assert "已保住前 1 页" in (record.error or "")
         assert db.count_messages(100) == 50  # 第一页整页 PASS_SIZE=50 条
         assert db.count_sources(record.backup_id) == 50
         assert record.message_count == 50
@@ -249,6 +253,7 @@ class TestFailedBackupSources:
     async def test_failure_reason_is_kept(self, db):
         """补登记不能把「为什么失败」盖掉。"""
         engine = BackupEngine(db, db.path.parent / "media", {"scope": {"download_media": False}})
+        engine.page_retry_delays = (0, 0, 0)
         platform = _Platform([_raw(f"m{i}") for i in range(60)], fail_after_first_page=True)
 
         record = await engine.backup_group(100, platform, download_media=False)

@@ -75,7 +75,8 @@ async def test_page_of_already_seen_messages_does_not_end_paging(db, tmp_path):
     record = await engine.backup_group(100, platform, incremental=True, download_media=False)
 
     assert record.status is BackupStatus.COMPLETED
-    assert platform.calls == 3, "120 条 / 每页 50，必须翻满 3 页"
+    # 第 41 轮起不再按「这一页给得少」收工，所以最后会多问一次空页：3 页数据 + 1 次确认
+    assert platform.calls == 4, "120 条 / 每页 50，必须翻满 3 页再确认一次到头"
     assert db.count_messages(100) == 120
     assert {m.message_id for m in db.get_messages(group_id=100)} == {
         f"m{i}" for i in range(120)

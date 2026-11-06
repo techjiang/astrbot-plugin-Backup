@@ -198,7 +198,10 @@ async def test_full_backup_over_real_http_reads_every_message(tmp_path, onebot):
     seqs = [p.get("message_seq") for p in server.history_calls()]
     assert seqs[0] is None
     assert all(seq is not None for seq in seqs[1:])
-    assert len(set(seqs[1:])) == len(seqs[1:])
+    # 前三次各推进一格；最后那次是「按同一个锚点再问一遍」——第 40 轮起不再
+    # 靠「这一页给得少」判到头，必须真拿到空页才算完
+    assert len(set(seqs[1:-1])) == len(seqs[1:-1])
+    assert seqs[-1] == seqs[-2]
 
 
 @pytest.mark.asyncio

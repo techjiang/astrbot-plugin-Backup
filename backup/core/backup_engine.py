@@ -26,6 +26,9 @@ from .verifier import compute_checksum
 logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 50
+#: 单页失败的退避表（秒）。备份是长任务，一页抖掉就整轮作废太亏：500 条的群
+#: 第 5 页断一次，前面 200 条白跑，而下一轮又从头翻一遍。
+PAGE_RETRY_DELAYS = (1, 3, 5)
 
 
 def _raw_id(raw) -> str:
@@ -518,9 +521,11 @@ class PlatformAdapter:
         # 平台而变。有锚点时把 count 一起收进 params 就够了，offset 不再出场。
         if anchor:
             params["message_seq"] = anchor
-        else:
+        elif self._supports("offset"):
             params["offset"] = offset
-        # 适配器自己实现的（有 offset 语义）优先
+        # 既不认 offset 也不给锚点（补齐路径要的第一页）：那就什么都不传，
+        # 等于「给我最新一页」。原来无条件塞 `offset`，只认 `message_seq` 的实现
+        # 判定「无匹配签名」，补齐路径一步都没走出去，整个群报 `failed`、0 条。
         result = await self._call(
             ("get_group_msg_history", "get_group_history", "get_history"), **params
         )
@@ -552,6 +557,40 @@ class BackupEngine:
         )
         self.tracker = IncrementalTracker(db)
         self.last_error: Optional[str] = None
+        #: 单页失败的退避表。做成实例属性，测试里可以置零——否则一条「重试也用尽」
+        #: 的用例要真等 9 秒。
+        self.page_retry_delays = PAGE_RETRY_DELAYS
+
+    # ---------- 内部：一页 + 重试 ----------
+    async def _fetch_page_with_retry(self, adapter, group_id: int, offset: int) -> list:
+        """拉一页，失败退避重试几次；都不行才把异常交给调用方。
+
+        `PAGE_RETRY_DELAYS` 三档（1/3/5 秒）覆盖的是「网络抖一下」「平台那一刻
+        在重启」，不是「平台根本不支持这个接口」。后者重试多少次都一样，所以
+        次数很少、总时长最多 9 秒——备份任务本身跑在后台，用户不会盯着这 9 秒。
+        """
+        delays = tuple(self.page_retry_delays or ())
+        last: Optional[Exception] = None
+        for attempt in range(len(delays) + 1):
+            try:
+                return await adapter.get_group_history(
+                    group_id, count=PAGE_SIZE, offset=offset
+                )
+            except Exception as e:
+                last = e
+                if attempt >= len(delays):
+                    break
+                delay = delays[attempt]
+                logger.warning(
+                    "分页拉取失败，%s 秒后重试 group=%s attempt=%s reason=%s",
+                    delay,
+                    group_id,
+                    attempt + 1,
+                    type(e).__name__,
+                )
+                if delay:
+                    await asyncio.sleep(delay)
+        raise last if last is not None else RuntimeError("page_fetch_failed")
 
     # ---------- 对外主流程 ----------
     async def backup_group(
@@ -680,10 +719,32 @@ class BackupEngine:
             stale_pages = 0
             own_ids: list[str] = []
             owned_seen: list[Message] = []
+            page_error: Optional[str] = None
             while True:
-                batch = await adapter.get_group_history(
-                    group_id, count=PAGE_SIZE, offset=offset
-                )
+                try:
+                    batch = await self._fetch_page_with_retry(adapter, group_id, offset)
+                except Exception as e:
+                    # 一页拉不下来，不等于整轮白跑。已经写进库的那部分是真数据，
+                    # 回执要说清「停在第几页、保住了多少」，状态降到 partial。
+                    # 原来直接冒到外层 except，整轮判 failed：库里躺着 200 条，
+                    # 回执只有一句 `RuntimeError`，用户既不知道丢了多少、也
+                    # 不知道该不该再跑一遍。
+                    #
+                    # 第一页就失败是另一回事：一条都没拿到，没有「保住的部分」
+                    # 可言，交回外层按 failed 处理，错误原话一并留着。
+                    if page == 0 and not collected and not skipped:
+                        raise
+                    page_error = (
+                        f"第 {page + 1} 页拉取失败（{type(e).__name__}），"
+                        f"已保住前 {page} 页"
+                    )
+                    logger.warning(
+                        "备份分页中断 group=%s page=%s reason=%s",
+                        group_id,
+                        page + 1,
+                        type(e).__name__,
+                    )
+                    break
                 if not batch:
                     break
                 # 有些适配器根本不认 offset，每页都回同一批消息。此时库里已经有它们，
@@ -711,6 +772,14 @@ class BackupEngine:
                 # 平台过滤掉一部分（撤回/系统消息不计入）时，按页码算会整段跳过，
                 # 那些消息永远不会被备份，而备份报成功
                 offset += len(batch)
+                # 一页一次事务。逐行提交时每行都要 fsync 一遍（`journal_mode=
+                # DELETE` + `synchronous=FULL`），3000 条 21 秒、2 万条近 3 分钟；
+                # 按页成批之后同一批数据 0.5 秒。断在一页中间就整页回滚，库里
+                # 永远是「整页的整数倍」，下一轮从断点接着翻。
+                #
+                # 注意**媒体下载在事务外**：`await` 期间事件循环会把别的协程切
+                # 进来，它们顺着可重入锁进到同一个事务里，一起提交或一起回滚。
+                pending: list[Message] = []
                 for raw in fresh:
                     msg = parse_message(raw, group_id)
                     if self.db.message_exists(msg.message_id, group_id):
@@ -730,25 +799,28 @@ class BackupEngine:
                         ok, bad = await self._download_media(msg)
                         record.media_count += ok
                         failed_media += bad
-                    self.db.save_message(msg, record.backup_id)
-                    record.message_count += 1
-                    collected.append(msg)
+                    pending.append(msg)
+                saved: list[Message] = []
+                with self.db.batch():
+                    for msg in pending:
+                        self.db.save_message(msg, record.backup_id)
+                        saved.append(msg)
+                # 提交成功之后才计入 `collected`：整页回滚时这几条其实不在库里，
+                # 提前记进去会让失败分支的「补登记来源清单」写进一批影子行
+                collected.extend(saved)
+                record.message_count += len(saved)
                 page += 1
                 if progress_callback:
                     await progress_callback(record.message_count)
-                # 只按「平台吐回来多少」判断翻页到头是错的：适配器不认 count、每页
-                # 固定给 30 条时，第一页就小于 PAGE_SIZE，循环当场退出，剩下 3 倍
-                # 的消息一条没备，备份还报 completed。低于半页才算到头（正常的最后
-                # 一页），否则继续要下一页。
+                # 翻到底的判据只有两条：**平台回空页**，或者**连续两页翻不出
+                # 新东西**（上面那个 `stale_pages`）。「这一页给得少」不能当判据。
                 #
-                # 分两种情况是因为「不足半页」本身不总等于到底：给了锚点之后
-                # （OneBot 的 `message_seq` 语义是「从这条往回数 count 条」），平台
-                # 返回得比 PAGE_SIZE 少就是真的没了；而没有锚点的 offset 翻页里，
-                # 平台照样可能每页只给固定条数（不认 count），这时按「给得少」判定
-                # 会漏掉后面所有页。收工兜底始终是「翻过的消息集合」——平台既不认
-                # count 也不认 offset 时，靠它停下来，不会死循环。
-                if len(batch) < PAGE_SIZE // 2:
-                    break
+                # 第 31 轮把 `len(batch) < PAGE_SIZE` 放宽成 `< PAGE_SIZE // 2`，
+                # 只解决了「每页 30 条」；平台封顶 20 条时（要 50 给 20，很多
+                # 实现就是这样）第一页 20 < 25，当场收工——120 条的群备到 20 条，
+                # 状态 `completed`。这类「半页」判据永远只是把阈值挪一挪，而平台
+                # 的封顶值可以比任何固定阈值都小。多问一次空页的代价是一次请求，
+                # 少问一次的代价是一整段历史永久缺失，且没人知道。
 
             # 6. 来源清单 + 快照
             # 来源清单和归属是两回事：归属会被后续备份接手，这里记的不会。
@@ -797,6 +869,11 @@ class BackupEngine:
             notes = []
             if failed_media:
                 notes.append(f"{failed_media} 个媒体文件下载失败")
+            if page_error:
+                # 分页中断也是 partial：已经拿到的是真数据，剩下的下一轮从断点
+                # 继续（增量只看「库里有没有」，不认水位）
+                record.status = BackupStatus.PARTIAL
+                notes.insert(0, page_error)
             if auxiliary_errors:
                 notes.append("；".join(auxiliary_errors) + "拉取失败，沿用上次快照")
             # 历史消息接口一次都没调通：这条不能报 completed。空群和「接口根本

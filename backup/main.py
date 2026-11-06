@@ -353,6 +353,18 @@ class BackupPlugin(Star):
         )
         self.storage = storage
         self.db = Database(storage / "db" / "backup.sqlite")
+        # 上一次进程死在备份中途时，库里会留下一条永远 `running` 的记录：列表里
+        # 看着像还在跑，恢复被「状态为 running，不可恢复」挡回去，而它其实
+        # 已经保住了上千条消息。启动时把「开跑时刻早于本次启动」的那些收成
+        # partial 并登记来源清单（见 `Database.reconcile_stale_records`）。
+        # 宽限两分钟：`__init__` 与第一条命令之间正常就差几秒，把阈值卡在
+        # 「现在」反而会把别处正在跑的那一轮误伤。
+        try:
+            stale = self.db.reconcile_stale_records(datetime.now() - timedelta(minutes=2))
+            if stale:
+                logger.warning("收编 %s 条中断的备份记录（宿主重启/进程退出）", stale)
+        except Exception as e:  # 修不了旧记录也不能让插件起不来
+            logger.warning("收编中断备份记录失败：%s", type(e).__name__)
         self.engine = BackupEngine(self.db, storage / "media", self.config)
         self.exports = ExportManager(
             self.db,

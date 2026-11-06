@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Optional
@@ -459,12 +460,103 @@ class Database:
         # 用 RLock 而不是 Lock：`save_message` 这类方法会嵌套调 `query_one` /
         # `execute`，不可重入会自己把自己锁死。
         self._lock = threading.RLock()
+        #: 事务深度。>0 表示正处在 `batch()` 里，`execute` 只写不提交。
+        self._tx_depth = 0
+        # 关掉 sqlite3 模块的**隐式**事务管理：它会在每条 DML 前自动 BEGIN，
+        # 于是我们自己的 `BEGIN` 撞上「cannot start a transaction within a
+        # transaction」。关掉之后每条语句各自生效，事务边界完全由这里决定。
+        self._conn.isolation_level = None
+        self._tune()
         self._conn.executescript(SCHEMA)
-        self._conn.commit()
+        self._commit()
         _migrate_messages_unique(self._conn)
         _migrate_media_unique(self._conn)
         _migrate_record_columns(self._conn)
         _migrate_token_columns(self._conn)
+
+    def _tune(self) -> None:
+        """改掉几个让「每行一次提交」变成电磨的默认值。
+
+        SQLite 默认 `journal_mode=DELETE` + `synchronous=FULL`：**每一次**
+        `commit()` 都要 fsync 一次日志文件和一次主库文件。备份走的是「一条消息
+        一次 `save_message`」，于是每个群的历史消息都要按「条数 × 2 次 fsync」
+        付账——3000 条 21 秒、2 万条 175 秒（约 114 条/秒），大群备份半小时都
+        跑不完，期间还把 `Database` 的锁攥在手里。
+
+        换成 WAL + `synchronous=NORMAL`：
+        - WAL 把随机写变成顺序追加，提交不重写主库；
+        - NORMAL 在 WAL 下**不会损坏数据库**，最坏情况是断电丢掉最近若干个
+          已提交事务（这里是「最近一页消息」，因为写库按页成批）。
+        对一个备份插件来说，「断电丢最后一页」远好过「跑不完、或者跑的时候
+        机器人卡住」。真要逐条 fsync 的原子性，代价是这个插件在 2000 人群上
+        不可用。
+
+        `PRAGMA` 失败不抛：换成只读目录、网络文件系统（WAL 需要共享内存）、
+        或者别的引擎实现时，退回默认值也要能跑，只是慢。
+        """
+        for pragma in (
+            "PRAGMA journal_mode=WAL",
+            "PRAGMA synchronous=NORMAL",
+            # 页缓存给足：排序/翻页查询都在这条连接上跑
+            "PRAGMA cache_size=-16000",
+            "PRAGMA busy_timeout=5000",
+        ):
+            try:
+                self._conn.execute(pragma)
+            except sqlite3.Error:
+                pass
+
+    def _commit(self) -> None:
+        """提交。收敛成一个方法，是为了让「一页一次提交」这件事可被数清楚。"""
+        self._conn.commit()
+
+    @contextmanager
+    def batch(self):
+        """一次事务写多行。
+
+        备份主流程每处理完一页消息就进一次：一页 50 条只提交一次，断在一页中间
+        就整页回滚——库里的东西永远是「整页的整数倍」，下一轮从上次的断点接着
+        翻，不会出现「这页写了一半、那半截永远进不来」。
+
+        嵌套调用安全（内层只加计数，不重复 BEGIN）。异常一律 rollback 后再抛：
+        回滚范围就是这一页，不能把前面几页已经提交的数据一起带走。
+
+        两点约束，都是「一条连接」逼出来的：
+
+        - **块里不能有 `await`**。锁是 `RLock`，同一线程可重入；事件循环在
+          `await` 处切走之后，另一个协程的写会顺着可重入锁进到这个事务里，
+          一起提交、一起回滚。所以网络 I/O（下媒体）必须在进块之前做完。
+        - 整块持锁。SQLite 的事务是**连接级**的：网关线程此刻
+          `commit()` 一次，就会把这个还没写完的页提前提交掉。持锁期间它进不来。
+        """
+        with self._lock:
+            if self._tx_depth:
+                self._tx_depth += 1
+                try:
+                    yield self
+                finally:
+                    self._tx_depth -= 1
+                return
+            self._tx_depth = 1
+            # `isolation_level = None` 是**自动提交**模式：不显式 BEGIN 的话每条
+            # 语句各自落盘，「一页一次事务」变成一句空话——写入不会更快，出错也
+            # 不会回滚（实测：一页写到一半抛错，前 19 条留在库里）。
+            try:
+                self._conn.execute("BEGIN")
+            except sqlite3.Error:
+                # 已经处在事务里（迁移脚本、外部调用方）就顺着用，不另起一个
+                pass
+            try:
+                yield self
+            except BaseException:
+                try:
+                    self._conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+            finally:
+                self._tx_depth = 0
+            self._commit()
 
     def close(self) -> None:
         with self._lock:
@@ -474,7 +566,8 @@ class Database:
     def execute(self, sql: str, params: Iterable = ()):
         with self._lock:
             cur = self._conn.execute(sql, tuple(params))
-            self._conn.commit()
+            if not self._tx_depth:
+                self._commit()
             return cur
 
     def query(self, sql: str, params: Iterable = ()) -> list[sqlite3.Row]:
@@ -494,8 +587,8 @@ class Database:
             return 0
         with self._lock:
             cur = self._conn.executemany(sql, payload)
-            if commit:
-                self._conn.commit()
+            if commit and not self._tx_depth:
+                self._commit()
             return cur.rowcount
 
     def query_one(self, sql: str, params: Iterable = ()) -> Optional[sqlite3.Row]:
@@ -654,18 +747,23 @@ class Database:
             return 0
         orphans = [r["message_id"] for r in rows if r["backup_id"] != REALTIME_BACKUP_ID]
         realtime = [r["message_id"] for r in rows if r["backup_id"] == REALTIME_BACKUP_ID]
-        if orphans:
+        # 一个事务：改归属和登记清单要么都成，要么都不成。原来靠「前一条
+        # commit=False、后一条顺手提交」拼在一起；连接改成显式事务之后，这种
+        # 隐式拼合不存在了，得自己说清楚
+        with self.batch():
+            if orphans:
+                self.executemany(
+                    "UPDATE messages SET backup_id = ? WHERE group_id = ? AND message_id = ?",
+                    [(backup_id, group_id, mid) for mid in orphans],
+                    commit=False,
+                )
+            # 登记来源清单对两种行都做：这份备份确实覆盖到了它们。实时归档只是不改归属
             self.executemany(
-                "UPDATE messages SET backup_id = ? WHERE group_id = ? AND message_id = ?",
-                [(backup_id, group_id, mid) for mid in orphans],
+                """INSERT OR IGNORE INTO backup_sources (backup_id, group_id, message_id)
+                   VALUES (?,?,?)""",
+                [(backup_id, group_id, mid) for mid in orphans + realtime],
                 commit=False,
             )
-        # 登记来源清单对两种行都做：这份备份确实覆盖到了它们。实时归档只是不改归属
-        self.executemany(
-            """INSERT OR IGNORE INTO backup_sources (backup_id, group_id, message_id)
-               VALUES (?,?,?)""",
-            [(backup_id, group_id, mid) for mid in orphans + realtime],
-        )
         return len(orphans) + len(realtime)
 
     def count_realtime_only(self, group_id: int, backup_id: Optional[str] = None) -> int:
@@ -1304,6 +1402,65 @@ class Database:
             )
             for r in rows
         ]
+
+    # ---------- 僵尸记录 ----------
+    def reconcile_stale_records(self, cutoff) -> int:
+        """把「跑到一半就没了」的 `running` 记录收成 partial。
+
+        记录的生命周期是「开跑先写一条 running → 跑完改状态」。宿主重启、插件
+        重载、容器被 kill 都会让进程死在这两步中间，于是库里留下一条永远
+        `running` 的记录：
+
+        - `/backup list` 里它一直挂在那儿，看起来像「备份还在跑」，其实早没了；
+        - `/backup status` 按 `latest_completed_record` 找实绩，找不到它；
+        - 恢复被 `verify_backup` 用「状态为 running，不可恢复」挡回去——而它
+          其实已经把上千条消息写进库了，只是没来得及改状态。
+
+        这里只动 `started_at < cutoff` 的那些。`cutoff` 由调用方给（插件启动
+        时刻，或「半小时前」这种宽限），不能写成「所有 running 都降级」——
+        正在跑的那一轮会被别的协程踩掉。
+
+        降级时顺手把「归属这条记录的消息」登记进来源清单：没有清单，导出和
+        恢复都按来源取数，一条也取不出来，降级等于白降。
+        """
+        rows = self.query(
+            "SELECT backup_id, group_id FROM backup_records WHERE status = ? AND started_at < ?",
+            (BackupStatus.RUNNING.value, to_db(cutoff)),
+        )
+        if not rows:
+            return 0
+        fixed = 0
+        for row in rows:
+            backup_id = str(row["backup_id"])
+            group_id = int(row["group_id"])
+            # 条数可能上万，不能拼成 `IN (?,?,…)` 再传参：SQLite 的变量上限
+            # 默认 999（老版本）/32766，2 万条直接 `too many SQL variables`。
+            # 用 INSERT ... SELECT 让过滤在库里做，一个参数都不用传
+            with self.batch():
+                self.execute(
+                    """INSERT OR IGNORE INTO backup_sources (backup_id, group_id, message_id)
+                       SELECT ?, group_id, message_id FROM messages
+                       WHERE backup_id = ? AND group_id = ?""",
+                    (backup_id, backup_id, group_id),
+                )
+                # 条数按来源清单数，不按刚才插入的行数：清单里可能早就有几行
+                # （这条记录之前被部分收编过），再插一遍是 0 行，但覆盖量不是 0
+                covered = self.count_sources(backup_id)
+                self.execute(
+                    """UPDATE backup_records
+                       SET status = ?, message_count = ?, finished_at = ?,
+                           error = COALESCE(NULLIF(error, ''), ?)
+                       WHERE backup_id = ?""",
+                    (
+                        BackupStatus.PARTIAL.value,
+                        covered,
+                        to_db(datetime.now()),
+                        "备份过程中断（宿主重启或进程退出），已保住当时入库的消息",
+                        backup_id,
+                    ),
+                )
+            fixed += 1
+        return fixed
 
     # ---------- 保留策略 ----------
     def prune_records(
