@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -268,7 +269,9 @@ def _migrate_token_columns(conn) -> None:
     `no such column` —— 每次下载都 500，而备份本身看不出问题。
     """
     cols = {row["name"] for row in conn.execute("PRAGMA table_info('download_tokens')")}
-    if cols and "opened_at" not in cols:
+    if not cols:
+        return
+    if "opened_at" not in cols:
         conn.execute("ALTER TABLE download_tokens ADD COLUMN opened_at REAL")
         conn.commit()
 
@@ -446,6 +449,16 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # 一把锁护住这**一条**连接。`check_same_thread=False` 只是「不拦你」，
+        # 不是「允许多线程同时用」：连接内部有事务状态，两个线程交错
+        # `execute` / `commit` 会得到 `cannot start a transaction within a
+        # transaction`、`cannot commit - no transaction is active`，重则
+        # `SystemError: error return without exception set`。
+        # 这里不是理论风险——下载网关是 `ThreadingHTTPServer`，每个请求一个线程，
+        # 而备份主流程跑在事件循环里，两边共用同一个 Database 对象。
+        # 用 RLock 而不是 Lock：`save_message` 这类方法会嵌套调 `query_one` /
+        # `execute`，不可重入会自己把自己锁死。
+        self._lock = threading.RLock()
         self._conn.executescript(SCHEMA)
         self._conn.commit()
         _migrate_messages_unique(self._conn)
@@ -454,16 +467,36 @@ class Database:
         _migrate_token_columns(self._conn)
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     # ---------- 通用 ----------
     def execute(self, sql: str, params: Iterable = ()):
-        cur = self._conn.execute(sql, tuple(params))
-        self._conn.commit()
-        return cur
+        with self._lock:
+            cur = self._conn.execute(sql, tuple(params))
+            self._conn.commit()
+            return cur
 
     def query(self, sql: str, params: Iterable = ()) -> list[sqlite3.Row]:
-        return self._conn.execute(sql, tuple(params)).fetchall()
+        with self._lock:
+            return self._conn.execute(sql, tuple(params)).fetchall()
+
+    def executemany(self, sql: str, rows: Iterable, *, commit: bool = True) -> int:
+        """批量写。`commit=False` 时把提交留给调用方，用于「一次事务写多张表」。
+
+        这些方法原先直接摸 `self._conn`——**绕过了锁**。下载网关是
+        `ThreadingHTTPServer`，`add_sources` / `adopt_orphans` 这类批量写正好和
+        请求线程里的 token 兑换撞在一起，于是 `executemany` 写一半、另一个线程
+        的 `commit` 把它的未提交事务一起提交或回滚掉。
+        """
+        payload = list(rows)
+        if not payload:
+            return 0
+        with self._lock:
+            cur = self._conn.executemany(sql, payload)
+            if commit:
+                self._conn.commit()
+            return cur.rowcount
 
     def query_one(self, sql: str, params: Iterable = ()) -> Optional[sqlite3.Row]:
         rows = self.query(sql, params)
@@ -548,14 +581,11 @@ class Database:
             for m in messages
             if m is not None and m.message_id
         ]
-        if not rows:
-            return
-        self._conn.executemany(
+        self.executemany(
             """INSERT OR IGNORE INTO backup_sources (backup_id, group_id, message_id)
                VALUES (?,?,?)""",
             rows,
         )
-        self._conn.commit()
 
     def get_source_messages(self, backup_id: str, group_id: Optional[int] = None) -> list[Message]:
         """按来源表取这次备份覆盖的消息。`group_id` 为空则取全部群。
@@ -625,17 +655,17 @@ class Database:
         orphans = [r["message_id"] for r in rows if r["backup_id"] != REALTIME_BACKUP_ID]
         realtime = [r["message_id"] for r in rows if r["backup_id"] == REALTIME_BACKUP_ID]
         if orphans:
-            self._conn.executemany(
+            self.executemany(
                 "UPDATE messages SET backup_id = ? WHERE group_id = ? AND message_id = ?",
                 [(backup_id, group_id, mid) for mid in orphans],
+                commit=False,
             )
         # 登记来源清单对两种行都做：这份备份确实覆盖到了它们。实时归档只是不改归属
-        self._conn.executemany(
+        self.executemany(
             """INSERT OR IGNORE INTO backup_sources (backup_id, group_id, message_id)
                VALUES (?,?,?)""",
             [(backup_id, group_id, mid) for mid in orphans + realtime],
         )
-        self._conn.commit()
         return len(orphans) + len(realtime)
 
     def count_realtime_only(self, group_id: int, backup_id: Optional[str] = None) -> int:
@@ -1420,14 +1450,12 @@ class Database:
             )
             for a in items or []
         ]
-        if rows:
-            self._conn.executemany(
-                """INSERT OR IGNORE INTO group_announcements
-                   (group_id, content, sender_id, sender_name, published_at, raw_content, synced_at)
-                   VALUES (?,?,?,?,?,?,?)""",
-                rows,
-            )
-            self._conn.commit()
+        self.executemany(
+            """INSERT OR IGNORE INTO group_announcements
+               (group_id, content, sender_id, sender_name, published_at, raw_content, synced_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            rows,
+        )
         return len(rows)
 
     def get_announcements(self, group_id: int) -> list[dict]:
@@ -1468,15 +1496,13 @@ class Database:
             for f in items or []
             if (f.get("file_id") or f.get("name"))
         ]
-        if rows:
-            self._conn.executemany(
-                """INSERT OR REPLACE INTO group_files
-                   (group_id, file_id, name, size, busid, upload_time,
-                    uploader_id, uploader_name, raw_content, synced_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                rows,
-            )
-            self._conn.commit()
+        self.executemany(
+            """INSERT OR REPLACE INTO group_files
+               (group_id, file_id, name, size, busid, upload_time,
+                uploader_id, uploader_name, raw_content, synced_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            rows,
+        )
         row = self.query_one(
             "SELECT COUNT(*) AS c FROM group_files WHERE group_id = ?", (group_id,)
         )
@@ -1523,6 +1549,72 @@ class Database:
             (token,),
         )
 
+    def peek_token(self, token: str) -> Optional[sqlite3.Row]:
+        """只看一眼 token 行，不占名额。用于「先算出这次请求要交付多少字节」。"""
+        if not token:
+            return None
+        return self.query_one(
+            "SELECT token, path, expires, opened_at FROM download_tokens WHERE token = ?",
+            (token,),
+        )
+
+    def redeem_token(
+        self, token: str, now: float, grace: float, full: bool
+    ) -> Optional[sqlite3.Row]:
+        """兑换一次下载，返回 token 行；返回 None 表示该拒（410）。**整段在一把锁里。**
+
+        两件事：
+
+        - **`full=True`（这次把整个文件交出去）：`DELETE` 就是抢占。** 一条
+          `DELETE ... WHERE token = ?` 只可能有一个赢家（`rowcount == 1`），其余
+          全部拿不到行。这条是「仅可使用一次」的实质：链接转发进另一个群，
+          第二个人点开就是一次整份 GET，当场 410——不用等窗口过期。
+        - **`full=False`（片段续传）：只刷新开头时间。** 浏览器/下载器一定先探
+          一刀再续传，两次都是片段。把它们当成「已经领走一份」，用户看到的就是
+          「下到一半断了」。片段受 `grace` 会话窗口约束，超窗口即作废。
+
+        为什么「整份」不能用「取到的字节数够不够整个文件」判：`Range: bytes=0-`
+        交付的字节数和整份一样多，但它是**分段下载的第一个动作**，后面还会跟
+        续传。按字节数判，就会把正当的续传链条掐断。
+
+        为什么必须收进一把锁：原来是 `has_been_opened` 查、`open_token` 写、
+        `resolve_token` 删，三次各自加锁。两个线程同时点同一条链接，能一步一步
+        交错着全通过——两个整份 GET 各自 `DELETE` 都报成功（一个删 1 行、一个删
+        0 行但没人看 `rowcount`），两个人一起把文件下走。而网关是
+        `ThreadingHTTPServer`，链接被转发进大群时并发是常态，不是意外。
+        """
+        if not token:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT token, path, expires, opened_at FROM download_tokens WHERE token = ?",
+                (token,),
+            ).fetchone()
+            if row is None:
+                return None
+            if float(row["expires"]) < now:
+                self._conn.execute("DELETE FROM download_tokens WHERE token = ?", (token,))
+                self._conn.commit()
+                return None
+            opened = row["opened_at"]
+            if opened is not None and now - float(opened) > grace:
+                # 会话窗口之外：这条链接早该作废，来的是第二个人
+                self._conn.execute("DELETE FROM download_tokens WHERE token = ?", (token,))
+                self._conn.commit()
+                return None
+            if full:
+                claimed = self._conn.execute(
+                    "DELETE FROM download_tokens WHERE token = ?", (token,)
+                ).rowcount
+                self._conn.commit()
+                return row if claimed == 1 else None
+            if opened is None:
+                self._conn.execute(
+                    "UPDATE download_tokens SET opened_at = ? WHERE token = ?", (now, token)
+                )
+            self._conn.commit()
+            return row
+
     def open_token(self, token: str, now: Optional[float] = None) -> None:
         """记下「第一次兑换」的时刻。已经有值就不动——后续片段不算新的开头。"""
         self.execute(
@@ -1531,16 +1623,12 @@ class Database:
         )
 
     def has_been_opened(self, token: str, now: Optional[float] = None, grace: float = 0.0) -> bool:
-        """这条 token 有没有**别人**先领过（`grace` 秒内算同一次下载的开头）。
+        """这条 token 有没有被碰过、且已经超出 `grace` 会话窗口。
 
-        原来是「整份取走就删 token」，于是拿不到任何「领过」的痕迹：_Range_
-        片段请求必须在整份取走之前到达（浏览器先探测再续传），而续传请求同样
-        过 `open_token` 这一关——两件事互斥，只能二选一：
-
-        - 片段不删 token（为了让续传过得去）→ 链接被转发后第二个人照样能整份下载；
-        - 片段删 token（为了「仅一次」）→ 探测之后真正的续传全是 410。
-
-        守住的必须是「仅可使用一次」这句承诺，所以改成记 `opened_at`。
+        只作**观测**用（测试与排障）。判定路径已经收进 `redeem_token`——那里
+        一把锁里既看窗口也抢名额。原来这个方法承担判定职责，而它和
+        `open_token`、`delete_token` 是三次独立加锁的调用，两个并发请求能
+        交错着全通过。
         """
         row = self.get_token(token)
         opened = row["opened_at"] if row is not None else None

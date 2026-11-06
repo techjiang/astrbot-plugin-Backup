@@ -43,13 +43,28 @@ class _Handler(BaseHTTPRequestHandler):
         # 不该留在日志里——这里只记状态码。
         logger.debug("下载网关 %s", fmt % args)
 
-    def _reply(self, response: DownloadResponse) -> None:
+    def _write_head(self, response: DownloadResponse) -> None:
+        """只发状态行和头。**Content-Length 只能有一个**。
+
+        原来 HEAD 这条路上 `response.headers` 里已经带了 `Content-Length: <文件
+        大小>`（`handle_download` 填的），这里又补一句 `Content-Length: 0`
+        （因为 HEAD 不发 body，`response.body` 是空的）。两个同名头一起发出去，
+        `http.client` 把它读成 `"102404, 0"`，`urllib` 直接
+        `InvalidURL`/`IncompleteRead`；某些下载器按第二个 0 字节理解，存出一个
+        0 字节的 ZIP 然后报「文件损坏」。
+        """
         self.send_response(response.status)
         for name, value in response.headers.items():
             self.send_header(name, value)
-        if not response.headers.get("Content-Length") and response.file is None:
-            self.send_header("Content-Length", str(len(response.body)))
+        if "Content-Length" not in {k.title() for k in response.headers}:
+            self.send_header(
+                "Content-Length",
+                str(len(response.body)) if response.file is None else str(0),
+            )
         self.end_headers()
+
+    def _reply(self, response: DownloadResponse) -> None:
+        self._write_head(response)
         try:
             for chunk in response.iter_chunks():
                 self.wfile.write(chunk)
@@ -58,31 +73,28 @@ class _Handler(BaseHTTPRequestHandler):
             pass
 
     def do_HEAD(self):  # noqa: N802 - BaseHTTPRequestHandler 的约定
-        self._respond(body=False)
+        self._respond(head=True)
 
     def do_GET(self):  # noqa: N802
         self._respond()
 
-    def _respond(self, body: bool = True) -> None:
+    def _respond(self, head: bool = False) -> None:
         try:
             response = handle_download(
                 self.path,
                 self.exports,
                 self.headers.get("Range") if self.headers else None,
+                head=head,
             )
         except Exception as e:  # 网关是最外层，任何异常都得变成一句话
-            logger.warning("下载网关处理失败：%s", type(e).__name__)
+            logger.warning("下载网关处理失败：%s: %s", type(e).__name__, e)
             response = DownloadResponse(
                 status=500,
                 body=b"internal error",
                 headers={"Content-Type": "text/plain; charset=utf-8"},
             )
-        if not body:
-            self.send_response(response.status)
-            for name, value in response.headers.items():
-                self.send_header(name, value)
-            self.send_header("Content-Length", str(len(response.body) or 0))
-            self.end_headers()
+        if head:
+            self._write_head(response)
             return
         self._reply(response)
 

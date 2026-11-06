@@ -70,32 +70,81 @@ def _error(status: int, message: str) -> DownloadResponse:
     )
 
 
-def _parse_range(header: Optional[str], total: int) -> Optional[tuple[int, int]]:
-    """解析 `Range: bytes=start-end`。只认单段、绝对偏移；不合法返回 None（按整份发）。"""
-    if not header or not header.lower().startswith("bytes="):
-        return None
-    spec = header[6:].strip().split(",")[0].strip()
-    if not spec or spec.startswith("-"):
-        return None  # 后缀区间（bytes=-500）对 ZIP 没意义，忽略
+#: `_parse_range` 的三种结局。原来只有「有区间 / 没区间」两种，把
+#: 「语法就不合法」和「语法对但要不到」混成了同一件事，于是两件事的回执也混了。
+RANGE_NONE = "none"          #: 没有 Range，或语法不认：按整份发 200
+RANGE_OK = "ok"              #: 能给的区间，回 206
+RANGE_UNSATISFIABLE = "no"   #: 语法对但整段在文件之外，回 416
+
+
+def _parse_range(header: Optional[str], total: int) -> tuple[str, Optional[tuple[int, int]]]:
+    """解析 `Range: bytes=...`，返回 (结局, (start, length) 或 None)。
+
+    RFC 7233 把两件事分得很开，这里跟着分：
+
+    - **语法不认 → 忽略 Range，回 200 整份**。原来一律回 416，于是下载器发一个
+      花哨的 Range（多段、带空格、`bytes=x`）就被判成「要不到」，用户看到的是
+      「下载失败」——文件其实好好躺着。
+    - **语法对但要不到（start >= 文件长度）→ 416**，这是真·不可满足。
+
+    后缀区间 `bytes=-500` 现在是**认**的（取末尾 500 字节）。原来那句注释写
+    「对 ZIP 没意义，忽略」——而忽略的后果是 416：断点续传工具（IDM、aria2）
+    探测文件大小时发的就是后缀区间，一眼看不出是它把下载搞挂的。
+    """
+    if not header or not str(header).strip().lower().startswith("bytes="):
+        return RANGE_NONE, None
+    parts = [p.strip() for p in str(header)[6:].split(",") if p.strip()]
+    if not parts:
+        return RANGE_NONE, None
+    if len(parts) > 1:
+        # 多段区间要回 `multipart/byteranges`。这里不回半截冒充完整——按 RFC 7233
+        # 「服务端可无视 Range」处理，整份发 200，客户端自己决定怎么切
+        return RANGE_NONE, None
+    spec = parts[0]
+    if "-" not in spec:
+        return RANGE_NONE, None
     start_s, _, end_s = spec.partition("-")
-    if not start_s.isdigit():
-        return None
+    start_s, end_s = start_s.strip(), end_s.strip()
+    if not start_s:
+        # `bytes=-N`：末尾 N 字节。N 为 0 是「要空的一段」，按不可满足处理
+        if not end_s.isdigit():
+            return RANGE_NONE, None
+        suffix = int(end_s)
+        if suffix <= 0 or total <= 0:
+            return RANGE_UNSATISFIABLE, None
+        start = max(total - suffix, 0)
+        return RANGE_OK, (start, total - start)
+    if not start_s.isdigit() or (end_s and not end_s.isdigit()):
+        return RANGE_NONE, None
     start = int(start_s)
     if start >= total:
-        return None
-    end = int(end_s) if end_s.isdigit() else total - 1
+        return RANGE_UNSATISFIABLE, None
+    end = int(end_s) if end_s else total - 1
     end = min(end, total - 1)
     if end < start:
-        return None
-    return start, end - start + 1
+        return RANGE_UNSATISFIABLE, None
+    return RANGE_OK, (start, end - start + 1)
 
 
-def handle_download(path: str, exports, range_header: Optional[str] = None) -> DownloadResponse:
+def handle_download(
+    path: str,
+    exports,
+    range_header: Optional[str] = None,
+    head: bool = False,
+) -> DownloadResponse:
     """处理一次下载请求。expires 由 exports.resolve_token 判定，token 一次性。
 
     状态码：404 无 token/文件不存在，410 已过期，416 区间不可满足。
     链接是分享给群成员点的，浏览器下载大文件时常常先发一个 Range 探测、再续传，
     所以这里必须回 206：回不了续传，用户拿到的是断掉的半个 ZIP。
+
+    `head=True` 表示这次是 HEAD：**只问元信息，不领走文件**。
+
+    HEAD 原来和 GET 走同一条路，于是把 token 一起烧掉了。这不是边角场景——
+    链接预览（微信、QQ、Telegram 抓取卡片）、下载器先探大小、浏览器的
+    「另存为」对话框都先发 HEAD。发完一次 HEAD，群成员真正点开就是
+    「链接已失效或已被使用」，而链接从头到尾只有一个人点过。一次性是给
+    「把文件领走」这件事的，不是给「问一句这文件多大」的。
     """
     if not path:
         return _error(404, "not found")
@@ -113,25 +162,65 @@ def handle_download(path: str, exports, range_header: Optional[str] = None) -> D
     if not token:
         return _error(404, "not found")
 
-    # token 一次性，但「一次性」指的是**只能被领走一次**，不是「只准发一个请求」：
-    # 浏览器下载大文件一定先发 `Range: bytes=0-` 探测再续传，那是两次请求。
-    #
-    # 原来把「一次性」落在「整份请求才删 token」上，于是和续传天然互斥：
-    # 探测、续传都是片段请求，谁都不删 token——链接转发进另一个群，第二个人照样
-    # 能整份下载，「仅可使用一次」在回执里写着、在代码里不成立。
-    #
-    # 现在按「**第一次**兑换」记时间戳：同一个 token 只有第一个请求能开头，
-    # 之后的请求必须在 GRACE_SECONDS 窗口内（同一次下载的后续片段）。
-    # 超窗口 = 第二个人，410。
-    partial = bool(range_header)
-    if not exports.open_token(token):
-        return _error(410, "链接已失效或已被使用")
-    target = exports.resolve_token(token, shared=partial)
+    target = exports.lookup_token(token)
     if target is None:
         return _error(410, "链接已失效或不存在")
+    total = target.stat().st_size
 
-    stat = target.stat()
-    total = stat.st_size
+    if head:
+        # **HEAD 只问元信息，不占名额。** 链接预览（微信/QQ/Telegram 抓卡片）、
+        # 下载器探大小、浏览器「另存为」都先发 HEAD。原来和 GET 走同一条路，
+        # token 当场被删，群成员真正点开就是「已失效」——而链接只有一个人点过。
+        return DownloadResponse(
+            status=200,
+            headers={
+                "Content-Type": content_type_for(target),
+                "Content-Disposition": f'attachment; filename="{target.name}"',
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(total),
+            },
+        )
+
+    outcome, span = _parse_range(range_header, total)
+    if outcome == RANGE_UNSATISFIABLE:
+        # 语法对但要不到。带上 `bytes */<总长>`，客户端据此重新对齐——
+        # 少这一行，下载器只会说「不支持断点续传」然后从 0 重来
+        return DownloadResponse(
+            status=416,
+            body=b"range not satisfiable",
+            headers={
+                "Content-Type": "text/plain; charset=utf-8",
+                "Cache-Control": "no-store",
+                "Accept-Ranges": "bytes",
+                "Content-Range": f"bytes */{total}",
+                "Content-Length": str(len(b"range not satisfiable")),
+            },
+        )
+
+    if outcome == RANGE_NONE:
+        start, length = 0, total
+    else:
+        start, length = span
+
+    # 「仅可使用一次」的实质是「**整份文件只能被交出去一次**」。判据看这次请求
+    # 会不会把整个文件发走，但不用「取到的字节数够不够整个文件」——`Range:
+    # bytes=0-` 交付的字节数一样多，可它在协议里是**分段下载的第一个动作**，
+    # 后面还会跟续传；按字节数判会把正当的续传链条掐断。
+    #
+    # 所以：不带 Range 的请求 = 「点开链接领走一份」，走 `full=True`（原子 DELETE
+    # 抢占，只有一个赢家）；带 Range 的请求 = 分段下载，只刷新会话窗口。
+    full_delivery = outcome == RANGE_NONE
+
+    # 判定在 `redeem_token` 的一把锁里做完。原来这里是 `open_token`（先查后写）
+    # 加 `resolve_token`（整份才删）两条独立语句：两个并发整份请求都查到、都通过，
+    # 各自 DELETE 一次，两个人一起把文件下走——而网关是 `ThreadingHTTPServer`，
+    # 链接被转发进大群时并发是常态。
+    target = exports.redeem_token(token, full=full_delivery)
+    if target is None:
+        return _error(410, "链接已失效或已被使用")
+
     headers = {
         "Content-Type": content_type_for(target),
         "Content-Disposition": f'attachment; filename="{target.name}"',
@@ -139,14 +228,11 @@ def handle_download(path: str, exports, range_header: Optional[str] = None) -> D
         "X-Content-Type-Options": "nosniff",
         "Accept-Ranges": "bytes",
     }
-    span = _parse_range(range_header, total)
-    if span is None:
-        if range_header:
-            return _error(416, "range not satisfiable")
+    if outcome == RANGE_NONE:
+        # 没有 Range 或者语法不认：整份发 200。语法不认不是「要不到」
         headers["Content-Length"] = str(total)
         return DownloadResponse(status=200, file=target, headers=headers)
 
-    start, length = span
     headers["Content-Length"] = str(length)
     headers["Content-Range"] = f"bytes {start}-{start + length - 1}/{total}"
     return DownloadResponse(status=206, file=target, headers=headers, start=start, length=length)

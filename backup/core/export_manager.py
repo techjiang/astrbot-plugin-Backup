@@ -19,6 +19,7 @@ from ..exporters import get_exporter
 from ..exporters.base import ExportContext
 from ..exporters.html_exporter import HtmlExporter
 from .database import REALTIME_BACKUP_ID, Database, group_info_from_dict, members_from_list
+from .download_route import LEGACY_PREFIX
 from .models import Message
 from .verifier import (
     compute_checksum,
@@ -451,18 +452,42 @@ class ExportManager:
             self.db.delete_token(token)
         return path
 
-    def open_token(self, token: str, now: Optional[float] = None) -> bool:
-        """给「第一次兑换」打时间戳。返回 False 表示这条 token 已经被别人领过头。
+    def lookup_token(self, token: str) -> Optional[Path]:
+        """只查、不占名额。调用方据此算出「这次请求要交付多少字节」。"""
+        if not token:
+            return None
+        row = self.db.peek_token(token)
+        if row is None or float(row["expires"]) < time.time():
+            return None
+        path = Path(row["path"])
+        if not self._is_inside(path, self.export_dir) or not path.exists():
+            return None
+        return path
 
-        `GRACE_SECONDS` 之内算同一次下载的开头（浏览器探测 + 立刻续传、用户
-        连点两下）。超出这个窗口的第二个请求就是第二个人。
+    def redeem_token(self, token: str, full: bool, now: Optional[float] = None) -> Optional[Path]:
+        """兑换一次下载，返回文件路径。None = 该拒（410）。
+
+        `full=True` 表示这次会把整个文件交出去：`DELETE` 就是抢占，只有一个赢家。
+        `full=False` 是片段续传：只刷新会话窗口。
+
+        判定全在 `Database.redeem_token` 的一把锁里做完。原来是「查有没有被领过 /
+        打时间戳 / 删 token」三步，每步各自加锁，两个线程能交错着全通过——网关
+        正是多线程的，链接转发进大群时并发是常态。
         """
-        if not token or self.db.get_token(token) is None:
-            return False
-        if self.db.has_been_opened(token, now, GRACE_SECONDS):
-            return False
-        self.db.open_token(token, now)
-        return True
+        if not token:
+            return None
+        moment = time.time() if now is None else float(now)
+        row = self.db.redeem_token(token, moment, GRACE_SECONDS, bool(full))
+        if row is None:
+            return None
+        path = Path(row["path"])
+        if not self._is_inside(path, self.export_dir) or not path.exists():
+            return None
+        return path
+
+    def open_token(self, token: str, now: Optional[float] = None) -> bool:
+        """占一个「片段」名额（不烧掉 token）。返回 False 表示已被别人领过。"""
+        return self.redeem_token(token, full=False, now=now) is not None
 
     def take_token(self, token: str) -> Optional[Path]:
         """兑换并作废。一次性下载用。"""
