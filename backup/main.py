@@ -392,7 +392,9 @@ class BackupPlugin(Star):
             storage / "media",
             self.config,
         )
-        self.restore_engine = RestoreEngine(self.db)
+        # 媒体目录一并交给恢复引擎：从 ZIP 包恢复时媒体要落回本机，否则换台机器
+        # 恢复完，聊天记录里每张图都是「本机找不到这个文件」，再导出一次就永久丢
+        self.restore_engine = RestoreEngine(self.db, storage / "media")
         permission_cfg = self.config.get("permission") or {}
         self.permission = PermissionChecker(
             permission_cfg.get("require_admin", True),
@@ -677,6 +679,10 @@ class BackupPlugin(Star):
         ]
         if result.merged:
             parts.append(f"补齐 {result.merged} 条")
+        # 媒体跟着回来了几条必须说：只说「写入 3 条」，用户打开导出的 HTML 发现
+        # 全是「本机找不到这个文件」，会以为消息恢复了、附件丢了
+        if result.media_restored:
+            parts.append(f"媒体 {result.media_restored} 个已落回本机")
         yield event.plain_result(
             f"✅ {result.message}\n" + " · ".join(parts) + f" → 群 {result.target_group_id}"
         )

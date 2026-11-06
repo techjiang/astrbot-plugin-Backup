@@ -3,7 +3,7 @@
 import csv
 from pathlib import Path
 
-from .base import BaseExporter, ExportContext
+from .base import BaseExporter, ExportContext, display_name, failed_url, media_href
 
 
 class CsvExporter(BaseExporter):
@@ -28,7 +28,22 @@ class CsvExporter(BaseExporter):
                         m.message_type.value,
                         (m.content or "").replace("\r", " "),
                         m.reply_to or "",
-                        ";".join(p for p in m.media_paths if p),
+                        ";".join(self._cell(x, ctx) for x in m.media_paths if x),
                     ]
                 )
         return path
+
+    @classmethod
+    def _cell(cls, media: str, ctx: ExportContext) -> str:
+        """媒体单元格。
+
+        原来直接写 `media_paths` 原值（导出机上的绝对路径）。这份 CSV 打开在
+        别人的 Excel 里，那一列指的是一台不存在的机器上的文件。
+
+        包内相对地址优先；没有就只留文件名——一列「文件名」至少还能在包里的
+        `media/` 下按名字找回来。下载失败的留原始 URL。
+        """
+        failed = failed_url(media)
+        if failed:
+            return f"{display_name(media, ctx)}（下载失败：{failed}）"
+        return media_href(media, ctx) or display_name(media, ctx)

@@ -6,7 +6,7 @@ import mimetypes
 from pathlib import Path
 from typing import Optional
 
-from .base import BaseExporter, ExportContext
+from .base import BaseExporter, ExportContext, display_name, failed_url, is_image
 
 TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "templates" / "chat.html"
 #: 单张图片内联上限。超过就只留链接——一张 40MB 的 PNG 塞进 HTML，文件从 3MB
@@ -15,11 +15,6 @@ MAX_INLINE_BYTES = 6 * 1024 * 1024
 #: 整份 HTML 的内联预算。单张都合格、但一天两百张图加起来照样能把页面撑到几百 MB，
 #: 浏览器直接卡死——所以逐张累计，超了就从这里开始只留链接。
 MAX_INLINE_TOTAL_BYTES = 96 * 1024 * 1024
-
-IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
-
-#: 媒体下载失败时，引擎在 `media_paths` 里留下的标记（见 `backup_engine._download_media`）
-_FAILED_MARK = "[下载失败]"
 
 _TYPE_LABEL = {
     "image": "[图片]",
@@ -134,7 +129,7 @@ class HtmlExporter(BaseExporter):
             [
                 m.sender_name or str(m.sender_id),
                 m.content or "",
-                *(_display_name(media, ctx) for media in m.media_paths if media),
+                *(display_name(media, ctx) for media in m.media_paths if media),
             ]
         ).lower()
         text_for_search = html.escape(searchable)
@@ -162,8 +157,8 @@ class HtmlExporter(BaseExporter):
         """
         if not media:
             return ""
-        failed = _failed_url(media)
-        name = html.escape(_display_name(media, ctx))
+        failed = failed_url(media)
+        name = html.escape(display_name(media, ctx))
         if failed:
             if failed.startswith(("http://", "https://")):
                 return (
@@ -174,14 +169,14 @@ class HtmlExporter(BaseExporter):
             return f'<span class="file failed">{name}<span class="hint">下载失败</span></span>'
 
         p = self._local_path(media, ctx)
-        is_image = p.suffix.lower() in IMAGE_SUFFIXES
+        image = is_image(media)
         href = ""
         if ctx is not None:
             href = str(ctx.media_links.get(media) or ctx.media_links.get(str(media)) or "")
 
         has_local = p.is_file()
 
-        if is_image:
+        if image:
             data_uri = self._inline(p) if has_local else None
             if data_uri:
                 return f'<img class="media" src="{data_uri}" alt="{name}" loading="lazy">'
@@ -256,29 +251,3 @@ class HtmlExporter(BaseExporter):
         self._inlined += size
         return f"data:{mime};base64,{b64}"
 
-
-def _failed_url(media: str) -> Optional[str]:
-    """媒体字符串是不是「下载失败」的标记；是就返回它记着的原始 URL。"""
-    text = str(media or "")
-    if text.startswith(_FAILED_MARK):
-        return text[len(_FAILED_MARK):].strip() or None
-    return None
-
-
-def _display_name(media: str, ctx: Optional[ExportContext] = None) -> str:
-    """给人看的文件名。
-
-    路径可能是本机绝对路径、包内相对路径、或者一个原始 URL。三种都只取最后一段，
-    且不能因为取不到就把井号/问号带出来（`http://x/a.png?sign=...` 会变成
-    `a.png?sign=...`，导出页上很难看）。
-    """
-    failed = _failed_url(media)
-    if failed:
-        media = failed
-    if ctx is not None and ctx.media_index:
-        hit = ctx.media_index.get(media) or ctx.media_index.get(str(media))
-        if hit:
-            return Path(hit).name
-    text = str(media or "")
-    base = text.split("?", 1)[0].split("#", 1)[0].rstrip("/").replace("\\", "/")
-    return base.rsplit("/", 1)[-1] or text or "附件"

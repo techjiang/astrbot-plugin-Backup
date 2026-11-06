@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from .base import BaseExporter, ExportContext
+from .base import BaseExporter, ExportContext, display_name, failed_url, is_image, media_href
 
 
 class MarkdownExporter(BaseExporter):
@@ -44,12 +44,29 @@ class MarkdownExporter(BaseExporter):
                 for media in m.media_paths:
                     if not media:
                         continue
-                    if media.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
-                        lines.append(f"![图片]({media})")
-                    else:
-                        lines.append(f"[附件]({media})")
+                    lines.append(self._media_line(media, ctx))
                     lines.append("")
                 lines.append("---")
                 lines.append("")
             (out_dir / f"{day}.md").write_text("\n".join(lines), encoding="utf-8")
         return out_dir
+
+    @classmethod
+    def _media_line(cls, media: str, ctx: ExportContext) -> str:
+        """一行媒体引用。
+
+        原文直接写 `![图片](/root/.astrbot-backup/media/20240501/x.png)`——导出机的
+        绝对路径。在别人的机器上打开这份 markdown，图片全是破图，链接点开是
+        「文件不存在」，而文件就躺在同一个包的 `media/` 里。
+
+        这份文件在 `<包根>/markdown/` 下，所以回包根要走一层 `../`。少了这一层，
+        地址会被解析成 `markdown/media/...`，仍然是死链。
+        """
+        failed = failed_url(media)
+        name = display_name(media, ctx)
+        if failed:
+            return f"[{name}（下载失败）]({failed})"
+        href = media_href(media, ctx, prefix="../")
+        if href:
+            return f"![{name}]({href})" if is_image(media) else f"[{name}]({href})"
+        return f"{name}（未随本包导出）"

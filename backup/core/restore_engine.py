@@ -17,6 +17,7 @@ from .database import (
 )
 from .export_manager import snapshot_of
 from .models import Message
+from ..exporters.base import media_member_name
 from .parser import parse_message
 from .verifier import (
     compute_checksum,
@@ -45,14 +46,21 @@ class RestoreResult:
     # 包/库里一共有多少条可恢复的消息。回执只说「写入/跳过/覆盖」时，用户数出
     # 3 条、回执写 1 条，只会以为包坏了
     total: int = 0
+    # 从包里落回本机的媒体个数。恢复回执要能回答「图片跟着回来了吗」——
+    # 只说「写入 3 条消息」，用户打开 HTML 发现全是占位，不知道该怪谁
+    media_restored: int = 0
     message: str = ""
 
 
 class RestoreEngine:
     STRATEGIES = ("skip", "overwrite", "merge")
 
-    def __init__(self, db: Database):
+    def __init__(self, db: Database, media_dir: Optional[str | Path] = None):
         self.db = db
+        # 从备份包恢复时，媒体要从包里**落回本机**。这个目录不给就退化成
+        # 「只恢复消息、媒体指向原机器」——换台机器恢复完，聊天记录里每张图都
+        # 打不开，而文件明明就在包里。
+        self.media_dir = Path(media_dir) if media_dir else None
 
     def verify_backup(
         self,
@@ -149,6 +157,10 @@ class RestoreEngine:
                 f"备份包里的消息都不属于群 {source_group}，拒绝恢复"
             )
 
+        # 媒体必须在写库之前落盘：写库之后才知道「这条消息的图在哪」就晚了，
+        # 而 media_paths 一旦按原机器的路径写进库，导出时只能显示「本机找不到」
+        media_restored = self._restore_media(messages, archive)
+
         total = len(messages)
         inserted = skipped = overwritten = merged = 0
         for msg in messages:
@@ -204,8 +216,159 @@ class RestoreEngine:
             merged=merged,
             checksum_ok=True,
             total=total,
+            media_restored=media_restored,
             message="恢复完成",
         )
+
+    def _restore_media(self, messages: list[Message], archive) -> int:
+        """把包里的媒体落回本机，并把 `media_paths` 改成本机路径。
+
+        为什么非做不可：导出包里的 `media/...` 是**包内成员名**，
+        `messages.media_paths` 记的是导出机上的绝对路径。恢复时不搬文件、
+        不改路径，结果是——
+
+        - 打开恢复后的聊天记录，每张图都是「本机找不到这个文件」；
+        - 更糟的是**再导出一次就永久丢**：第二次导出找不到本机文件，
+          `media_files` 也是空的，新包里一个媒体都没有。原包一删，图就没了。
+
+        路径写成本机真实落盘位置而不是包内相对路径：库里的 `media_paths` 是给
+        下载/去重/导出共用的，留一个只有包内才成立的相对路径，等于把「文件在哪」
+        这件事绑死在某一次导出上。
+
+        单份媒体解不出来只记一条 debug 并跳过——红线 2 的同一条道理：媒体坏了
+        不该让整次恢复停摆。
+        """
+        if archive is None or self.media_dir is None:
+            return 0
+        restored = 0
+        try:
+            zf = zipfile.ZipFile(archive)
+        except (OSError, zipfile.BadZipFile):
+            return 0
+        with zf:
+            names = set(zf.namelist())
+            for m in messages:
+                if not m.media_paths:
+                    continue
+                fresh: list[str] = []
+                for media in m.media_paths:
+                    member = self._resolve_member(m.message_id, media, names)
+                    if member is None:
+                        # 包里没有这份媒体（下载失败、或导出时本机就没有）。
+                        # 原值原样留着，让「媒体丢了」这件事在导出页上看得出，
+                        # 而不是被悄悄洗成空列表
+                        fresh.append(media)
+                        continue
+                    target = self._media_target(member)
+                    try:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        if not target.is_file() or target.stat().st_size == 0:
+                            target.write_bytes(zf.read(member))
+                        restored += 1
+                    except OSError as e:
+                        logger.debug("媒体落盘失败 %s: %s", member, type(e).__name__)
+                        fresh.append(media)
+                        continue
+                    fresh.append(str(target))
+                    self._register_media(m, str(target), member)
+                m.media_paths = fresh
+        return restored
+
+    @staticmethod
+    def _resolve_member(message_id: str, media: str, names: set[str]) -> Optional[str]:
+        """这条消息的这份媒体，在包里到底叫什么。
+
+        正常情况就是 `media_member_name(message_id, media)`。但导出端按**媒体原值**
+        去重：两条消息指向同一个文件时，包里只存一份，名字带的是**第一条**消息的
+        id。第二条按自己的 id 去算，算出一个包里不存在的名字，于是它那份媒体就被
+        判成「包里没有」——恢复后显示「本机找不到这个文件」，而文件明明在包里。
+
+        「同一条消息被实时归档和定时备份各记一次」正是这样：两个 message_id、
+        一份文件。
+
+        所以按 id 算不到时，退回「同目录同文件名、只是前缀不同」的那一个。
+        精确匹配优先，只在唯一命中时采用——多个候选说明这份媒体真有歧义，
+        宁可保留原值让它显形，也不能随便挑一个（张冠李戴比缺失更难查）。
+        """
+        # 0. 值本身就已经是包内成员名。导出端在 json/csv/txt 里写的正是这个名字，
+        #    恢复端照着念就行——按 message_id 重算只会算出一个不同的名字。
+        #    两条消息共用一份媒体时更是如此：包里只有一份（按原值去重），名字带的是
+        #    第一条消息的 id，第二条无论怎么算都算不出来。
+        text = str(media or "").replace("\\", "/").lstrip("./")
+        if text in names:
+            return text
+        # 1. 按 message_id 算出来的标准名字
+        exact = media_member_name(message_id, media)
+        if exact in names:
+            return exact
+        # 2. 「同目录、同文件名、只是前缀不同」——老包（没有包内路径）走这条
+        path = Path(str(media or ""))
+        wanted_dir = path.parent.name or "unknown"
+        suffix = f"_{path.name}"
+        hits = [
+            n
+            for n in names
+            if n.startswith("media/")
+            and n.rsplit("/", 1)[0] == f"media/{wanted_dir}"
+            and n.endswith(suffix)
+        ]
+        return hits[0] if len(hits) == 1 else None
+
+    def _media_target(self, member: str) -> Path:
+        """包内成员名 → 本机落盘路径。
+
+        按 `media/<日期目录>/<文件名>` 还原本地目录结构，而不是把 `<日期目录>`
+        压进文件名——媒体目录本来就按天分，摊平了以后同一天几百个文件挤在一起。
+        `member` 来自包（等于不可信输入），所以逐段取 `name`，挡掉 `../` 穿越。
+        """
+        parts = [p for p in Path(member).parts if p not in ("", ".", "..")]
+        if parts and parts[0] == "media":
+            parts = parts[1:]
+        safe = [Path(p).name for p in parts] or ["unknown"]
+        return self.media_dir.joinpath(*safe)
+
+    def _register_media(self, message: Message, local_path: str, member: str) -> None:
+        """把落盘的媒体登记进 `media_files`。
+
+        没有这一行，第二次导出时 `_media_index` 和 `_collect_media_members` 都
+        找不到它，包里的图会凭空消失；`/backup clean` 也认不出这个文件该归谁。
+        """
+        path = Path(local_path)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
+        import mimetypes
+
+        mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        try:
+            self.db.save_media(
+                message_id=message.message_id,
+                group_id=message.group_id,
+                # 原始 URL 已不可知（包里的 media_paths 是导出机的本地路径）。
+                # 用包内成员名当键：同一条消息的同一个附件，重复恢复只会更新同一行
+                original_url=f"restored:{member}",
+                local_path=str(path),
+                filename=path.name,
+                file_size=size,
+                mime_type=mime,
+                sha256=self._sha256(path),
+            )
+        except Exception as e:  # 登记失败不该让恢复停摆
+            logger.debug("媒体登记失败 %s: %s", member, type(e).__name__)
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        import hashlib
+
+        h = hashlib.sha256()
+        try:
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 256), b""):
+                    h.update(chunk)
+        except OSError:
+            return ""
+        return h.hexdigest()
 
     def _merge_missing(self, group_id: int, incoming: Message) -> bool:
         """把库里这条消息缺的字段补上，返回是否真的改过。已有的值一个不动。"""

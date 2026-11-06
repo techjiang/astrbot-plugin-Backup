@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 from ..exporters import get_exporter
-from ..exporters.base import ExportContext
+from ..exporters.base import ExportContext, media_member_name
 from ..exporters.html_exporter import HtmlExporter
 from .database import REALTIME_BACKUP_ID, Database, group_info_from_dict, members_from_list
 from .download_route import LEGACY_PREFIX
@@ -300,19 +300,20 @@ class ExportManager:
         if work.exists():
             shutil.rmtree(work)
         work.mkdir(parents=True, exist_ok=True)
+        # 包内媒体成员必须先定下来，**再**跑任何一个导出器：包里的每份产物
+        # （chat.html / messages.txt / messages.csv / markdown / json）在别人的机器上
+        # 都要点得动，而它们各自都只知道 `media_paths` 里那个导出机的绝对路径。
+        # 原来只给 chat.html 算过一遍 `media_links`，其余四份照样把
+        # `/root/.astrbot-backup/media/...` 写进去——同一个包，一份能看、四份是死链。
+        media_members = self._collect_media_members(ctx)
+        ctx.media_links = {
+            key: member for key, (member, _path) in media_members.items()
+        }
         get_exporter("sqlite").export(ctx, work / "messages.sqlite")
         get_exporter("json").export(ctx, work / "json")
         get_exporter("csv").export(ctx, work / "messages.csv")
         get_exporter("txt").export(ctx, work / "messages.txt")
         get_exporter("markdown").export(ctx, work / "markdown")
-        # 包内媒体成员先定下来，再渲染 chat.html：页面里的附件链接必须指向**包内
-        # 相对路径**。原来渲染用的是 `media_paths` 原值——那是导出机上的绝对路径
-        # `/root/.astrbot-backup/media/...`，解压到任何别的机器上都是一条死链，
-        # 而这个包的卖点正是「解开就能看」。
-        media_members = self._collect_media_members(ctx)
-        ctx.media_links = {
-            key: member for key, (member, _path) in media_members.items()
-        }
         (work / "chat.html").write_text(HtmlExporter().render(ctx), encoding="utf-8")
         # 公告 / 文件清单优先取**这份备份自己的快照**。取当前状态表的话，导出
         # 一份上个月的备份，带出去的却是这个群今天的公告——那不是备份，是现状。
@@ -408,9 +409,9 @@ class ExportManager:
                 if not path.is_file() or not self._is_inside(path, self.media_dir):
                     continue
                 # 同名不同目录的媒体（同一天两条消息都叫 image.png）以前会压成
-                # 同一个成员名，后写的覆盖前一个，包里的图张冠李戴
-                member = str(Path("media") / path.parent.name / f"{m.message_id}_{path.name}")
-                out[key] = (member, path)
+                # 同一个成员名，后写的覆盖前一个，包里的图张冠李戴。
+                # 命名规则与恢复端共用 `media_member_name`，两边各写一遍迟早对不上
+                out[key] = (media_member_name(m.message_id, path), path)
         return out
 
     def _trusted_snapshot(self, record, group_id: int) -> dict:
