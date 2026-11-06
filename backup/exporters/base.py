@@ -15,6 +15,10 @@ class ExportContext:
     group_info: Optional[GroupInfo] = None
     members: list[GroupMember] = field(default_factory=list)
     media_index: dict[str, Path] = field(default_factory=dict)
+    # 媒体路径 → **可点得动的地址**。ZIP 包里是包内相对路径（`media/20240501/x.png`），
+    # 单文件导出时为空。空着不代表「没媒体」，只代表「这里没有可引用的地址」——
+    # 那时候导出器只能内联、或者明说省略，不能把导出机的绝对路径当链接写进 HTML。
+    media_links: dict[str, str] = field(default_factory=dict)
     backup_id: str = ""
     # 导出前的消息集校验和。导出器拼出来的清单要跟它一致，ZIP 包才恢复得回去
     checksum: str = ""

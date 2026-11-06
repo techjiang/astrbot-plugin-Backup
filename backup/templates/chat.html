@@ -8,6 +8,10 @@
 :root{--bg:#f4f4f8;--panel:#ffffff;--text:#1f1f27;--sub:#8a8a99;--line:#e8e8f0;--own:#95ec69;--other:#ffffff;--accent:#7C3AED;--accent2:#EC4899;}
 html[data-theme="dark"]{--bg:#16161d;--panel:#1f1f27;--text:#e8e8ef;--sub:#8b8b9c;--line:#2c2c38;--own:#3a6b4a;--other:#262633;}
 *{box-sizing:border-box}
+/* `hidden` 属性靠 UA 样式表里的 `display:none` 生效，而作者样式 `.msg{display:flex}`
+   优先级更高——于是搜索/筛选把 `el.hidden = true` 写上去，消息一条都没消失。
+   表现是「输入关键词后整页消息还在，中间冒出一句『没有匹配的消息』」。 */
+[hidden]{display:none!important}
 body{margin:0;font:15px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--text)}
 header{position:sticky;top:0;z-index:10;background:linear-gradient(120deg,#7C3AED,#EC4899);color:#fff;padding:14px 18px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 header .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px}
@@ -35,6 +39,16 @@ main{flex:1;min-width:0}
 .msg.mine .bubble{background:var(--own);text-align:left;border-color:transparent}
 .msg img.media{max-width:100%;border-radius:12px;margin-top:6px;cursor:zoom-in;display:block}
 .msg .file{display:inline-flex;gap:6px;align-items:center;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:6px 10px;margin-top:6px;font-size:13px;color:var(--accent);text-decoration:none;word-break:break-all}
+.msg .file .hint{color:var(--sub);font-size:11.5px;font-weight:400;white-space:nowrap}
+@media(max-width:520px){.msg .file{flex-wrap:wrap}.msg .file .hint{white-space:normal}}
+.msg .file.missing,.msg .file.failed{color:var(--text);border-style:dashed;cursor:default}
+.msg img.media{background:var(--bg)}
+/* 图片放大：自建覆盖层。原来是把 data: 地址新开一个标签页，主流浏览器一律
+   当弹窗拦掉，点了毫无反应 (第 38 轮) */
+#lightbox{position:fixed;inset:0;z-index:50;display:none;place-items:center;background:rgba(0,0,0,.78);padding:24px}
+#lightbox.on{display:grid}
+#lightbox img{max-width:100%;max-height:100%;border-radius:12px;box-shadow:0 18px 60px rgba(0,0,0,.5)}
+#lightbox .tip{position:fixed;left:0;right:0;bottom:14px;text-align:center;color:#fff;font-size:12.5px;opacity:.7}
 .quote{border-left:3px solid var(--accent);background:var(--bg);border-radius:8px;padding:4px 8px;font-size:12.5px;color:var(--sub);margin-bottom:6px}
 details.forward{border:1px solid var(--line);border-radius:12px;padding:8px 10px;margin-top:6px;background:var(--bg)}
 details.forward summary{cursor:pointer;font-size:13px;font-weight:600}
@@ -93,6 +107,10 @@ footer a{color:var(--accent);text-decoration:none}
   </aside>
   <main id="chat">{{MESSAGES_HTML}}<div class="empty" id="noResult" hidden>没有匹配的消息</div></main>
 </div>
+<div id="lightbox" role="dialog" aria-modal="true" aria-label="图片预览">
+  <img alt="">
+  <div class="tip">点击任意处或按 Esc 关闭</div>
+</div>
 <footer>
   由 <strong>Backup 高级备份</strong> 插件导出 · 作者 科技酱<br>
   <a href="https://www.asoe.cn" target="_blank" rel="noopener">www.asoe.cn</a> ·
@@ -113,29 +131,43 @@ footer a{color:var(--accent);text-decoration:none}
     btn.textContent=next==='dark'?'亮色模式':'暗色模式';
     try{localStorage.setItem('backup-theme',next)}catch(e){}
   });
+
   var search=document.getElementById('search'), filter=document.getElementById('senderFilter');
   var msgs=[].slice.call(document.querySelectorAll('.msg'));
   var days=[].slice.call(document.querySelectorAll('.day'));
+  var noResult=document.getElementById('noResult');
   function apply(){
     var q=(search.value||'').trim().toLowerCase(), who=filter.value;
     var any=false;
-    msgs.forEach(function(el){
+    for(var i=0;i<msgs.length;i++){
+      var el=msgs[i];
       var okQ=!q||(el.dataset.text||'').indexOf(q)>=0;
       var okW=!who||el.dataset.sender===who;
       var show=okQ&&okW;
       el.hidden=!show; if(show)any=true;
-    });
-    days.forEach(function(d){
-      var next=d.nextElementSibling, visible=false;
-      while(next&&!next.classList.contains('day')){ if(next.classList.contains('msg')&&!next.hidden){visible=true;break;} next=next.nextElementSibling; }
+    }
+    for(var j=0;j<days.length;j++){
+      var d=days[j], next=d.nextElementSibling, visible=false;
+      while(next&&!next.classList.contains('day')){
+        if(next.classList.contains('msg')&&!next.hidden){visible=true;break;}
+        next=next.nextElementSibling;
+      }
       d.hidden=!visible;
-    });
-    document.getElementById('noResult').hidden=any;
+    }
+    noResult.hidden=any;
   }
   search.addEventListener('input',apply); filter.addEventListener('change',apply);
+
+  /* 图片放大用自建覆盖层。原来是把 data: 地址新开一个标签页（第 38 轮）：
+     主流浏览器一律当弹窗拦掉，点了没反应，而缩略图本身又小得看不清。 */
+  var box=document.getElementById('lightbox'), boxImg=box.querySelector('img');
+  function closeBox(){ box.classList.remove('on'); boxImg.removeAttribute('src'); }
   document.addEventListener('click',function(e){
-    if(e.target.classList.contains('media')){ window.open(e.target.getAttribute('src'),'_blank'); }
+    var img=e.target.closest?e.target.closest('img.media'):null;
+    if(img){ boxImg.src=img.getAttribute('src'); boxImg.alt=img.alt||''; box.classList.add('on'); return; }
+    if(box.classList.contains('on')){ closeBox(); }
   });
+  document.addEventListener('keydown',function(e){ if(e.key==='Escape') closeBox(); });
 })();
 </script>
 </body>

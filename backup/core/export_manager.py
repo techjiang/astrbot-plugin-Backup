@@ -305,6 +305,14 @@ class ExportManager:
         get_exporter("csv").export(ctx, work / "messages.csv")
         get_exporter("txt").export(ctx, work / "messages.txt")
         get_exporter("markdown").export(ctx, work / "markdown")
+        # 包内媒体成员先定下来，再渲染 chat.html：页面里的附件链接必须指向**包内
+        # 相对路径**。原来渲染用的是 `media_paths` 原值——那是导出机上的绝对路径
+        # `/root/.astrbot-backup/media/...`，解压到任何别的机器上都是一条死链，
+        # 而这个包的卖点正是「解开就能看」。
+        media_members = self._collect_media_members(ctx)
+        ctx.media_links = {
+            key: member for key, (member, _path) in media_members.items()
+        }
         (work / "chat.html").write_text(HtmlExporter().render(ctx), encoding="utf-8")
         # 公告 / 文件清单优先取**这份备份自己的快照**。取当前状态表的话，导出
         # 一份上个月的备份，带出去的却是这个群今天的公告——那不是备份，是现状。
@@ -371,25 +379,39 @@ class ExportManager:
                 manifest["trusted"],
                 snapshot_evidence(manifest["trusted"]),
             )
-        media_members: list[str] = []
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for file in work.rglob("*"):
                 if file.is_file():
                     zf.write(file, file.relative_to(work))
-            for m in ctx.messages:
-                for media in m.media_paths:
-                    p = Path(ctx.media_index.get(str(media), media))
-                    if p.is_file() and self._is_inside(p, self.media_dir):
-                        # 同名不同目录的媒体（同一天两条消息都叫 image.png）以前会
-                        # 压成同一个成员名，后写的覆盖前一个，包里的图张冠李戴
-                        member = str(Path("media") / p.parent.name / f"{m.message_id}_{p.name}")
-                        zf.write(p, member)
-                        media_members.append(member)
+            for member, path in media_members.values():
+                zf.write(path, member)
             # 媒体清单写进 manifest，校验时才知道包里该有哪些文件
-            manifest["media_files"] = sorted(set(media_members))
+            manifest["media_files"] = sorted({member for member, _ in media_members.values()})
             zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         shutil.rmtree(work, ignore_errors=True)
         return zip_path
+
+    def _collect_media_members(self, ctx: ExportContext) -> dict[str, tuple[str, Path]]:
+        """这次导出要打进包的媒体：`media_paths 里的原值 → (包内成员名, 本机文件)`。
+
+        只收本机真有、且在本插件媒体目录里的文件——`media_files` 表里可能留着
+        「文件已经被 `/backup clean` 删了」的路径，收进清单会让校验报「包里缺
+        媒体」，而实际只是淘汰了。同一条消息的同一个文件名只收一次。
+        """
+        out: dict[str, tuple[str, Path]] = {}
+        for m in ctx.messages:
+            for media in m.media_paths:
+                key = str(media)
+                if not key or key in out:
+                    continue
+                path = Path(ctx.media_index.get(key, key))
+                if not path.is_file() or not self._is_inside(path, self.media_dir):
+                    continue
+                # 同名不同目录的媒体（同一天两条消息都叫 image.png）以前会压成
+                # 同一个成员名，后写的覆盖前一个，包里的图张冠李戴
+                member = str(Path("media") / path.parent.name / f"{m.message_id}_{path.name}")
+                out[key] = (member, path)
+        return out
 
     def _trusted_snapshot(self, record, group_id: int) -> dict:
         """导出时记下的「这份备份属于谁」：群名、群信息、成员表。
