@@ -2349,3 +2349,105 @@ import 语句写不出来），本地测试时又是任意目录名，两者都�
 
 这是这一轮唯一一个「功能一直在，只是没干活」的缺陷。前两轮修的是「装不上」和
 「没人按回执点过链接」，这条是**没人看过回执里那个 ✅ 到底代表什么**。
+
+## 第 44 轮：元数据在替插件吹牛
+
+起点是一句需求：「metadata.yaml 那啥补充好标签、支持平台等等等等，插件直接名为
+Backup」。前半句是补字段，后半句是改名。做下来发现，前半句藏着一个比措辞更实在的
+问题。
+
+### 只有四个字段
+
+改之前的 `metadata.yaml` 是这样的：`name / display_name / version / description /
+author / author_url / homepage / repository / email / tags / python / astrbot / license / repo`。
+看着挺全，但宿主真正会读的只有前五个——`PluginManager._load_plugin_metadata` 里
+给了 `StarMetadata` 的字段是 `name / author / desc / short_desc / version / repo /
+display_name / support_platforms / astrbot_version / views / i18n`。
+
+换句话说：
+
+- `display_name` 写对了（宿主会读），但它写的是「Backup 高级备份」；
+- `short_desc` 没写，卡片紧凑布局只能退回去截断 `desc` 的长文本；
+- `support_platforms` 没写 → 面板插件页上没有平台标签；
+- `astrbot_version` 没写 → 版本不匹配时宿主不会拦，装上去才炸；
+- `tags` 只有 backup / export / data 三个泛词，市场里搜「消息归档」「迁移」都搜不到；
+- `tags` 之外还有个更微妙的问题：`astrbot` / `python` 这两个键宿主**从来不读**。
+  它们看着像能力声明，实际只是摆设。真正的版本约束键叫 `astrbot_version`。
+
+### 真正的问题：声明和代码不对齐
+
+`support_platforms` 写什么，取决于「插件真能在哪些平台上备份」。而
+`main.py` 里当时写着：
+
+```python
+HISTORY_CAPABLE = ("aiocqhttp", "telegram", "discord", "slack", "wecom")
+```
+
+这份名单是第 25 轮写的，当时的目的只是「别在 `platform_insts[0]`（永远是 webchat）
+上做备份」。它从来不是「这些平台真能拉历史消息」的证据。核对了一遍 AstrBot 的适配器：
+
+| 适配器 | 有没有回捞历史的入口 |
+| --- | --- |
+| aiocqhttp | OneBot 客户端 `call_action` 可打 `get_group_msg_history` / `get_group_member_list` / `get_group_info` |
+| telegram / discord / slack / wecom / qq_official | 只有「收消息、转事件」，没有历史接口 |
+
+所以如果照着 `HISTORY_CAPABLE` 写 `support_platforms`，就是在面板上承诺一个
+备不出东西的平台：用户装完跑 `/backup now`，得到「备份完成 · 0 条」。这句回执
+比报错更糟——它看起来像成功了。
+
+### 改了什么
+
+- `core/platforms.py`：`HISTORY_PLATFORMS = ("aiocqhttp",)` + `PREFERRED_ORDER`。
+  「哪些平台能备份」从此**只有一处定义**，`metadata.yaml` 的 `support_platforms`
+  与 `main.py` 挑平台共用它。
+- `_pick_by_capability` 从「有客户端就选」改成按 `PREFERRED_ORDER` 挑。webchat、
+  telegram、discord 也有客户端，挑中它们等于挑中一次必然返回 0 条的备份。
+- `metadata.yaml`：`display_name` → **Backup**；补 `short_desc` /
+  `astrbot_version(">=4.14,<5")` / `logo` / `social_link`；`tags` 换成 8 个真关键词；
+  `support_platforms` 只写 `aiocqhttp`，并按字段用途把「宿主会读的」和「写给人看的」
+  分成两段，省得下次又改错键名。
+- `name` **没动**：它同时是宿主 import 用的模块名和市场 `plugin_id` 的前半段
+  （`author/name`）。改它等于换一个插件——已装的那份会变成两个，面板上并排出现。
+
+### 为什么 `astrbot_version` 是 `>=4.14,<5`
+
+下限不是拍的：钩子必须挂在**任意事件**上（`@filter.custom_filter`），命令过滤器会把
+实时归档和退群聚合全饿死；这条路径从 4.14 才稳。上限 `<5` 留给将来——写
+`>=4.14` 就等着在 5.0 上被静默装进来。
+
+顺带核了个版本差异：4.14.6 的 `StarMetadata` 里**没有** `support_platforms` /
+`astrbot_version` / `short_desc`，这几个字段是 4.16+ 才加的。也就是说在 4.14 上
+它们写了也不显示，但也不会报错——所以用例只能断言「宿主有这个字段时必须读到」，
+不能断言「一定读得到」。
+
+### 改名要改到底
+
+`display_name` 改了，文案里还有六处「高级备份」：HELP 首行、README 标题与 banner
+alt、DESIGN 标题、导出页页脚、`logo.svg` / `banner.svg` 的 `<title>`，以及
+`@register(desc)`。最后那处平时看不见（有 metadata.yaml 时宿主用 yaml 覆盖），
+只在 yaml 丢了或者走装饰器老路时才露——而那种时候正是最容易被误判成「两个插件」的时候。
+
+banner 第二行也顺手重排：「高级备份 · AstrBot 插件」→「AstrBot 群聊备份插件」。
+中文字形仍旧是提取的路径（第 6 轮定的规矩），不依赖系统字体。
+
+### 验证
+
+- `tests/test_round44_metadata.py`（12 条）：`display_name` 就是 Backup、
+  `name` 没被顺手改、`short_desc` 长度与 `tags` 去重/小写、**`support_platforms`
+  必须等于 `core/platforms.py::HISTORY_PLATFORMS`**、平台名必须是宿主认识的 key
+  （装了 AstrBot 就拿 `ADAPTER_NAME_2_TYPE` 真表比）、`astrbot_version` 能被 PEP 440
+  解析且包含当前宿主版本、`repo` 合市场规范、真调一次 `_pick_by_capability` 看
+  telegram 抢不到 aiocqhttp 前面。
+- 装了 AstrBot 4.14.6：**668 passed / 1 skipped**；没装（`astrbot` 是空包）：
+  **594 passed / 75 skipped，0 红**。
+- 元数据被宿主真读一遍：`PluginManager._load_plugin_metadata("/workspace")` 返回
+  `name=backup display_name=Backup version=1.0.0 author=科技酱`，
+  `repo=https://github.com/techjiang/astrbot-plugin-Backup`（市场规范要的 HTTPS
+  GitHub 形状）。
+- banner / logo 重新渲染看过（白底、800px / 256px）。
+
+### 一句总结
+
+这一轮最像「填字段」的活，实际做的是**把一句自我描述改成经得起对照的事实**。
+`support_platforms` 不是装饰性的标签，它是对用户的承诺；写多一个平台，就会多一个
+用户对着「备份完成 · 0 条」发呆。
