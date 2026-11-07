@@ -94,8 +94,9 @@ pip install -r astrbot-plugin-Backup/requirements.txt
 1. 面板里打开这个插件的配置，把 `export.base_url` 填成网关的**对外地址**
    （反代/内网穿透指向 `gateway.port`）。不填的话导出回执只给裸路径，
    并在回执里说明「这条链接只有本机能用」——因为那时它确实只有本机能用。
-2. `storage_dir` 默认落在 `~/.astrbot-backup`，刻意避开插件目录。要换位置就填
-   绝对路径；如果新位置在 Web 根下，插件会**拒绝启动**（红线 3）。
+2. `storage_dir` 默认落在宿主的插件数据目录 `data/plugin_data/backup`，跟着 AstrBot
+   的 data 走（迁移/备份/审计都在同一块地方）。要换位置就填绝对路径；如果新位置在
+   Web 根下，插件会**拒绝启动**（红线 3）。
 
 ## 命令速查
 
@@ -122,7 +123,7 @@ pip install -r astrbot-plugin-Backup/requirements.txt
 
 ```yaml
 backup:
-  storage_dir: ""             # 留空 = ~/.astrbot-backup，刻意避开插件目录
+  storage_dir: ""             # 留空 = <AstrBot>/data/plugin_data/backup
   storage:
     web_roots: []             # 数据目录不允许落在这里面，否则启动直接报错
   scope:
@@ -174,11 +175,12 @@ backup:
 
 ## 数据存放
 
-默认在 `~/.astrbot-backup`，不在插件目录里——AstrBot 的 data 目录常被面板静态托管，
-备份放那儿等于挂在公网（红线 3）。目录结构：
+默认在宿主的插件数据目录 `<AstrBot>/data/plugin_data/backup`——插件数据就该落在
+插件数据目录里，用户迁移、备份、审计才扫得到（早期版本放在 `~/.astrbot-backup`，
+卸载插件后那堆备份没人知道该不该删）。目录结构：
 
 ```
-~/.astrbot-backup/
+data/plugin_data/backup/
 ├── db/backup.sqlite   # 消息、成员、群信息、备份记录、增量点、定时任务、下载 token
 ├── media/             # 媒体文件（按日期分目录）
 └── exports/           # 导出产物，只能通过带 token 的临时链接取
@@ -186,6 +188,14 @@ backup:
 
 `storage_dir` 配成绝对路径时按配置走；配成相对路径会相对插件目录解析并打告警；
 无论哪种，只要落在 `storage.web_roots` 里就拒绝启动。
+
+老用户注意：`~/.astrbot-backup` 里的数据**不会自动搬**。旧目录还在的话启动时会打一条
+告警，想继续用就把 `storage_dir` 指过去；想换到新位置，停插件后把整个目录搬进
+`data/plugin_data/backup` 即可（库里的媒体路径是绝对路径，搬完需要重新导出）。
+
+至于「面板静态托管」这层：AstrBot 4.14 的面板把 `data/dist` 当静态目录，不是整个
+`data`；万一你的部署把 `data` 整块暴露出去，用 `storage.web_roots` 把那条路径列上，
+插件启动时会直接报错而不是默默把备份挂上公网。
 
 ### 下载链接怎么用
 

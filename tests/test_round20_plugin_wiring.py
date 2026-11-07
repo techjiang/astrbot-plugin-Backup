@@ -7,6 +7,7 @@
 """
 
 import asyncio
+import logging
 import sys
 import types
 from datetime import datetime, timedelta
@@ -121,6 +122,8 @@ def _install_fake_astrbot(monkeypatch):
     pkg.__path__ = []
     api = types.ModuleType("astrbot.api")
     api.__path__ = []
+    # 插件的每个模块都有 `from astrbot.api import logger`（上架规范硬要求）
+    api.logger = logging.getLogger("astrbot")
     api.event = api_event
     api.star = api_star
     core = types.ModuleType("astrbot.core")

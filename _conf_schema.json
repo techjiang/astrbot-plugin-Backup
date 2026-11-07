@@ -1,7 +1,7 @@
 {
   "storage_dir": {
     "type": "string",
-    "description": "数据根目录（备份/媒体/数据库/导出）。留空 = ~/.astrbot-backup，刻意避开插件目录",
+    "description": "数据根目录（备份/媒体/数据库/导出）。留空 = 插件数据目录 data/plugin_data/backup",
     "default": ""
   },
   "storage": {

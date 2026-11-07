@@ -1,5 +1,5 @@
 backup:
-  # 留空 = ~/.astrbot-backup，刻意避开插件目录（插件常落在面板静态托管的 data 下）
+  # 留空 = <AstrBot>/data/plugin_data/backup（宿主的插件数据目录）
   storage_dir: ""
 
   storage:

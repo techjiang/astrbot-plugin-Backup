@@ -3,12 +3,13 @@
 import asyncio
 import inspect
 import json
-import logging
 import mimetypes
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+from astrbot.api import logger
 
 from .database import REALTIME_BACKUP_ID, Database
 from .incremental import IncrementalTracker
@@ -23,7 +24,6 @@ from .parser import (
 )
 from .verifier import compute_checksum
 
-logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 50
 #: 单页失败的退避表（秒）。备份是长任务，一页抖掉就整轮作废太亏：500 条的群

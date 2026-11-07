@@ -1,13 +1,13 @@
 """定时备份调度。APScheduler 延迟导入：未安装时插件仍可手动备份。"""
 
-import logging
 import re
 from datetime import datetime
 from typing import Awaitable, Callable, Optional
 
+from astrbot.api import logger
+
 from .database import Database
 
-logger = logging.getLogger(__name__)
 
 # 标准 5 段 cron：分 时 日 月 周。允许 * / , - 和数字
 _CRON_FIELD = re.compile(r"^[\d*/,\-]+$")

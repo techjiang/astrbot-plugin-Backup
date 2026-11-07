@@ -4,11 +4,11 @@
 """
 
 import json
-import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.custom_filter import CustomFilter
@@ -45,7 +45,6 @@ from .core.restore_engine import RestoreEngine, RestoreError
 from .core.scheduler import BackupScheduler
 from .core.verifier import compute_checksum, read_manifest, verify_zip
 
-logger = logging.getLogger(__name__)
 
 PLUGIN_DIR = Path(__file__).resolve().parent
 
@@ -340,7 +339,7 @@ def _save_config(config: dict, injected: Optional[dict] = None) -> bool:
     "backup",
     "科技酱",
     "群聊消息备份插件：消息/媒体/成员全量或增量备份，多格式导出与一键恢复",
-    "1.0.0",
+    "1.0.1",
 )
 class BackupPlugin(Star):
     def __init__(self, context: Context, config: Optional[dict] = None):

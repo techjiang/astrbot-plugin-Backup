@@ -233,9 +233,14 @@ def install_fake_astrbot(monkeypatch):
     for _mod in (pkg, core, core_star, core_filter, custom_filter):
         _mod.__astrbot_stub__ = True
         _STUB_MODULE_NAMES.add(_mod.__name__)
+    # `from astrbot.api import logger` 是上架规范的硬要求，插件每个模块都有这一行；
+    # 替身缺了它，`import backup.main` 直接 ImportError。
+    import logging as _logging
+
     api = types.ModuleType("astrbot.api")
     api.__path__ = []
     api.__astrbot_stub__ = True
+    api.logger = _logging.getLogger("astrbot")
     api.event = api_event
     api.star = api_star
     for name, mod in (
@@ -617,3 +622,22 @@ class _FakePlatformManager:
 
     def get_insts(self):
         return list(self.platform_insts)
+
+
+def _make_logger_importable() -> None:
+    """收集阶段先保证 `from astrbot.api import logger` 能过。
+
+    `core/` 各模块按上架规范改成 `from astrbot.api import logger`，而用例在**收集
+    阶段**就会 import 它们——那时还没有任何 fixture 铺宿主。所以：真宿主拉得起来
+    就用真的（后面 `_lineage_env_ready` 再确认一遍），拉不起来（没装 / 依赖不全）
+    就整包铺替身。半真半假的残留先摘干净，否则 `astrbot.core` 缺 `__file__`
+    会把后面真加载的用例一起带歪。
+    """
+    try:
+        from astrbot.api import logger  # noqa: F401
+    except Exception:
+        unload_astrbot_modules()
+        install_fake_astrbot(_SysModulesProxy())
+
+
+_make_logger_importable()

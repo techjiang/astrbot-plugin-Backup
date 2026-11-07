@@ -1,12 +1,13 @@
 """恢复引擎。恢复是危险操作：先校验完整性，再按策略写入。"""
 
 import json
-import logging
 import zipfile
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+from astrbot.api import logger
 
 from .database import (
     REALTIME_BACKUP_ID,
@@ -26,8 +27,6 @@ from .verifier import (
     snapshot_evidence,
     verify_zip,
 )
-
-logger = logging.getLogger(__name__)
 
 
 class RestoreError(Exception):

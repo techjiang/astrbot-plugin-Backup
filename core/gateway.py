@@ -15,14 +15,14 @@
 """
 
 import errno
-import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
+from astrbot.api import logger
+
 from .download_route import PREFIX, DownloadResponse, handle_download
 
-logger = logging.getLogger(__name__)
 
 #: 网关自己的路径前缀，和面板路由同形
 GATEWAY_PREFIX = PREFIX

@@ -1,20 +1,20 @@
 """事件钩子：把 AstrBot 事件翻译成「实时归档 / 触发式备份」。
 
-不 import astrbot，全部按鸭子类型取字段，便于单测与多适配器共用。
-真实适配器字段不一致时，改这一个文件即可，主流程不动。
+除了 `astrbot.api.logger`，不依赖 astrbot：事件字段全部按鸭子类型取，便于单测与
+多适配器共用。真实适配器字段不一致时，改这一个文件即可，主流程不动。
 """
 
 import inspect
-import logging
 from datetime import datetime, timedelta
 from typing import Any, Optional
+
+from astrbot.api import logger
 
 from .auto_trigger import AutoTrigger
 from .parser import is_event_payload
 from .commands import PermissionChecker
 from .models import PRIVATE_ARCHIVE_GROUP, Message
 
-logger = logging.getLogger(__name__)
 
 # 「机器人自己被踢」的通知子类型。OneBot 协议里这个值是 kick_me，不叫 kick_off。
 # 注意不能把 `leave` 放进来：那是「有成员退群」，被踢的可以是别人。

@@ -20,8 +20,8 @@ desc: |
   - 恢复：恢复前比对校验和，skip / overwrite / merge 三种冲突策略，支持恢复到别的群
   - 定时：cron 定时备份；退群激增、群解散、机器人被踢自动补一次
 
-  导出链接带一次性 token 且会过期；备份文件默认落在插件目录之外的 ~/.astrbot-backup。
-version: 1.0.0
+  导出链接带一次性 token 且会过期；备份数据默认落在插件数据目录 data/plugin_data/backup。
+version: 1.0.1
 author: 科技酱
 repo: "https://github.com/techjiang/astrbot-plugin-Backup"
 

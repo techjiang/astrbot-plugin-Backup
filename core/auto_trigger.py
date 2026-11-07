@@ -1,11 +1,8 @@
 """触发式备份：大量退群、解散预警、机器人被踢。"""
 
-import logging
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Deque, Optional
-
-logger = logging.getLogger(__name__)
 
 
 class AutoTrigger:

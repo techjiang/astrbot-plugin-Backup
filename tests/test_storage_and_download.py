@@ -8,8 +8,21 @@ import pytest
 
 from backup.core.download_route import PREFIX, handle_download
 from backup.core.export_manager import ExportManager, parse_expire
-from backup.core.paths import DEFAULT_ROOT, UnsafeStoragePath, assert_writable_target, resolve_storage_root
+from backup.core.paths import (
+    LEGACY_ROOT,
+    UnsafeStoragePath,
+    assert_writable_target,
+    default_root,
+    resolve_storage_root,
+)
 from backup.tests.conftest import make_message
+
+
+def _installed_dir(tmp_path):
+    """照宿主装法的路径：`<data>/plugins/<插件目录名>`。"""
+    plugin_dir = tmp_path / "data" / "plugins" / "astrbot-plugin-Backup"
+    plugin_dir.mkdir(parents=True)
+    return plugin_dir
 
 
 def test_relative_storage_dir_resolves_under_plugin_dir(tmp_path):
@@ -20,9 +33,36 @@ def test_relative_storage_dir_resolves_under_plugin_dir(tmp_path):
     assert root.is_dir()
 
 
-def test_empty_storage_dir_uses_home_default(tmp_path):
-    root = resolve_storage_root({"storage_dir": ""}, tmp_path)
-    assert root == DEFAULT_ROOT.resolve()
+def test_empty_storage_dir_uses_the_host_plugin_data_dir(tmp_path):
+    """不给 storage_dir 时落在 `data/plugin_data/backup`——宿主自己管的那块。
+
+    以前默认是 `~/.astrbot-backup`：宿主的插件数据清理、迁移、审计都扫不到它，
+    用户卸载插件后那堆备份还留在原地，谁也不知道。上架规范要求落在插件数据目录，
+    这里把它钉住。
+    """
+    plugin_dir = _installed_dir(tmp_path)
+    root = resolve_storage_root({"storage_dir": ""}, plugin_dir)
+    assert root == (tmp_path / "data" / "plugin_data" / "backup").resolve()
+    assert root.is_dir()
+
+
+def test_default_root_is_named_after_the_plugin(tmp_path):
+    plugin_dir = _installed_dir(tmp_path)
+    assert default_root(plugin_dir).name == "backup"
+    assert default_root(plugin_dir).parent.name == "plugin_data"
+
+
+def test_missing_storage_dir_falls_back_to_the_same_place(tmp_path):
+    """`storage_dir` 整个不写和写空串是一回事。"""
+    plugin_dir = _installed_dir(tmp_path)
+    assert resolve_storage_root({}, plugin_dir) == resolve_storage_root(
+        {"storage_dir": ""}, plugin_dir
+    )
+
+
+def test_legacy_home_dir_is_no_longer_the_default():
+    """老路径只留作提醒，不许再被当成默认目录写进去。"""
+    assert LEGACY_ROOT.name == ".astrbot-backup"
 
 
 def test_absolute_storage_dir_is_respected(tmp_path):

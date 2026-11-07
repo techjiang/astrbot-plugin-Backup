@@ -6,14 +6,14 @@
 
 import inspect
 import json
-import logging
 import time
 from datetime import datetime
 from typing import Any, Optional
 
+from astrbot.api import logger
+
 from .models import Message, MessageType
 
-logger = logging.getLogger(__name__)
 
 _TYPE_KEYS = {
     "text": MessageType.TEXT,

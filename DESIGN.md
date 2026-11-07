@@ -38,11 +38,15 @@ exporters/         6 种格式，统一 export(ctx, path)
 （防止路径穿越），`take_token` 供一次性下载。`core/download_route.py` 的 `handle_download`
 把请求路径变成文件流，不依赖具体 Web 框架，方便接任何宿主。
 
-**存储目录为什么不在插件目录里**
-插件通常装在 AstrBot 的 `data/plugins` 下，面板一旦把 `data` 静态托管，`storage/` 就被挂在公网。
-默认落到 `~/.astrbot-backup`；配了 `storage_dir` 就按配置解析，但必须不在 `storage.web_roots` 内，
-否则启动即抛 `UnsafeStoragePath`（红线 3）。相对路径按插件目录解析而不是 CWD，
-避免启动位置变化导致数据「跑」到别处。
+**存储目录为什么落在插件数据目录**
+早期版本默认落到 `~/.astrbot-backup`，理由是「面板一旦把 `data` 静态托管，`storage/` 就挂在公网」。
+上架规范对这条的答案是另一件事：插件数据必须落在宿主给它的数据目录里，否则用户的迁移、
+备份、审计全都扫不到它——卸载插件之后那堆备份留在谁也不知道的地方。
+所以默认改成 `<AstrBot>/data/plugin_data/backup`（宿主 `StarTools.get_data_dir` 用的同一个位置），
+红线 3 由 `storage.web_roots` 兜：配了这个列表，落进去就启动即抛 `UnsafeStoragePath`。
+（4.14 的面板静态目录是 `data/dist`，不是整个 `data`。）
+配了 `storage_dir` 就按配置解析；相对路径按插件目录解析而不是 CWD，
+避免启动位置变化导致数据「跑」到别处。旧目录只保留一条启动告警，不自动搬家。
 
 **消息为什么按 (message_id, group_id) 唯一**
 唯一键留着 backup_id，同一批消息每备份一次就多一行。全量重跑、失败重试、恢复都会触发，
@@ -874,7 +878,7 @@ payload 塞在里头），`url` 就只在段上、`data` 里没有——`_media_
 | --- | --- |
 | 日志不打印消息内容 | 全仓日志只打 message_id / 群号 / 异常类型 |
 | 媒体失败不阻塞 | `BackupEngine._download_media` 内 try/except，计失败数 |
-| 备份不在 Web 目录 | `storage/exports`，靠 token 转发 |
+| 备份不在 Web 目录 | 落在 `data/plugin_data/backup`；`storage/web_roots` 命中即拒绝启动，导出靠 token 转发 |
 | 链接带 token 且过期 | `ExportManager._issue_token` / `resolve_token`；兑换入口是 `core/gateway.py`（宿主面板挂不通，见上文） |
 | 恢复二次确认 + 校验 | `RestoreEngine.restore(confirm=True)` + `verify_backup` + 本机 `export_evidence` 快照比对 |
 | 大群分页 | `PAGE_SIZE = 50` 循环拉取 |
@@ -1720,7 +1724,7 @@ bytes=0-` 交付的字节数和整份一样多，但它是**分段下载的第�
 ```python
 return f'<a class="file" href="{html.escape(media)}" ...>📎 {name}</a>'
 #                                          ↑ media_paths 的原值
-#                                          = /root/.astrbot-backup/media/20240501/m4_ghi.pdf
+#                                          = /srv/astrbot/data/plugin_data/backup/media/20240501/m4_ghi.pdf
 ```
 
 `_export_zip` 明明把媒体打进了 `media/20240501/m4_m4_ghi.pdf`，可 `chat.html`
@@ -1841,10 +1845,10 @@ href 用，点开是 `[下载失败]%20http://...`，一串谁也看不懂的东
 但同一份包里另外四份产物照旧写着导出机的绝对路径：
 
 ```
-messages.txt     <附件> /root/.astrbot-backup/media/20240501/m4_ghi.pdf
-messages.csv     ...,/root/.astrbot-backup/media/20240501/m4_ghi.pdf
-markdown/x.md    ![图片](/root/.astrbot-backup/media/20240501/m4_ghi.png)
-json/daily/x.json "media_paths": ["/root/.astrbot-backup/media/20240501/m4_ghi.png"]
+messages.txt     <附件> /srv/astrbot/data/plugin_data/backup/media/20240501/m4_ghi.pdf
+messages.csv     ...,/srv/astrbot/data/plugin_data/backup/media/20240501/m4_ghi.pdf
+markdown/x.md    ![图片](/srv/astrbot/data/plugin_data/backup/media/20240501/m4_ghi.png)
+json/daily/x.json "media_paths": ["/srv/astrbot/data/plugin_data/backup/media/20240501/m4_ghi.png"]
 ```
 
 而 `media_links` 是在这四份导出**之后**才算出来的，只有 `chat.html` 享受到了。
@@ -2290,7 +2294,7 @@ import 语句写不出来），本地测试时又是任意目录名，两者都�
 这条真实路径 import，然后：
 
 - `_get_modules` 认出了它，`star_map` 里有 `backup`，三个 handler 全在
-- 实例化成功，`storage` 落在 `~/.astrbot-backup`，网关真绑上了端口
+- 实例化成功，`storage` 落在 `data/plugin_data/backup`，网关真绑上了端口
 - `/backup help` / `list` / `export` / `status` 都对答
 - 导出 → 从网关 HTTP 下载（7.8KB）→ 同一个 token 再点一次回 410
 - 用另一个库从包里恢复：3 条消息 + 1 个媒体落回本机，路径指向本机
