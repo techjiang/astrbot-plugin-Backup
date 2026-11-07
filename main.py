@@ -339,7 +339,7 @@ def _save_config(config: dict, injected: Optional[dict] = None) -> bool:
 @register(
     "backup",
     "科技酱",
-    "群聊数据高级备份插件：消息/媒体/成员全量或增量备份，多格式导出与一键恢复",
+    "群聊消息备份插件：消息/媒体/成员全量或增量备份，多格式导出与一键恢复",
     "1.0.0",
 )
 class BackupPlugin(Star):
