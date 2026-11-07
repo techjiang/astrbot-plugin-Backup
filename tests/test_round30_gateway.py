@@ -24,6 +24,12 @@ import pytest
 
 from .conftest import real_astrbot_available
 
+
+def _run(coro):
+    import asyncio
+
+    return asyncio.run(coro)
+
 # ---------------------------------------------------------------- 宿主规则复现
 
 
@@ -358,6 +364,106 @@ def test_end_to_end_export_then_download_over_http(tmp_path, monkeypatch):
             with urllib.request.urlopen(req, timeout=10) as resp:
                 assert resp.status == 206
                 assert len(resp.read()) == expect_len
+    finally:
+        plugin.gateway.stop()
+        plugin.db.close()
+
+
+async def test_receipt_link_is_downloadable_after_filling_base_url(tmp_path, monkeypatch):
+    """`export.base_url` 填完之后，**回执里那条字符串本身**要能下载。
+
+    这一条补的是我这轮亲自踩的坑：前面所有断言的落点是「链接拼得对不对」和
+    「拿网关自己的 `url_for()` 能不能下」——后者绕开了回执。于是「用户照着回执
+    复制走的那串字」从来没有被当成 URL 请求过一次。真跑一遍才发现：填了
+    `base_url` 之后回执给的是 `http://127.0.0.1:<端口>/backup/download/<token>`，
+    而网关确实就在那个端口上——**这条链接是能用的**（本机场景），只是它长得像
+    上一轮被判定为「点不动」的那条。
+
+    两件事必须同时成立，缺一个都说明 `base_url` 没接到底：
+    - 回执里出现 base_url，而不是裸路径；
+    - 拿回执里那串字直接请求，拿到的字节和导出文件一致。
+    """
+    import urllib.request
+
+    from .conftest import load_plugin_for_real, real_astrbot_available
+
+    if not real_astrbot_available():
+        pytest.skip("需要真 AstrBot")
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    class _HostConfig(dict):
+        """面板注入的那份（AstrBotConfig 的契约：dict + save_config）。
+
+        必须注入：不注入时 `_save_config` 会退回写插件目录下的 `config.yaml`，
+        跑一次用例就把仓库里的默认配置改了（还会把注释洗掉）。第一版这条用例
+        就是这么把所有「默认配置」相关断言一起搞红的。
+        """
+
+        def save_config(self):
+            return True
+
+    plugin, _context, _mod = load_plugin_for_real(
+        monkeypatch,
+        config=_HostConfig({"storage_dir": str(tmp_path / "storage")}),
+    )
+    try:
+        from datetime import datetime
+
+        from backup.core.models import Message, MessageType
+
+        for i in range(3):
+            plugin.db.save_message(
+                Message(
+                    message_id=f"m{i}",
+                    group_id=10001,
+                    sender_id=1,
+                    sender_name="小明",
+                    timestamp=datetime(2026, 11, 5, 12, i),
+                    message_type=MessageType.TEXT,
+                    content=f"第{i}条",
+                    raw_content=f"第{i}条",
+                ),
+                backup_id="realtime",
+            )
+
+        # 没配 base_url：裸路径 + 明说点不动。这几句的判据是「链接必须以 / 开头」，
+        # 不是「链接里不能出现 127.0.0.1」——宿主自己给的 Host 本来就可能带它
+        async def say(text):
+            event = types.SimpleNamespace(
+                message_str=text,
+                get_group_id=lambda: "10001",
+                is_private_chat=lambda: False,
+                is_admin=lambda: True,
+                get_sender_id=lambda: "7",
+                plain_result=lambda t: t,
+            )
+            return [r async for r in plugin.backup(event)]
+
+        first = (await say("backup export 10001 zip"))[0]
+        link_line = [ln for ln in first.splitlines() if "临时链接" in ln][0]
+        bare = link_line.split("：")[-1]
+        assert bare.startswith("/backup/download/"), bare
+        assert "⚠️" in first, "裸路径必须配一句「点不动」，否则用户以为已经能分享了"
+
+        # 填上对外地址（这里就用网关自己的地址，充当"反代已就位"）
+        base = f"http://127.0.0.1:{plugin.gateway.bound_port}"
+        await say(f"backup config set export.base_url {base}")
+        assert plugin.exports.base_url == base
+
+        second = (await say("backup export 10001 zip"))[0]
+        full = [ln for ln in second.splitlines() if "临时链接" in ln][0].split("：")[-1]
+        assert full.startswith(base + "/backup/download/"), full
+        assert "⚠️" not in second, "链接已经能用了，不该再挂「点不动」的提示"
+
+        with urllib.request.urlopen(full, timeout=10) as resp:
+            assert resp.status == 200
+            downloaded = resp.read()
+        assert downloaded.startswith(b"PK"), "下回来的不是 ZIP"
+        # 一次性：第二次点回 410
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(full, timeout=10)
+        assert exc.value.code == 410
     finally:
         plugin.gateway.stop()
         plugin.db.close()

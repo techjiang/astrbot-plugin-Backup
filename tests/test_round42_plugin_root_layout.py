@@ -155,3 +155,38 @@ def test_schema_covers_every_key_the_code_reads():
 
     missing = flatten(schema) - flatten_conf(conf)
     assert not missing, f"config.yaml 缺这些项：{sorted(missing)}"
+
+
+def test_no_test_writes_into_the_repository_config():
+    """整个测试期间，仓库里的 `config.yaml` / `_conf_schema.json` 一个字节都不许变。
+
+    这是我这轮踩的坑：新加的那条「填完 base_url 后回执链接能下载」没有注入面板
+    配置，`_save_config` 于是退回写 `PLUGIN_DIR / config.yaml`——跑一次用例就把
+    默认配置改成了测试当时的值，还把注释全洗掉了。表现是**另外 15 条用例一起变红**，
+    而那 15 条验的是「默认配置该是什么」，它们读的正是被污染的那个文件。
+
+    这类污染比用例失败更麻烦：失败信息指向的是被改坏的默认值，而不是「谁改的」。
+    断言方式很土但有效——拿文件内容跟 git 里的版本比（没有 git 就跳过）。
+    """
+    import subprocess
+
+    files = ["config.yaml", "_conf_schema.json", "metadata.yaml"]
+    try:
+        out = subprocess.run(
+            ["git", "status", "--porcelain", "--"] + files,
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        pytest.skip("没有 git，无法判断是否被改过")
+    if out.returncode != 0:
+        pytest.skip("不是 git 工作区")
+    # 注意：这条用例只在「跑完整轮之后」才有意义，放到文件末尾靠 pytest 的顺序。
+    # 单独跑它时结果始终是干净的，不会假失败。
+    assert out.stdout.strip() == "", (
+        f"这些文件在测试期间被改写了：\n{out.stdout}\n"
+        "测试不许写仓库里的配置文件：给插件注入一份配置（dict + save_config），"
+        "或者 monkeypatch 掉 PLUGIN_DIR。"
+    )
