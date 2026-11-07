@@ -1,3 +1,4 @@
+import importlib.util
 import sys
 import types
 from datetime import datetime, timedelta
@@ -5,7 +6,26 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+#: 插件目录 = 仓库根。宿主（AstrBot 的 `PluginManager._get_modules`）只认
+#: `<插件目录>/main.py` 或 `<插件目录>/<目录名>.py`，所以这些文件必须摊在根上，
+#: 不能收进子目录。代价是「插件包」的模块名由宿主决定（`data.plugins.<目录名>`），
+#: 而用例需要一个写死的名字才能 import。
+#:
+#: 所以这里把根目录**按固定名 `backup` 注册进 `sys.modules`**：`__path__` 指向
+#: 仓库根，`backup.core.database` 这类导入于是和以前一模一样。不去 `sys.path` 里
+#: 找 `backup`——安装后的目录名是 `astrbot-plugin-Backup`（带连字符，import 语句
+#: 写不出来），测试时是本地的任意目录名，两者都不该成为用例的前提。
+_PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+if "backup" not in sys.modules:
+    _spec = importlib.util.spec_from_file_location(
+        "backup",
+        _PLUGIN_ROOT / "__init__.py",
+        submodule_search_locations=[str(_PLUGIN_ROOT)],
+    )
+    _pkg = importlib.util.module_from_spec(_spec)
+    sys.modules["backup"] = _pkg
+    _spec.loader.exec_module(_pkg)
+sys.path.insert(0, str(_PLUGIN_ROOT.parent))
 
 from backup.core.database import Database  # noqa: E402
 from backup.core.models import GroupInfo, GroupMember, Message, MessageType  # noqa: E402

@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="backup/assets/banner.svg" alt="Backup 高级备份" width="100%">
+  <img src="assets/banner.svg" alt="Backup 高级备份" width="100%">
 </p>
 
 <p align="center">
-  <img src="backup/assets/logo.svg" alt="logo" width="72">
+  <img src="assets/logo.svg" alt="logo" width="72">
 </p>
 
 # Backup 高级备份
@@ -56,10 +56,18 @@
 ```bash
 cd AstrBot/data/plugins
 git clone <本仓库地址> astrbot-plugin-Backup
-pip install -r astrbot-plugin-Backup/backup/requirements.txt
+pip install -r astrbot-plugin-Backup/requirements.txt
 ```
 
 重启 AstrBot 后，插件会出现在插件列表中。
+
+装完记得做两步（都不做也能跑，但会少东西）：
+
+1. 面板里打开这个插件的配置，把 `export.base_url` 填成网关的**对外地址**
+   （反代/内网穿透指向 `gateway.port`）。不填的话导出回执只给裸路径，
+   并在回执里说明「这条链接只有本机能用」——因为那时它确实只有本机能用。
+2. `storage_dir` 默认落在 `~/.astrbot-backup`，刻意避开插件目录。要换位置就填
+   绝对路径；如果新位置在 Web 根下，插件会**拒绝启动**（红线 3）。
 
 ## 命令速查
 
@@ -82,7 +90,7 @@ pip install -r astrbot-plugin-Backup/backup/requirements.txt
 
 ## 配置
 
-配置文件：`backup/config.yaml`
+配置文件：`config.yaml`（面板里改也行，两边同源）
 
 ```yaml
 backup:
@@ -287,12 +295,12 @@ A：能。每次备份都单独记着「覆盖过哪些消息」，后续备份�
 ```bash
 pip install pytest pytest-asyncio coverage
 python -m pytest -q
-python -m coverage run --source=backup/core,backup/exporters -m pytest -q && python -m coverage report
+python -m coverage run --source=core,exporters -m pytest -q && python -m coverage report
 ```
 
-覆盖率要求 ≥ 80%（当前 90%，按 `backup/core` + `backup/exporters` 口径统计）。
+覆盖率要求 ≥ 80%（当前 90%，按 `core/` + `exporters/` 口径统计）。
 
-**接线层要拿真 AstrBot 验**。`backup/main.py` 的 bug 从来不在纯逻辑里：
+**接线层要拿真 AstrBot 验**。`main.py` 的 bug 从来不在纯逻辑里：
 `@filter.command` 到底是不是「注册 handler」、`CommandFilter` 会不会 inspect 签名、
 真 pipeline 会不会把一条通知送进两个钩子——这些只有装一份 AstrBot 才能确定。
 
@@ -304,22 +312,29 @@ python -m pytest -q      # tests/test_round28_real_astrbot_loader.py 自动生�
 没装时那一组自动 skip（不是「不用验」，是「这个环境验不了」）。它只假一件事：
 OneBot 客户端——那本来就是平台本身。
 
-项目结构：
+项目结构（**插件根 = 仓库根**）：
 
 ```
-backup/
+.
 ├── metadata.yaml          # 插件元数据
 ├── _conf_schema.json      # 面板配置 schema（与 config.yaml 同源）
 ├── main.py                # 命令注册 + 事件钩子（唯一依赖 AstrBot 的文件）
 ├── config.yaml            # 默认配置
+├── requirements.txt       # 宿主装插件时会读它
 ├── logo.png               # 插件市场图标（AstrBot 只认 logo.png）
 ├── assets/                # SVG 品牌素材（logo / icon / banner）
 ├── core/                  # 备份、恢复、导出调度、解析、校验、调度器
 ├── exporters/             # 6 种格式导出器 + ZIP
 ├── templates/chat.html    # HTML 导出模板（内联样式与脚本）
-├── storage/               # 运行时数据（git 忽略）
 └── tests/                 # pytest
 ```
+
+**为什么必须是仓库根**：AstrBot 的插件加载器（`PluginManager._get_modules`）只认
+`<插件目录>/main.py` 或 `<插件目录>/<目录名>.py`，目录里没有就直接跳过。所以这些
+文件不能收进 `backup/` 这样的子目录——收进去的表现是：插件列表里根本没有它，
+日志只有一句「未找到 main.py 或者 xxx.py，跳过」。
+
+运行时数据不在这里，见下面的 `storage_dir`。
 
 ## 贡献
 

@@ -3,6 +3,5 @@
 htmlcov/
 __pycache__/
 *.pyc
-backup/storage/
 storage/
 data/

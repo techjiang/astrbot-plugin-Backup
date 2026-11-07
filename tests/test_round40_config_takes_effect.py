@@ -101,6 +101,13 @@ def plugin_factory(tmp_path, monkeypatch):
     插件目录整个 copy 到临时目录：`/backup config set` 在「没有注入配置」时会
     写 `PLUGIN_DIR/config.yaml`，不能让它写回仓库。
     """
+    # 这一组要造**真的插件实例**（真 `Star` / 真 `Context` / 真注册链），没有宿主
+    # 就没有「运行中的组件」可问。没装时必须 skip，不能塌成 23 条红：
+    # README 承诺的是「没装那一组自动 skip」，而塌成红色会让「这个环境验不了」
+    # 看起来像「代码坏了」——两者要修的东西完全不同。
+    if not real_astrbot_available():
+        pytest.skip("需要真 AstrBot（pip install astrbot==4.14.6）")
+
     source = Path(__file__).resolve().parent.parent
     plugin_dir = tmp_path / "plug"
     shutil.copytree(

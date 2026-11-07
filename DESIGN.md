@@ -2216,3 +2216,86 @@ Telegram 的 `-100…` 都能解析了。这轮补的是「解析出来之后真
 网络偶尔断一下、进程偶尔被杀。
 
 **「跑得通」和「跑得动」是两个命题。** 前 40 轮一直在证前者。
+
+## 第 42 轮：插件从来没被装上过
+
+这一轮的起点不是读代码，是按 README 的安装段装一遍：
+
+```bash
+cd AstrBot/data/plugins
+git clone <本仓库> astrbot-plugin-Backup
+```
+
+装完，插件列表里没有它。日志只有一行：
+
+```
+插件 astrbot-plugin-Backup 未找到 main.py 或者 astrbot-plugin-Backup.py，跳过。
+```
+
+`PluginManager._get_modules` 的判据就这一条：
+
+```python
+if os.path.exists(os.path.join(path, d, "main.py")):      module_str = "main"
+elif os.path.exists(os.path.join(path, d, d + ".py")):    module_str = d
+else:                                                     continue   # 跳过
+```
+
+而仓库把 `main.py`、`metadata.yaml`、`_conf_schema.json`、`requirements.txt`、
+`config.yaml`、`logo.png`、`templates/`、`assets/` 全收在了 `backup/` 子目录里。
+
+### 为什么 639 条用例一条都没发现
+
+因为它们**都从「文件在哪」出发**（`Path(__file__).resolve().parent.parent`），
+没有一条从「宿主怎么找插件」出发。更关键的是 `load_plugin_for_real` 自己把加载器
+绕开了：
+
+```python
+spec = importlib.util.spec_from_file_location(name, plugin_dir / "__init__.py", ...)
+```
+
+自己算目录、自己造 spec，等于把 `_get_modules` 里那条 `os.path.exists` 判据
+整个跳过。它验的是「这段代码 import 得动吗」，不是「宿主会加载它吗」。这两个问题
+在这份代码里曾经是两个答案。
+
+### 表现，以及为什么它比崩溃更难发现
+
+- 插件列表里**没有这个插件**，不是「装坏了报错」。用户看到的是「我装了但没生效」，
+  第一反应是回去查安装步骤，而安装步骤正是错的。
+- 同一个 `backup/` 目录还会让 `import backup.core...` 在进程里命中**磁盘上那个
+  子目录**，而宿主加载的是 `data.plugins.<目录名>.main`。同一份代码两份模块对象，
+  改配置、改状态、注册表全对不上——这一层只有在把文件挪到根上之后才会暴露。
+
+### 改了什么
+
+文件全部搬到插件根，`backup/` 目录消失。仓库根 = 插件根，和任何 AstrBot 插件一样。
+
+测试侧不能再靠目录位置，所以 `tests/conftest.py` 开头按**固定名 `backup`** 把根目录
+注册进 `sys.modules`（`__path__` 指向根），`backup.core.database` 这类导入原样不动。
+不去 `sys.path` 里找 `backup`：安装后的目录名是 `astrbot-plugin-Backup`（带连字符，
+import 语句写不出来），本地测试时又是任意目录名，两者都不该成为用例的前提。
+
+`tests/test_round42_plugin_root_layout.py`（12 条）：
+
+- 8 条「宿主直接读的文件必须在插件根」（`main.py` / `metadata.yaml` /
+  `_conf_schema.json` / `requirements.txt` / `config.yaml` / `logo.png` /
+  `templates/chat.html` / `assets/logo.svg`）
+- 1 条「`backup/` 子目录不许回来」（防两份模块对象）
+- 1 条**调宿主自己的 `_get_modules`**（不经过任何测试侧计算，旧布局上返回 `[]`）
+- 1 条 `metadata.yaml` 字段完整性（宿主缺 name/version/author 会直接抛）
+- 1 条 schema 与 `config.yaml` 的键不漂移
+
+### 端到端
+
+按真装法放到 `data/plugins/astrbot-plugin-Backup`，用 `data.plugins.<目录名>.main`
+这条真实路径 import，然后：
+
+- `_get_modules` 认出了它，`star_map` 里有 `backup`，三个 handler 全在
+- 实例化成功，`storage` 落在 `~/.astrbot-backup`，网关真绑上了端口
+- `/backup help` / `list` / `export` / `status` 都对答
+- 导出 → 从网关 HTTP 下载（7.8KB）→ 同一个 token 再点一次回 410
+- 用另一个库从包里恢复：3 条消息 + 1 个媒体落回本机，路径指向本机
+
+### 一句总结
+
+前 41 轮验的是「代码写得对不对」，这轮是**「它到用户手里到底存不存在」**。
+用例可以绕开加载器验逻辑，但用户不能——他手里只有 README 和那个目录。
