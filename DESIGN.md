@@ -2403,11 +2403,23 @@ HISTORY_CAPABLE = ("aiocqhttp", "telegram", "discord", "slack", "wecom")
 - `_pick_by_capability` 从「有客户端就选」改成按 `PREFERRED_ORDER` 挑。webchat、
   telegram、discord 也有客户端，挑中它们等于挑中一次必然返回 0 条的备份。
 - `metadata.yaml`：`display_name` → **Backup**；补 `short_desc` /
-  `astrbot_version(">=4.14,<5")` / `logo` / `social_link`；`tags` 换成 8 个真关键词；
-  `support_platforms` 只写 `aiocqhttp`，并按字段用途把「宿主会读的」和「写给人看的」
-  分成两段，省得下次又改错键名。
+  `astrbot_version(">=4.14,<5")` / `logo` / `social_link`；`category: utilities`；
+  `tags` 换成 8 个英文关键词 + 5 个中文关键词；`support_platforms` 只写 `aiocqhttp`，
+  并按字段用途把「宿主会读的」「市场读的」「写给人看的」分成三段，省得下次又改错键名。
 - `name` **没动**：它同时是宿主 import 用的模块名和市场 `plugin_id` 的前半段
   （`author/name`）。改它等于换一个插件——已装的那份会变成两个，面板上并排出现。
+
+### 分类不是自由文本
+
+「分类属于：工具」这句话落到 `metadata.yaml` 里，字段名是 `category`，值是 **`utilities`**。
+
+市场源（`AstrBot_Plugins_Collection/plugins.json`，1300 多条记录）里实际在用的
+category 只有五个：`entertainment` / `utilities` / `ai_tools` / `integrations` /
+`productivity`。写成中文「工具」不会报错——只是市场那边认不出来，插件永远不会出现在
+「工具」这一栏。这类错误的症状只有「分类栏里没有我」一个，最难查。
+
+顺手把 tags 从纯英文改成中英混排：市场里 1300 多个插件有 780 个带中文标签，
+只给英文等于放弃一半搜索入口。
 
 ### 为什么 `astrbot_version` 是 `>=4.14,<5`
 
@@ -2432,7 +2444,8 @@ banner 第二行也顺手重排：「高级备份 · AstrBot 插件」→「Astr
 
 ### 验证
 
-- `tests/test_round44_metadata.py`（12 条）：`display_name` 就是 Backup、
+- `tests/test_round44_metadata.py`（13 条）：`category` 必须是 `utilities`、
+  `display_name` 就是 Backup、
   `name` 没被顺手改、`short_desc` 长度与 `tags` 去重/小写、**`support_platforms`
   必须等于 `core/platforms.py::HISTORY_PLATFORMS`**、平台名必须是宿主认识的 key
   （装了 AstrBot 就拿 `ADAPTER_NAME_2_TYPE` 真表比）、`astrbot_version` 能被 PEP 440

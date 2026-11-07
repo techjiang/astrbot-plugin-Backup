@@ -42,7 +42,16 @@ astrbot_version: ">=4.14,<5"
 support_platforms:
   - aiocqhttp
 
-# 插件市场分类与搜索关键词
+# ---- 插件市场字段，宿主不读，市场读取端认 ----
+#
+# `category` 是市场里的**单值分类 key**，不是自由文本。市场源里实际在用的只有这五个：
+#   entertainment（娱乐）/ utilities（工具）/ ai_tools（AI 工具）
+#   / integrations（集成）/ productivity（效率）
+# 「工具」对应 `utilities`。
+category: utilities
+
+# 市场分类与搜索关键词。市场按 tags 做搜索，中英混排是常态
+# （市场源里 1300 多个插件有 780 个带中文标签），所以两边都给。
 tags:
   - backup
   - restore
@@ -52,8 +61,13 @@ tags:
   - data-migration
   - sqlite
   - zip
+  - 备份
+  - 工具
+  - 群聊
+  - 导出
+  - 恢复
 
-# ---- 以下是信息字段，宿主不读，写给人看 ----
+# ---- 作者与授权信息，写给人看 ----
 logo: "logo.png"
 author_url: "https://www.asoe.cn"
 homepage: "https://docs.asoe.cn"

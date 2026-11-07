@@ -48,6 +48,22 @@ def test_display_name_is_just_backup(meta):
     )
 
 
+#: 市场源里实际在用的分类 key。写成别的名字不会报错，只是永远不会被归到那一栏。
+MARKET_CATEGORIES = {"entertainment", "utilities", "ai_tools", "integrations", "productivity"}
+
+
+def test_category_is_the_market_key_for_tools(meta):
+    """「分类：工具」在市场里叫 `utilities`。
+
+    `category` 是**单值 key**，不是自由文本。写「工具」看着对，市场那边认不出来——
+    这类错误没有报错，只有「分类栏里没有我」这一个症状。
+    """
+    assert meta.get("category") == "utilities", (
+        f"分类该是 utilities（工具），现在是 {meta.get('category')!r}"
+    )
+    assert meta["category"] in MARKET_CATEGORIES
+
+
 def test_short_desc_and_tags_are_present_and_sane(meta):
     """`short_desc` 是卡片紧凑布局用的，没有就退化成截断的 desc 长描述。"""
     short = meta.get("short_desc")
@@ -58,7 +74,13 @@ def test_short_desc_and_tags_are_present_and_sane(meta):
     assert isinstance(tags, list) and len(tags) >= 5, "tags 太少，市场里搜不到"
     assert all(isinstance(t, str) and t.strip() for t in tags)
     assert len(set(tags)) == len(tags), "tags 有重复"
-    assert all(t == t.lower() for t in tags), "tags 统一小写，免得同一件事算两个关键词"
+    assert [t for t in tags if t != t.lower()] == [], (
+        "英文标签统一小写，免得同一件事算两个关键词"
+    )
+    # 市场里中文检索是常态（1300 多个插件里 780 个带中文标签），只给英文等于放弃一半入口
+    assert any(any("\u4e00" <= c <= "\u9fff" for c in t) for t in tags), (
+        "tags 里没有中文：市场的中文搜索搜不到这个插件"
+    )
 
 
 def test_support_platforms_matches_what_the_code_can_actually_do(meta):
