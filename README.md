@@ -1,12 +1,12 @@
 <p align="center">
-  <img src="assets/banner.svg" alt="Backup 高级备份" width="100%">
+  <img src="assets/banner.svg" alt="Backup" width="100%">
 </p>
 
 <p align="center">
   <img src="assets/logo.svg" alt="logo" width="72">
 </p>
 
-# Backup 高级备份
+# Backup
 
 > AstrBot 群聊数据备份插件。把群里的消息、文件、图片、成员、群信息全备份下来，支持定时自动备份、增量备份、多格式导出、一键恢复。群被炸了、机器人迁移、数据审计，都靠它。
 
@@ -50,6 +50,24 @@
 - `zip` 里每一份产物都是**能走的**：`chat.html`、`messages.txt`、`messages.csv`、
   `markdown/*.md`、`json/*.json` 里的媒体地址全部指向包内相对路径 `media/...`，
   解压到任何机器上都能打开、点得动。
+
+## 支持平台
+
+| 能力 | 需要什么平台 |
+| --- | --- |
+| 历史消息 / 成员 / 公告 / 群文件备份 | `aiocqhttp`（OneBot v11：NapCat、Lagrange、go-cqhttp） |
+| 实时归档（消息进群即写库） | 任意平台，走事件钩子 |
+| 导出 / 恢复 / 定时 / 触发式备份 | 与平台无关，纯本地 |
+
+为什么只有 `aiocqhttp`：备份的历史数据全部来自平台的历史消息接口，而 AstrBot 的
+适配器大多只做「收消息、转事件」，没有回捞历史的入口。OneBot 客户端的
+`call_action` 能直接打 `get_group_msg_history` / `get_group_member_list` /
+`get_group_info`，备份引擎正是按这几个名字探测的。
+
+所以 `metadata.yaml` 的 `support_platforms` 只写了 `aiocqhttp`——一份经得起对照的
+能力声明，比一份好看的列表有用。装在 telegram / discord / slack 上插件照常加载、
+实时归档照常工作，只是 `/backup now` 会拉不到历史消息，回执里直接说清原因，
+而不是闷掉报个「备份完成 0 条」。
 
 ## 安装
 

@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="Backup 高级备份">
-  <title>Backup 高级备份</title>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="Backup">
+  <title>Backup</title>
   <defs>
     <linearGradient id="plate" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="216" y2="216">
       <stop offset="0%" stop-color="#8B5CF6"/>

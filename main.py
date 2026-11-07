@@ -1,4 +1,4 @@
-"""Backup 高级备份 · AstrBot 插件入口。
+"""Backup · AstrBot 插件入口。
 
 作者：科技酱 · https://www.asoe.cn
 """
@@ -40,6 +40,7 @@ from .core.event_hooks import (
     notice_payload,
 )
 from .core.paths import assert_writable_target, resolve_storage_root
+from .core.platforms import HISTORY_PLATFORMS, PREFERRED_ORDER
 from .core.restore_engine import RestoreEngine, RestoreError
 from .core.scheduler import BackupScheduler
 from .core.verifier import compute_checksum, read_manifest, verify_zip
@@ -484,7 +485,7 @@ class BackupPlugin(Star):
 
     @filter.command("backup")
     async def backup(self, event: AstrMessageEvent):
-        """Backup 高级备份命令入口"""
+        """Backup 命令入口"""
         args = [a for a in event.message_str.strip().split() if a]
         if args and args[0].lower() == "backup":
             args = args[1:]
@@ -1047,8 +1048,11 @@ class BackupPlugin(Star):
         f"/{PLUGIN_NAME}/backup/download/<token>",
     )
 
-    #: 能拉取群历史消息的平台类型。备份的全部数据都从这几个平台来
-    HISTORY_CAPABLE = ("aiocqhttp", "telegram", "discord", "slack", "wecom")
+    #: 能拉取群历史消息的平台类型。名单在 `core/platforms.py`——那里同时是
+    #: `metadata.yaml` 的 `support_platforms` 的依据，两处共用一个来源。
+    HISTORY_CAPABLE = HISTORY_PLATFORMS
+    #: 挑平台的偏好顺序：能拉历史的排前面，有客户端的其次
+    PREFERRED_PLATFORMS = PREFERRED_ORDER
 
     def _platform_by(self, key, by_id: bool):
         """按 id / 名字 / 「随便哪个」找平台实例。
@@ -1104,11 +1108,14 @@ class BackupPlugin(Star):
             if client is not None:
                 with_client.append(inst)
         candidates = with_client or insts
-        for inst in candidates:
-            meta = inst.meta() if callable(getattr(inst, "meta", None)) else None
-            name = str(getattr(meta, "name", "") or "").lower()
-            if name in self.HISTORY_CAPABLE:
-                return inst
+        # 先按偏好顺序找：能拉历史消息的最合适，其次是有客户端的那几个。
+        # 只认「有没有客户端」是不够的——webchat、qq_official 也有客户端，但它们
+        # 拿不到群历史，挑中它们等于挑中一个必然失败的备份。
+        for name in self.PREFERRED_PLATFORMS:
+            for inst in candidates:
+                meta = inst.meta() if callable(getattr(inst, "meta", None)) else None
+                if str(getattr(meta, "name", "") or "").lower() == name:
+                    return inst
         return candidates[0]
 
     async def _backup(self, group_id: int, event=None):

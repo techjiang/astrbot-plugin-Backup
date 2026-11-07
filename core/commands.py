@@ -10,7 +10,7 @@ from .models import PRIVATE_ARCHIVE_GROUP
 
 SIZE_UNITS = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3}
 
-HELP_TEXT = """**Backup 高级备份** · 命令速查
+HELP_TEXT = """**Backup** · 命令速查
 
 `/backup help` 帮助
 `/backup now [群号]` 立即备份
