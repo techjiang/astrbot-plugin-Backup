@@ -2450,7 +2450,7 @@ banner 第二行也顺手重排：「高级备份 · AstrBot 插件」→「Astr
 
 ### 验证
 
-- `tests/test_round44_metadata.py`（14 条）：`category` 必须是 `utilities`、
+- `tests/test_round44_metadata.py`（18 条）：`category` 必须是 `utilities`、
   README「插件信息」表与 metadata 不许漂、
   `display_name` 就是 Backup、
   `name` 没被顺手改、`short_desc` 长度与 `tags` 去重/小写、**`support_platforms`
@@ -2465,6 +2465,23 @@ banner 第二行也顺手重排：「高级备份 · AstrBot 插件」→「Astr
   `repo=https://github.com/techjiang/astrbot-plugin-Backup`（市场规范要的 HTTPS
   GitHub 形状）。
 - banner / logo 重新渲染看过（白底、800px / 256px）。
+
+### 收尾：这张名片还有四处没人盯着
+
+字段补齐之后再按规范对一遍，剩下四条不是「缺字段」，是**没有任何东西阻止它下次
+改错**——补成断言才算真的钉住：
+
+| 断言 | 拦的是什么 |
+| --- | --- |
+| 不许写 `description` | 它是宿主 `_load_plugin_metadata` 里给老插件留的兜底别名，不是规范。写了这一版能活，哪天兼容被删就是「插件元数据信息不完整」 |
+| 不许出现 `support_platform` / `platform` / `plugin_id` 等 | 规范 §8/§9 的已弃用与保留字段。不影响加载，会让市场更新链路认为「这条记录还没迁移」 |
+| `name` / `author` / `version` 必须等于 `@register(...)` | 卡片读 yaml、运行时 `StarMetadata` 读装饰器。漂开的表现是面板显示 1.0.0、装的是 1.1.0 |
+| `logo: logo.png` 必须真有文件、真 PNG | 市场读这个键取图，宿主**不读它**——只在根目录找写死的 `logo.png`。文件不在是空白方块，不是 PNG 是裂图 |
+
+最后一条顺带在 `metadata.yaml` 里补了注释：这个键的两面性（市场读 / 宿主不读）
+原来一句话都没写，改它的人只会看到「改了没反应」。
+
+补完：**674 passed / 1 skipped**（装 AstrBot 4.14.6），覆盖率 90%。
 
 ### 一句总结
 
