@@ -70,6 +70,11 @@ tags:
   - 恢复
 
 # ---- 第三段：作者与授权信息，写给人看 ----
+#
+# `logo` 的两面性：市场按这个键取图（规范里是「HTTPS 图片 URL 或相对静态路径」），
+# 宿主则**不看这个键**，它只在插件根目录里找写死的 `logo.png`
+# （`PluginManager.logo_fname`）。所以这里的值只能是 `logo.png` 本身——哪天宿主
+# 支持了别的文件名，改这里才有意义。文件真伪由用例守（不是空白方块、不是裂图）。
 logo: "logo.png"
 author_url: "https://www.asoe.cn"
 homepage: "https://docs.asoe.cn"

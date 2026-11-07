@@ -293,3 +293,63 @@ def test_pick_prefers_history_capable_over_other_clients(monkeypatch, tmp_path):
         },
     )
     assert plugin._resolve_platform(None).meta().name == "aiocqhttp"
+
+
+# ------------------------------------ 补：名片上还有三笔没人验，和一个「两处落点」的坑
+
+
+def test_description_alias_is_not_used(meta):
+    """`description` 只是宿主兜底时的别名，不该靠那段兼容代码活着。
+
+    `_load_plugin_metadata` 里有一句
+    `if "desc" not in metadata and "description" in metadata: metadata["desc"] = ...`。
+    它是给老插件留的迁移口子，不是规范——真写了 `description`，宿主这一版能活，
+    哪天那段兼容被删就是「插件元数据信息不完整」。
+    """
+    assert "desc" in meta
+    assert "description" not in meta, "写了 description：命中的是宿主的兼容分支"
+
+
+def test_no_deprecated_or_reserved_market_keys(meta):
+    """市场规范里 `support_platform` / `platform` 已弃用，另有一批字段是保留的。
+
+    这些字段不会被宿主读走，但会被市场数据源当成「这条记录还没迁移」或「身份字段
+    被手写」，两种情况都让更新链路变得不可预测（规范 §9、§8）。
+    """
+    deprecated = {"support_platform", "platform"}
+    reserved = {"plugin_id", "market_plugin_id", "root_dir_name", "install_method", "installed_at"}
+    keys = set(meta)
+    assert not (keys & deprecated), f"用了已弃用字段：{sorted(keys & deprecated)}"
+    assert not (keys & reserved), f"用了保留字段：{sorted(keys & reserved)}"
+
+
+def test_identity_matches_the_register_decorator(meta):
+    """`metadata.yaml` 和 `@register(...)` 是同一份身份的两处落点，不许漂。
+
+    卡片读前者、运行时 `StarMetadata` 读后者。版本漂开时面板显示 1.0.0、装的却是
+    1.1.0，用户没法判断自己装的是哪版；作者漂开时市场里登记的 plugin_id 和本地
+    装的插件会被认成两个。
+    """
+    source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
+    match = re.search(
+        r'@register\(\s*"([^"]+)",\s*"([^"]+)",\s*"([^"]*)",\s*"([^"]+)"\s*,?\s*\)',
+        source,
+    )
+    assert match, "没在 main.py 里找到四段式的 @register(...)"
+    name, author, _desc, version = match.groups()
+    assert name == meta["name"]
+    assert author == meta["author"], f"装饰器作者 {author} vs metadata {meta['author']}"
+    assert version == meta["version"], f"装饰器版本 {version} vs metadata {meta['version']}"
+
+
+def test_declared_logo_really_exists_and_is_a_png(meta):
+    """`logo` 声明了名字就得真有那个文件，而且是真 PNG。
+
+    宿主找图标的文件名是写死的（`PluginManager.logo_fname = "logo.png"`），
+    面板按后缀把它当图片发出去——文件不在是空白方块，文件在但不是 PNG 是裂图。
+    仓库里的品牌素材是 SVG，所以「根上有 logo.png」这件事必须被钉住。
+    """
+    assert meta.get("logo") == "logo.png", "logo 要么不写，要么就写宿主认的那个文件名"
+    png = REPO_ROOT / "logo.png"
+    assert png.is_file() and png.stat().st_size > 0
+    assert png.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n", "logo.png 不是真 PNG"
