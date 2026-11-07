@@ -1,8 +1,10 @@
 # AstrBot 插件元数据。
 #
-# 上半部分是宿主**真的会读**的字段（`PluginManager._load_plugin_metadata` +
-# `_PluginUpdater.validate_plugin_metadata`）；下半部分宿主不读，是写给人、
-# 给插件市场看的。混在一起最容易出的错是：以为改了个名字，面板上却纹丝不动。
+# 按「谁会读」分三段摆：
+#   1. 宿主会读（`PluginManager._load_plugin_metadata` + `_PluginUpdater.validate_plugin_metadata`）
+#   2. 插件市场会读（`category` / `tags` / `support_platforms` / `astrbot_version` …）
+#   3. 写给人看（作者链接、邮箱、许可证）
+# 混在一起最容易出的错是：以为改了个名字，面板上却纹丝不动——因为改的那行压根没人读。
 #
 # 宿主必填（缺一个直接抛「插件元数据信息不完整」）：name / desc / version / author
 name: backup
@@ -23,7 +25,7 @@ version: 1.0.0
 author: 科技酱
 repo: "https://github.com/techjiang/astrbot-plugin-Backup"
 
-# 宿主版本不满足这一条就**拒绝加载**（`_validate_astrbot_version_specifier`）。
+# 宿主 + 市场都会读。版本不满足这一条宿主就**拒绝加载**（`_validate_astrbot_version_specifier`）。
 # 下限取 4.14：钩子必须挂在任意事件上（`CustomFilter`），命令过滤器会把实时归档
 # 和退群聚合全饿死；实测环境是 4.14.6，上限留给将来。
 astrbot_version: ">=4.14,<5"
@@ -42,7 +44,7 @@ astrbot_version: ">=4.14,<5"
 support_platforms:
   - aiocqhttp
 
-# ---- 插件市场字段，宿主不读，市场读取端认 ----
+# ---- 第二段：插件市场会读的字段 ----
 #
 # `category` 是市场里的**单值分类 key**，不是自由文本。市场源里实际在用的只有这五个：
 #   entertainment（娱乐）/ utilities（工具）/ ai_tools（AI 工具）
@@ -67,7 +69,7 @@ tags:
   - 导出
   - 恢复
 
-# ---- 作者与授权信息，写给人看 ----
+# ---- 第三段：作者与授权信息，写给人看 ----
 logo: "logo.png"
 author_url: "https://www.asoe.cn"
 homepage: "https://docs.asoe.cn"
