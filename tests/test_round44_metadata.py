@@ -83,6 +83,24 @@ def test_short_desc_and_tags_are_present_and_sane(meta):
     )
 
 
+def test_readme_states_the_market_identity(meta):
+    """README 顶上那张「插件信息」表得和 metadata 对得上。
+
+    `category` 写进 yaml 之后，宿主不读、面板不显示——它唯二的出口是市场记录和
+    README。市场那条要等发布才生效，README 这条是现在就能给用户看的。两边漂开
+    就是文档在说谎，而用户没有任何别的途径发现。
+    """
+    text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "## 插件信息" in text, "README 缺「插件信息」一节"
+    assert meta["display_name"] in text, f"README 没写插件名 {meta['display_name']!r}"
+    assert meta["category"] in text, (
+        f"README 没写市场分类 key {meta['category']!r}——用户会以为分类是自由文本"
+    )
+    for platform in meta["support_platforms"]:
+        assert platform in text, f"README 没提支持平台 {platform}"
+    assert meta["astrbot_version"] in text, f"README 没写 AstrBot 版本要求 {meta['astrbot_version']!r}"
+
+
 def test_support_platforms_matches_what_the_code_can_actually_do(meta):
     """声明的平台必须就是 `core/platforms.py` 里那份「真能回捞历史」的名单。
 

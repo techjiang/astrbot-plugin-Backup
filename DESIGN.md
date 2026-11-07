@@ -2421,6 +2421,12 @@ category 只有五个：`entertainment` / `utilities` / `ai_tools` / `integratio
 顺手把 tags 从纯英文改成中英混排：市场里 1300 多个插件有 780 个带中文标签，
 只给英文等于放弃一半搜索入口。
 
+`category` 还有一个别的字段没有的处境：**写进 yaml 之后它没有任何出口**。宿主不读
+（`StarMetadata` 上没有这个属性），面板「类别」读的是市场记录，而市场记录要等发布
+才有。也就是说本地怎么改都看不出对错——所以 README 顶上补了一张「插件信息」表，
+把名字、分类（连市场 key 一起写出来）、支持平台、版本要求摊开。那是它现在唯一一处
+用户看得见的落地，也是唯一一处写错了能被看见的地方。
+
 ### 为什么 `astrbot_version` 是 `>=4.14,<5`
 
 下限不是拍的：钩子必须挂在**任意事件**上（`@filter.custom_filter`），命令过滤器会把
@@ -2444,7 +2450,8 @@ banner 第二行也顺手重排：「高级备份 · AstrBot 插件」→「Astr
 
 ### 验证
 
-- `tests/test_round44_metadata.py`（13 条）：`category` 必须是 `utilities`、
+- `tests/test_round44_metadata.py`（14 条）：`category` 必须是 `utilities`、
+  README「插件信息」表与 metadata 不许漂、
   `display_name` 就是 Backup、
   `name` 没被顺手改、`short_desc` 长度与 `tags` 去重/小写、**`support_platforms`
   必须等于 `core/platforms.py::HISTORY_PLATFORMS`**、平台名必须是宿主认识的 key
