@@ -42,7 +42,7 @@ from .core.event_hooks import (
 from .core.paths import assert_writable_target, resolve_storage_root
 from .core.restore_engine import RestoreEngine, RestoreError
 from .core.scheduler import BackupScheduler
-from .core.verifier import read_manifest, verify_zip
+from .core.verifier import compute_checksum, read_manifest, verify_zip
 
 logger = logging.getLogger(__name__)
 
@@ -687,9 +687,40 @@ class BackupPlugin(Star):
             ok, reason = verify_zip(args[1])
             if ok:
                 reason += "（包与自身清单一致；群信息/成员表在恢复时才与本机留存的快照比对）"
-        else:
-            ok, reason = True, "本机记录校验和：" + (record.checksum[:16] or "（空）")
-        yield event.plain_result(f"{'✅' if ok else '❌'} {reason}")
+            yield event.plain_result(f"{'✅' if ok else '❌'} {reason}")
+            return
+        # 不给包时，原来这里只回一句「本机记录校验和：<16 位十六进制>」外加一个
+        # ✅。那个 ✅ 什么都没验——它只是把库里存着的字符串截了一半打出来。
+        # 而「重新算一遍再比」在这里是完全做得到的：来源清单 + 现存的库就是
+        # 备份当时那批数据。所以现在真比：对不上就直接说哪几类不一致。
+        messages = self.db.get_source_messages(record.backup_id, record.group_id)
+        if not messages:
+            # 来源清单空着不等于数据被删。老记录（前几轮建的）没有清单，
+            # `checksum` 也是空串；把它判成「损坏」会误伤一大批正常备份。
+            if not record.checksum:
+                yield event.plain_result(
+                    "⚠️ 这条记录没有校验和（早期版本建的备份），无法比对完整性。"
+                    "可以用 `/backup verify <备份ID> <备份包路径>` 校验手里的包"
+                )
+                return
+            yield event.plain_result(
+                f"❌ 备份 `{record.backup_id}` 登记过消息，本机库里一条都没剩下；"
+                "消息可能已被清理。如果你手里有导出包，用 "
+                "`/backup verify <备份ID> <备份包路径>` 校验那个包"
+            )
+            return
+        actual = compute_checksum(messages)
+        if actual == record.checksum:
+            yield event.plain_result(
+                f"✅ 校验通过：`{record.backup_id}` 的 {len(messages)} 条消息与备份时的校验和一致"
+            )
+            return
+        yield event.plain_result(
+            f"❌ 校验不一致：`{record.backup_id}` 现在库里的 {len(messages)} 条消息"
+            f"重算得 `{actual[:16]}`，记录里是 `{record.checksum[:16]}`"
+            "——消息内容被改过、或被别的读改写路径覆盖过（例如 overwrite 恢复）。"
+            "校验的是消息本身，不是备份包；包请用 `--` 后面的路径参数单独验"
+        )
 
     async def _cmd_clean(self, event, args):
         """清理旧备份。
